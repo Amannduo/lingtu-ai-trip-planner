@@ -1,5 +1,12 @@
 import axios from 'axios'
-import type { DestinationChatRequest, DestinationChatResponse, TripFormData, TripPlanResponse } from '@/types'
+import type {
+  AgentChatRequest,
+  AgentChatResponse,
+  DestinationChatRequest,
+  DestinationChatResponse,
+  TripFormData,
+  TripPlanResponse
+} from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
 const DEFAULT_REQUEST_TIMEOUT_MS = 120000
@@ -82,6 +89,82 @@ export async function chatDestinationRecommendation(
   } catch (error: any) {
     console.error('目的地推荐失败:', error)
     throw new Error(error.response?.data?.detail || error.message || '目的地推荐失败')
+  }
+}
+
+/**
+ * 多智能体自然语言数据分析
+ */
+export async function chatAgentAnalysis(payload: AgentChatRequest): Promise<AgentChatResponse> {
+  try {
+    const response = await apiClient.post<AgentChatResponse>('/api/agent/chat', payload)
+    return response.data
+  } catch (error: any) {
+    console.error('多智能体分析失败:', error)
+    throw new Error(error.response?.data?.detail || error.message || '多智能体分析失败')
+  }
+}
+
+/**
+ * 文件分析 — 上传旅行文档并获取 AI 分析结果
+ */
+export async function analyzeFile(
+  file: File,
+  question: string = '',
+  userId: string = 'u_current',
+  role: string = 'user'
+): Promise<{
+  success: boolean
+  summary: string
+  suggestions: string[]
+  extracted_info: Record<string, any>
+  table: Record<string, any>[]
+  file_type: string
+}> {
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('question', question)
+    formData.append('user_id', userId)
+    formData.append('role', role)
+    const response = await apiClient.post('/api/agent/analyze-file', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000 // 5 minutes for file analysis
+    })
+    return response.data
+  } catch (error: any) {
+    console.error('文件分析失败:', error)
+    throw new Error(error.response?.data?.detail || error.message || '文件分析失败')
+  }
+}
+
+/**
+ * 获取用户旅行历史
+ */
+export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
+  success: boolean
+  user_id: string
+  stats: { total_trips: number; avg_budget: number; total_days: number }
+  fav_cities: { city: string; count: number }[]
+  trips: {
+    plan_no: string
+    destination: string
+    start_date: string
+    end_date: string
+    travel_days: number
+    budget: number
+    transportation: string
+    summary: string
+  }[]
+}> {
+  try {
+    const response = await apiClient.get('/api/trip/history', {
+      params: { user_id: userId }
+    })
+    return response.data
+  } catch (error: any) {
+    console.error('获取历史行程失败:', error)
+    return { success: false, user_id: userId, stats: { total_trips: 0, avg_budget: 0, total_days: 0 }, fav_cities: [], trips: [] }
   }
 }
 

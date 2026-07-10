@@ -35,6 +35,11 @@ def get_llm() -> HelloAgentsLLM:
         if llm_model:
             os.environ["OPENAI_MODEL"] = llm_model
 
+        # 映射超时配置到 OpenAI SDK（默认 120s，行程规划 prompt 较大需要更长时间）
+        llm_timeout = os.getenv("LLM_TIMEOUT", "120")
+        if llm_timeout and "OPENAI_TIMEOUT" not in os.environ:
+            os.environ["OPENAI_TIMEOUT"] = llm_timeout
+
         _llm_instance = HelloAgentsLLM()
 
         print(f"✅ LLM服务初始化成功")

@@ -5,7 +5,7 @@ import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
-from .routes import trip, poi, recommend, map as map_routes
+from .routes import trip, poi, recommend, agent, map as map_routes
 
 
 def _configure_stdio() -> None:
@@ -53,6 +53,7 @@ app.add_middleware(
 app.include_router(trip.router, prefix="/api")
 app.include_router(poi.router, prefix="/api")
 app.include_router(recommend.router, prefix="/api")
+app.include_router(agent.router, prefix="/api")
 app.include_router(map_routes.router, prefix="/api")
 
 

@@ -3,9 +3,11 @@
     <a-layout-header class="app-header">
       <div class="brand">
         <GlobalOutlined />
-        <span>灵途 AI 旅行规划师</span>
+        <span>灵途 AI 旅行画像系统</span>
       </div>
-      <span class="header-tag">智能目的地推荐与行程规划</span>
+      <nav class="header-nav">
+        <router-link to="/">行程规划</router-link>
+      </nav>
     </a-layout-header>
 
     <a-layout-content class="app-content">
@@ -13,7 +15,7 @@
     </a-layout-content>
 
     <a-layout-footer class="app-footer">
-      灵途 AI 旅行规划师 ©2025
+      灵途 AI 旅行画像与个性化推荐系统 © 2026
     </a-layout-footer>
   </a-layout>
 </template>
@@ -77,10 +79,24 @@ body,
   font-size: 21px;
 }
 
-.header-tag {
+.header-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header-nav a {
+  padding: 7px 10px;
+  border-radius: 8px;
   color: #64748b;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.header-nav a.router-link-active {
+  background: #edf7f5;
+  color: #0f766e;
 }
 
 .app-content {
@@ -111,8 +127,13 @@ body,
     white-space: nowrap;
   }
 
-  .header-tag {
-    display: none;
+  .header-nav {
+    gap: 4px;
+  }
+
+  .header-nav a {
+    padding: 6px 7px;
+    font-size: 12px;
   }
 
   .app-content {

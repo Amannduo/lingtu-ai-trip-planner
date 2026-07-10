@@ -244,6 +244,28 @@
             </a-button>
           </div>
 
+          <!-- 旅行历史 -->
+          <div v-if="history.stats.total_trips > 0" class="history-section">
+            <div class="section-header">
+              <HistoryOutlined />
+              <span>我的旅行历史</span>
+              <a-tag color="green">{{ history.stats.total_trips }} 次行程</a-tag>
+              <a-tag color="blue">均预算 ¥{{ history.stats.avg_budget }}</a-tag>
+              <a-tag color="orange">{{ history.stats.total_days }} 天</a-tag>
+              <span v-if="history.fav_cities.length" style="font-size:13px;color:#667085;margin-left:8px">
+                常去: {{ history.fav_cities.map(c => c.city).join('、') }}
+              </span>
+            </div>
+            <div class="history-list">
+              <div v-for="trip in history.trips.slice(0, 6)" :key="trip.plan_no" class="history-card">
+                <strong>{{ trip.destination }}</strong>
+                <span>{{ trip.start_date }} ~ {{ trip.end_date }}</span>
+                <span>{{ trip.travel_days }}天 · {{ trip.transportation }}</span>
+                <span v-if="trip.budget">¥{{ trip.budget }}</span>
+              </div>
+            </div>
+          </div>
+
           <div v-if="loading" class="loading-container">
             <a-progress
               :percent="loadingProgress"
@@ -361,14 +383,16 @@ import {
   CheckOutlined,
   CompassOutlined,
   EnvironmentOutlined,
+  HistoryOutlined,
   MessageOutlined,
   RocketOutlined,
   SendOutlined,
   SettingOutlined
 } from '@ant-design/icons-vue'
-import { chatDestinationRecommendation, generateTripPlan } from '@/services/api'
+import { chatDestinationRecommendation, fetchTripHistory, generateTripPlan } from '@/services/api'
 import type { ChatMessage, DestinationRecommendation, TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
+import { onMounted } from 'vue'
 
 type PlannerFormData = Omit<TripFormData, 'start_date' | 'end_date'> & {
   start_date: Dayjs | null
@@ -390,6 +414,20 @@ const assistantMessages = ref<ChatMessage[]>([
   }
 ])
 const recommendations = ref<DestinationRecommendation[]>([])
+const history = ref({
+  stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
+  fav_cities: [] as { city: string; count: number }[],
+  trips: [] as any[]
+})
+
+onMounted(async () => {
+  history.value = await fetchTripHistory('u_current')
+})
+
+// Refresh history after generating a plan
+const refreshHistory = async () => {
+  history.value = await fetchTripHistory('u_current')
+}
 
 const transportationOptions = ['公共交通', '自驾', '步行', '混合']
 const intercityTransportationOptions = ['自动选择', '火车/高铁', '飞机', '自驾']
@@ -556,7 +594,7 @@ const handleSubmit = async () => {
 
     if (response.success && response.data) {
       sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
-      console.info('[home] trip plan stored in sessionStorage')
+      refreshHistory()
       message.success('旅行计划生成成功')
       setTimeout(() => {
         router.push('/result')
@@ -1026,6 +1064,39 @@ const handleSubmit = async () => {
   color: #0f766e;
   font-weight: 600;
   text-align: center;
+}
+
+.history-section {
+  margin-top: 20px;
+  padding: 18px;
+  border-top: 1px solid #e6ecea;
+}
+
+.history-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.history-card {
+  padding: 12px;
+  border: 1px solid #dce8e4;
+  border-radius: 8px;
+  background: #f8fbfb;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-card strong {
+  color: #172033;
+  font-size: 15px;
+}
+
+.history-card span {
+  color: #667085;
+  font-size: 12px;
 }
 
 @media (max-width: 900px) {

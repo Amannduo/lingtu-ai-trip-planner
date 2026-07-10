@@ -1,65 +1,61 @@
 """Unsplash图片服务"""
 
-import requests
 from typing import List, Optional
+
+import httpx
+
 from ..config import get_settings
 
+
 class UnsplashService:
-    """Unsplash图片服务类"""
-    
+    """Unsplash图片服务类（使用 httpx 非阻塞客户端）"""
+
     def __init__(self):
-        """初始化服务"""
         settings = get_settings()
         self.access_key = settings.unsplash_access_key
         self.base_url = "https://api.unsplash.com"
         self._warned_missing_key = False
-    
+        self._client: httpx.Client | None = None
+
+    @property
+    def client(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(timeout=15)
+        return self._client
+
     def search_photos(self, query: str, per_page: int = 5) -> List[dict]:
-        """
-        搜索图片
-        
-        Args:
-            query: 搜索关键词
-            per_page: 每页数量
-            
-        Returns:
-            图片列表
-        """
         if not self.access_key:
             if not self._warned_missing_key:
-                print("⚠️ Unsplash Access Key 未配置，跳过景点图片搜索。")
+                print("Unsplash Access Key 未配置，跳过景点图片搜索。")
                 self._warned_missing_key = True
             return []
 
         try:
-            url = f"{self.base_url}/search/photos"
-            params = {
-                "query": query,
-                "per_page": per_page,
-                "client_id": self.access_key
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
+            response = self.client.get(
+                f"{self.base_url}/search/photos",
+                params={
+                    "query": query,
+                    "per_page": per_page,
+                    "client_id": self.access_key,
+                },
+            )
             response.raise_for_status()
-            
             data = response.json()
             results = data.get("results", [])
-            
-            # 提取图片URL
-            photos = []
+
+            photos: List[dict] = []
             for photo in results:
                 photos.append({
                     "id": photo.get("id"),
                     "url": photo.get("urls", {}).get("regular"),
                     "thumb": photo.get("urls", {}).get("thumb"),
                     "description": photo.get("description") or photo.get("alt_description"),
-                    "photographer": photo.get("user", {}).get("name")
+                    "photographer": photo.get("user", {}).get("name"),
                 })
-            
             return photos
-            
+
         except Exception as e:
-            print(f"❌ Unsplash搜索失败: {str(e)}")
+            print(f"Unsplash search failed: {type(e).__name__}: {e}")
             return []
     
     def get_photo_url(self, query: str) -> Optional[str]:

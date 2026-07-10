@@ -187,3 +187,29 @@ export interface DestinationChatResponse {
   needs_more_info: boolean
   recommendations: DestinationRecommendation[]
 }
+
+export interface AgentChatRequest {
+  user_id: string
+  role: 'guest' | 'user' | 'manager' | 'admin'
+  message: string
+  email?: string | null
+}
+
+export interface AgentPermission {
+  role: string
+  allowed: boolean
+  reason: string
+}
+
+export interface AgentChatResponse {
+  success: boolean
+  intent: string
+  agent: string
+  tool: string
+  table: Record<string, any>[]
+  chart?: Record<string, any> | null
+  result: string
+  permission: AgentPermission
+  sensitive: Record<string, any>
+  extra: Record<string, any>
+}
