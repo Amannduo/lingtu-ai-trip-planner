@@ -11,7 +11,7 @@
       <button :class="{ active: mode === 'register' }" type="button" @click="mode = 'register'">注册</button>
     </div>
 
-    <a-form layout="vertical" @finish="submit">
+    <a-form layout="vertical" @submit.prevent>
       <a-alert
         v-if="mode === 'login'"
         type="info"
@@ -35,21 +35,27 @@
       <a-form-item label="密码" required>
         <a-input-password v-model:value="password" placeholder="至少 4 位" />
       </a-form-item>
-      <a-form-item v-if="mode === 'register'" label="角色">
+      <a-form-item v-if="mode === 'register'" label="注册角色">
         <a-select v-model:value="role">
           <a-select-option value="user">普通用户</a-select-option>
           <a-select-option value="manager">经理</a-select-option>
           <a-select-option value="admin">管理员</a-select-option>
         </a-select>
       </a-form-item>
+      <a-form-item v-if="mode === 'register' && role !== 'user'" label="授权码" required>
+        <a-input-password
+          v-model:value="inviteCode"
+          :placeholder="role === 'manager' ? '请输入经理授权码' : '请输入管理员授权码'"
+        />
+      </a-form-item>
       <a-alert
         v-if="mode === 'register'"
         type="info"
         show-icon
-        message="课程演示账号保存在浏览器本地，用于展示角色权限和数据沉淀。"
+        message="普通用户可直接注册；经理和管理员需要对应授权码。"
         class="auth-note"
       />
-      <a-button type="primary" html-type="submit" block class="auth-submit">
+      <a-button type="primary" html-type="button" block class="auth-submit" @click="submit">
         {{ mode === 'login' ? '登录' : '注册并登录' }}
       </a-button>
     </a-form>
@@ -74,6 +80,7 @@ const mode = ref<'login' | 'register'>('login')
 const username = ref('')
 const password = ref('')
 const role = ref<UserRole>('user')
+const inviteCode = ref('')
 
 const demoAccounts = [
   { label: '普通用户登录', username: 'user' },
@@ -83,9 +90,18 @@ const demoAccounts = [
 
 const submit = () => {
   try {
+    if (!username.value.trim()) {
+      throw new Error('请输入用户名')
+    }
+    if (!password.value) {
+      throw new Error('请输入密码')
+    }
+    if (mode.value === 'register' && role.value !== 'user' && !inviteCode.value.trim()) {
+      throw new Error(role.value === 'manager' ? '请输入经理授权码' : '请输入管理员授权码')
+    }
     const user = mode.value === 'login'
       ? login(username.value, password.value)
-      : register(username.value, password.value, role.value)
+      : register(username.value, password.value, role.value, inviteCode.value)
     message.success(`${user.username}，欢迎回来`)
     emit('success', user)
     emit('close')

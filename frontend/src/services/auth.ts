@@ -12,6 +12,8 @@ type StoredUser = LocalUser & {
 
 const USERS_KEY = 'lingtu_users'
 const CURRENT_USER_KEY = 'lingtu_current_user'
+const MANAGER_INVITE_CODE = import.meta.env.VITE_MANAGER_INVITE_CODE || 'LINGTU_MANAGER_2026'
+const ADMIN_INVITE_CODE = import.meta.env.VITE_ADMIN_INVITE_CODE || 'LINGTU_ADMIN_2026'
 
 const DEFAULT_USERS: StoredUser[] = [
   { user_id: 'u_0001', username: 'user', password: '123456', role: 'user' },
@@ -87,8 +89,23 @@ export const login = (username: string, password: string): LocalUser => {
   return publicUser
 }
 
-export const register = (username: string, password: string, role: UserRole = 'user'): LocalUser => {
+const validateInviteCode = (role: UserRole, inviteCode: string) => {
+  if (role === 'manager' && inviteCode.trim() !== MANAGER_INVITE_CODE) {
+    throw new Error('经理账号需要有效授权码')
+  }
+  if (role === 'admin' && inviteCode.trim() !== ADMIN_INVITE_CODE) {
+    throw new Error('管理员账号需要有效授权码')
+  }
+}
+
+export const register = (
+  username: string,
+  password: string,
+  role: UserRole = 'user',
+  inviteCode: string = ''
+): LocalUser => {
   const name = username.trim()
+  const normalizedRole: UserRole = role === 'admin' || role === 'manager' ? role : 'user'
   if (name.length < 2) {
     throw new Error('用户名至少需要 2 个字符')
   }
@@ -99,11 +116,12 @@ export const register = (username: string, password: string, role: UserRole = 'u
   if (users.some(item => item.username === name)) {
     throw new Error('用户名已存在')
   }
+  validateInviteCode(normalizedRole, inviteCode)
   const user: StoredUser = {
     user_id: `u_${Date.now().toString().slice(-6)}`,
     username: name,
     password,
-    role
+    role: normalizedRole
   }
   users.push(user)
   writeUsers(users)

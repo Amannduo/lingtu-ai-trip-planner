@@ -67,6 +67,23 @@ python backend/scripts/init_travel_sqlite.py --rows 10000 --reset
 管理员:   admin / 123456      -> u_0002
 ```
 
+注册规则：
+
+```text
+普通用户: 可直接注册
+经理:     需要经理授权码
+管理员:   需要管理员授权码
+```
+
+默认演示授权码可在 `frontend/.env` 配置：
+
+```env
+VITE_MANAGER_INVITE_CODE=LINGTU_MANAGER_2026
+VITE_ADMIN_INVITE_CODE=LINGTU_ADMIN_2026
+```
+
+这样可以展示“高权限角色需要授权”的权限控制流程，避免普通用户随意注册为 manager/admin。
+
 未登录状态下：
 
 ```text
