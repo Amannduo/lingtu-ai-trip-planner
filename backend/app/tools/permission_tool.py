@@ -23,14 +23,23 @@ def check_permission(role: str, intent: str, message: str = "") -> dict:
     level = ROLE_LEVEL[role]
     text = message or ""
 
-    if any(field in text for field in SENSITIVE_FIELDS) and level < ROLE_LEVEL["admin"]:
+    if intent == "email_report":
+        if level < ROLE_LEVEL["user"]:
+            return {
+                "allowed": False,
+                "role": role,
+                "reason": "发送个人画像报告需要先登录。",
+            }
+        return {"allowed": True, "role": role, "reason": ""}
+
+    if any(field in text for field in SENSITIVE_FIELDS):
         return {
             "allowed": False,
             "role": role,
             "reason": "当前角色无权查询联系人、手机号、邮箱等敏感字段。",
         }
 
-    if intent in {"all_plan_detail", "audit_log", "email_report"} and level < ROLE_LEVEL["admin"]:
+    if intent in {"all_plan_detail", "audit_log"} and level < ROLE_LEVEL["admin"]:
         return {
             "allowed": False,
             "role": role,

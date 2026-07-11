@@ -18,7 +18,7 @@ router = APIRouter(prefix="/agent", tags=["多智能体数据分析"])
 # ── Chat models ──────────────────────────────────────────────────────────
 
 class AgentChatRequest(BaseModel):
-    user_id: str = Field(default="u_current", description="当前用户 ID")
+    user_id: str = Field(default="", description="当前用户 ID")
     role: str = Field(default="user", description="用户角色: guest/user/manager/admin")
     message: str = Field(..., description="自然语言问题")
     email: Optional[str] = Field(default=None, description="邮件发送目标")
@@ -78,7 +78,7 @@ async def agent_chat(request: AgentChatRequest):
 async def analyze_file(
     file: UploadFile = File(..., description="上传文件（支持 TXT/MD/PDF/DOCX/XLSX）"),
     question: str = Form(default="", description="额外的分析问题（可选）"),
-    user_id: str = Form(default="u_current"),
+    user_id: str = Form(default=""),
     role: str = Form(default="user"),
 ):
     """Upload a travel document and get AI analysis."""

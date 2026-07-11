@@ -11,7 +11,7 @@ from typing import Iterator
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = BACKEND_DIR / "data" / "travel.db"
 
-# Convert psycopg pyformat %(name)s → SQLite :name
+# Accept legacy pyformat placeholders %(name)s and run them as SQLite :name.
 _PYFORMAT_RE = re.compile(r"%\((\w+)\)s")
 
 

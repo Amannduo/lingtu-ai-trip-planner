@@ -7,9 +7,11 @@ import type {
   TripFormData,
   TripPlanResponse
 } from '@/types'
+import { getCurrentUser } from './auth'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
 const DEFAULT_REQUEST_TIMEOUT_MS = 120000
+
 const readTimeoutMs = (rawValue: string | undefined, fallbackMs: number) => {
   const timeoutMs = Number(rawValue)
   return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : fallbackMs
@@ -32,36 +34,22 @@ const isTimeoutError = (error: any) => {
 
 const formatTimeout = (timeoutMs: number) => {
   const minutes = Math.round(timeoutMs / 60000)
-  return minutes >= 1 ? `${minutes}分钟` : `${Math.round(timeoutMs / 1000)}秒`
+  return minutes >= 1 ? `${minutes} 分钟` : `${Math.round(timeoutMs / 1000)} 秒`
 }
 
-// 请求拦截器
 apiClient.interceptors.request.use(
   (config) => {
-    console.log('发送请求:', config.method?.toUpperCase(), config.url)
+    const user = getCurrentUser()
+    if (user) {
+      config.headers = config.headers || {}
+      config.headers['x-user-id'] = user.user_id
+      config.headers['x-user-role'] = user.role
+    }
     return config
   },
-  (error) => {
-    console.error('请求错误:', error)
-    return Promise.reject(error)
-  }
+  (error) => Promise.reject(error)
 )
 
-// 响应拦截器
-apiClient.interceptors.response.use(
-  (response) => {
-    console.log('收到响应:', response.status, response.config.url)
-    return response
-  },
-  (error) => {
-    console.error('响应错误:', error.response?.status, error.message)
-    return Promise.reject(error)
-  }
-)
-
-/**
- * 生成旅行计划
- */
 export async function generateTripPlan(formData: TripFormData): Promise<TripPlanResponse> {
   try {
     const response = await apiClient.post<TripPlanResponse>('/api/trip/plan', formData, {
@@ -69,17 +57,13 @@ export async function generateTripPlan(formData: TripFormData): Promise<TripPlan
     })
     return response.data
   } catch (error: any) {
-    console.error('生成旅行计划失败:', error)
     if (isTimeoutError(error)) {
-      throw new Error(`旅行计划生成耗时较长，已超过${formatTimeout(TRIP_PLAN_TIMEOUT_MS)}等待时间，请减少天数或稍后重试`)
+      throw new Error(`旅行计划生成时间较长，已超过 ${formatTimeout(TRIP_PLAN_TIMEOUT_MS)}，请减少天数或稍后重试`)
     }
     throw new Error(error.response?.data?.detail || error.message || '生成旅行计划失败')
   }
 }
 
-/**
- * 目的地推荐对话
- */
 export async function chatDestinationRecommendation(
   payload: DestinationChatRequest
 ): Promise<DestinationChatResponse> {
@@ -87,31 +71,23 @@ export async function chatDestinationRecommendation(
     const response = await apiClient.post<DestinationChatResponse>('/api/recommend/chat', payload)
     return response.data
   } catch (error: any) {
-    console.error('目的地推荐失败:', error)
     throw new Error(error.response?.data?.detail || error.message || '目的地推荐失败')
   }
 }
 
-/**
- * 多智能体自然语言数据分析
- */
 export async function chatAgentAnalysis(payload: AgentChatRequest): Promise<AgentChatResponse> {
   try {
     const response = await apiClient.post<AgentChatResponse>('/api/agent/chat', payload)
     return response.data
   } catch (error: any) {
-    console.error('多智能体分析失败:', error)
-    throw new Error(error.response?.data?.detail || error.message || '多智能体分析失败')
+    throw new Error(error.response?.data?.detail || error.message || '智能分析失败')
   }
 }
 
-/**
- * 文件分析 — 上传旅行文档并获取 AI 分析结果
- */
 export async function analyzeFile(
   file: File,
   question: string = '',
-  userId: string = 'u_current',
+  userId: string = '',
   role: string = 'user'
 ): Promise<{
   success: boolean
@@ -129,19 +105,15 @@ export async function analyzeFile(
     formData.append('role', role)
     const response = await apiClient.post('/api/agent/analyze-file', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 300000 // 5 minutes for file analysis
+      timeout: 300000
     })
     return response.data
   } catch (error: any) {
-    console.error('文件分析失败:', error)
     throw new Error(error.response?.data?.detail || error.message || '文件分析失败')
   }
 }
 
-/**
- * 获取用户旅行历史
- */
-export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
+export async function fetchTripHistory(userId?: string): Promise<{
   success: boolean
   user_id: string
   stats: { total_trips: number; avg_budget: number; total_days: number }
@@ -157,26 +129,38 @@ export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
     summary: string
   }[]
 }> {
+  const currentUser = getCurrentUser()
+  const targetUserId = userId || currentUser?.user_id
+  if (!targetUserId) {
+    return {
+      success: false,
+      user_id: '',
+      stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
+      fav_cities: [],
+      trips: []
+    }
+  }
   try {
     const response = await apiClient.get('/api/trip/history', {
-      params: { user_id: userId }
+      params: { user_id: targetUserId }
     })
     return response.data
-  } catch (error: any) {
-    console.error('获取历史行程失败:', error)
-    return { success: false, user_id: userId, stats: { total_trips: 0, avg_budget: 0, total_days: 0 }, fav_cities: [], trips: [] }
+  } catch {
+    return {
+      success: false,
+      user_id: targetUserId,
+      stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
+      fav_cities: [],
+      trips: []
+    }
   }
 }
 
-/**
- * 健康检查
- */
 export async function healthCheck(): Promise<any> {
   try {
     const response = await apiClient.get('/health')
     return response.data
   } catch (error: any) {
-    console.error('健康检查失败:', error)
     throw new Error(error.message || '健康检查失败')
   }
 }

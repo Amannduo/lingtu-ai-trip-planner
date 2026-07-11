@@ -8,7 +8,7 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS travel_plans (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     plan_no       TEXT UNIQUE NOT NULL,
-    user_id       TEXT NOT NULL DEFAULT 'u_current',
+    user_id       TEXT NOT NULL DEFAULT '',
     user_role     TEXT NOT NULL DEFAULT 'user',
     origin_city   TEXT,
     destination   TEXT NOT NULL,

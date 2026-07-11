@@ -20,10 +20,12 @@ class TravelPlanDataService:
         request: TripRequest,
         trip_plan: TripPlan,
         *,
-        user_id: str = "u_current",
+        user_id: str = "",
         user_role: str = "user",
         source: str = "generated",
     ) -> str:
+        if not user_id:
+            raise ValueError("user_id is required when saving a trip plan")
         init_db()
         plan_no = f"P{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
         summary = _summary_from_plan(trip_plan)

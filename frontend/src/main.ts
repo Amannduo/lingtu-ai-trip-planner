@@ -5,7 +5,6 @@ import 'ant-design-vue/dist/reset.css'
 import App from './App.vue'
 import Home from './views/Home.vue'
 import Result from './views/Result.vue'
-import AgentChat from './views/AgentChat.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -19,11 +18,6 @@ const router = createRouter({
       path: '/result',
       name: 'Result',
       component: Result
-    },
-    {
-      path: '/agent',
-      name: 'AgentChat',
-      component: AgentChat
     }
   ]
 })

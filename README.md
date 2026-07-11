@@ -1,226 +1,277 @@
-# 灵途 AI 旅行规划师
+# 灵途：基于多智能体的用户旅行画像与个性化行程推荐系统
 
-灵途 AI 旅行规划师集成高德地图 MCP 服务、火山联网问答 Agent 和多智能体行程生成能力，提供个性化旅行计划与行前攻略。
+灵途是一个面向课程设计的旅游领域多智能体系统。项目以“用户旅行计划数据”为核心数据集，结合 FastAPI、LangGraph/LangChain 风格 Agent、SQLite、Vue3、ECharts，实现旅行规划、用户画像、自然语言数据分析、权限控制、敏感词过滤和个性化推荐。
 
-## ✨ 功能特点
+## 核心能力
 
-- 🤖 **AI驱动的旅行规划**: 基于HelloAgents框架的SimpleAgent,智能生成详细的多日旅程
-- 🗺️ **高德地图集成**: 通过MCP协议接入高德地图服务,支持景点搜索、路线规划、天气查询
-- 🧠 **智能工具调用**: Agent自动调用高德地图MCP工具,获取实时POI、路线和天气信息
-- 🌐 **联网攻略增强**: 可接入火山引擎联网问答Agent,对预约、天气、票务、交通和预算进行二次核对并输出行前攻略
-- 🎨 **现代化前端**: Vue3 + TypeScript + Vite,响应式设计,流畅的用户体验
-- 📱 **完整功能**: 包含住宿、交通、餐饮和景点游览时间推荐
+- 旅行计划生成：根据城市、日期、预算、交通、住宿和偏好生成多日行程。
+- 本地旅行数据集：SQLite 存储 10000 条真实模拟旅行计划数据。
+- 用户画像分析：根据用户历史旅行计划汇总兴趣标签、常去城市、预算和旅行者类型。
+- 多智能体分析：SecurityAgent、RoleAgent、RouterAgent、SQLAgent、ProfileAgent、RecommendationAgent、PredictAgent、EmailAgent、ChartAgent、ReportAgent 协同处理自然语言问题。
+- 权限控制：guest、user、manager、admin 不同角色拥有不同查询权限。
+- 敏感词过滤：手机号、邮箱、联系人、危险 SQL 等请求会被拦截。
+- ECharts 图表：智能分析弹窗中返回 `table + chart + result`。
+- 登录/注册演示：前端本地账号用于课程演示角色差异。
+- 邮件工具：支持 SMTP；未配置时自动 dry-run，生成邮件内容但不真实发送。
+- 文件分析：支持 TXT、MD、PDF、DOCX、XLSX 上传分析。
 
-## 🏗️ 技术栈
+## 当前数据集
 
-### 后端
-- **框架**: HelloAgents (基于SimpleAgent)
-- **API**: FastAPI
-- **MCP工具**: amap-mcp-server (高德地图)
-- **LLM**: 支持多种LLM提供商(OpenAI, DeepSeek等)
+默认数据库文件：
 
-### 前端
-- **框架**: Vue 3 + TypeScript
-- **构建工具**: Vite
-- **UI组件库**: Ant Design Vue
-- **地图服务**: 高德地图 JavaScript API
-- **HTTP客户端**: Axios
-
-## 📁 项目结构
-
-```
-lingtu-ai-trip-planner/
-├── backend/                    # 后端服务
-│   ├── app/
-│   │   ├── agents/            # Agent实现
-│   │   │   └── trip_planner_agent.py
-│   │   ├── api/               # FastAPI路由
-│   │   │   ├── main.py
-│   │   │   └── routes/
-│   │   │       ├── trip.py
-│   │   │       └── map.py
-│   │   ├── services/          # 服务层
-│   │   │   ├── amap_service.py
-│   │   │   └── llm_service.py
-│   │   ├── models/            # 数据模型
-│   │   │   └── schemas.py
-│   │   └── config.py          # 配置管理
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── .gitignore
-├── frontend/                   # 前端应用
-│   ├── src/
-│   │   ├── components/        # Vue组件
-│   │   ├── services/          # API服务
-│   │   ├── types/             # TypeScript类型
-│   │   └── views/             # 页面视图
-│   ├── package.json
-│   └── vite.config.ts
-└── README.md
+```text
+backend/data/travel.db
 ```
 
-## 🚀 快速开始
+核心表：
 
-### 前提条件
+```text
+travel_plans   旅行计划明细
+user_profiles  用户画像汇总
+audit_logs     Agent 权限/调用审计日志
+query_logs     自然语言查询日志
+```
 
-- Python 3.10+
-- Node.js 16+
-- 高德地图API密钥 (Web服务API和Web端(JS API))
-- LLM API密钥 (OpenAI/DeepSeek等)
+当前数据规模：
 
-### 后端安装
+```text
+travel_plans: 10000 条
+user_profiles: 4545 个用户画像
+目的地城市: 35 个
+出发城市: 30 个
+数据来源: realistic_synthetic
+```
 
-1. 进入后端目录
+数据生成规则考虑了城市热度、季节、出发地、旅行天数、出行人数、预算、住宿、交通、用户偏好和旅行者类型，不使用 `u_current`、`test_user` 等测试数据。
+
+重新生成或补齐数据：
+
 ```bash
+conda activate LINGTU
+python backend/scripts/init_travel_sqlite.py --rows 10000
+```
+
+如需清空后重建：
+
+```bash
+python backend/scripts/init_travel_sqlite.py --rows 10000 --reset
+```
+
+## 演示账号
+
+登录功能为课程演示用，本地保存在浏览器 `localStorage`。
+
+```text
+普通用户: user / 123456       -> u_0001
+经理:     manager / 123456    -> u_0100
+管理员:   admin / 123456      -> u_0002
+```
+
+未登录状态下：
+
+```text
+不会展示个人历史记录
+生成行程不会写入用户数据集
+智能分析会提示先登录
+```
+
+## 技术栈
+
+后端：
+
+```text
+FastAPI
+HelloAgents / SimpleAgent
+LangGraph
+SQLite
+ECharts option 生成工具
+高德地图服务
+火山引擎联网问答 Agent，可选
+FlyAI/飞猪预算数据源，可选
+```
+
+前端：
+
+```text
+Vue 3
+TypeScript
+Vite
+Ant Design Vue
+ECharts
+Axios
+高德地图 JS API
+```
+
+## 项目结构
+
+```text
+backend/
+  app/
+    agents/
+      graph/travel_agent_graph.py
+      trip_planner_agent.py
+      destination_recommender_agent.py
+    api/routes/
+      trip.py
+      agent.py
+      map.py
+    services/
+      schema.py
+      database_service.py
+      travel_plan_data_service.py
+      transport_budget_service.py
+    tools/
+      sql_agent_tool.py
+      llm_sql_agent_tool.py
+      profile_tool.py
+      chart_tool.py
+      permission_tool.py
+      sensitive_filter_tool.py
+      predict_tool.py
+      send_email_tool.py
+      file_analysis_tool.py
+  scripts/
+    init_travel_sqlite.py
+  data/
+    travel.db
+
+frontend/
+  src/
+    components/
+      AgentAssistantModal.vue
+      AuthDialog.vue
+      AgentChart.vue
+    views/
+      Home.vue
+      Result.vue
+    services/
+      api.ts
+      auth.ts
+```
+
+## 快速启动
+
+后端：
+
+```bash
+conda activate LINGTU
 cd backend
-```
-
-2. 创建虚拟环境
-```bash
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-```
-
-3. 安装依赖
-```bash
 pip install -r requirements.txt
-```
-
-4. 配置环境变量
-```bash
-cp .env.example .env
-# 编辑.env文件,填入你的API密钥
-```
-
-5. 启动后端服务
-```bash
+copy .env.example .env
 uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 前端安装
+前端：
 
-1. 进入前端目录
 ```bash
 cd frontend
-```
-
-2. 安装依赖
-```bash
 npm install
-```
-
-3. 配置环境变量
-```bash
-# 创建.env文件, 填入高德地图Web API Key 和 Web端JS API Key
-cp .env.example .env
-```
-
-4. 启动开发服务器
-```bash
+copy .env.example .env
 npm run dev
 ```
 
-5. 打开浏览器访问 `http://localhost:5173`
+访问：
 
-## 📝 使用指南
-
-1. 在首页填写旅行信息:
-   - 目的地城市
-   - 旅行日期和天数
-   - 交通方式偏好
-   - 住宿偏好
-   - 旅行风格标签
-
-2. 点击"生成旅行计划"按钮
-
-3. 系统将:
-   - 调用灵途 AI 旅行规划师后端 Agent 生成初步计划
-   - Agent自动调用高德地图MCP工具搜索景点
-   - Agent获取天气信息和路线规划
-   - 整合所有信息生成完整行程
-
-4. 查看结果:
-   - 每日详细行程
-   - 景点信息与地图标记
-   - 交通路线规划
-   - 天气预报
-   - 餐饮推荐
-
-## 🔧 核心实现
-
-### HelloAgents Agent集成
-
-```python
-from hello_agents import SimpleAgent, HelloAgentsLLM
-from hello_agents.tools import MCPTool
-
-# 创建高德地图MCP工具
-amap_tool = MCPTool(
-    name="amap",
-    server_command=["uvx", "amap-mcp-server"],
-    env={"AMAP_MAPS_API_KEY": "your_api_key"},
-    auto_expand=True
-)
-
-# 创建旅行规划Agent
-agent = SimpleAgent(
-    name="旅行规划助手",
-    llm=HelloAgentsLLM(),
-    system_prompt="你是一个专业的旅行规划助手..."
-)
-
-# 添加工具
-agent.add_tool(amap_tool)
+```text
+前端: http://127.0.0.1:5173/
+后端文档: http://127.0.0.1:8000/docs
 ```
 
-### MCP工具调用
+## 主要接口
 
-Agent可以自动调用以下高德地图MCP工具:
-- `maps_text_search`: 搜索景点POI
-- `maps_weather`: 查询天气
-- `maps_direction_walking_by_address`: 步行路线规划
-- `maps_direction_driving_by_address`: 驾车路线规划
-- `maps_direction_transit_integrated_by_address`: 公共交通路线规划
+```text
+POST /api/trip/plan
+生成旅行计划；登录后会把结果写入 travel_plans 并刷新 user_profiles。
 
-## 📄 API文档
+GET /api/trip/history
+查询当前用户历史旅行计划。
 
-启动后端服务后,访问 `http://localhost:8000/docs` 查看完整的API文档。
+POST /api/agent/chat
+自然语言智能分析，返回 table、chart、result、permission、sensitive。
 
-主要端点:
-- `POST /api/trip/plan` - 生成旅行计划
-- `GET /api/map/poi` - 搜索POI
-- `GET /api/map/weather` - 查询天气
-- `POST /api/map/route` - 规划路线
-
-### 火山联网问答Agent
-
-如需启用联网攻略增强,先在火山引擎控制台创建「联网问答Agent」并获取 `bot_id` 与 API Key,再在 `backend/.env` 配置:
-
-```env
-VOLCENGINE_AGENT_ENABLED=true
-VOLCENGINE_AGENT_API_KEY=your_volcengine_agent_api_key
-VOLCENGINE_AGENT_BOT_ID=your_volcengine_agent_bot_id
-VOLCENGINE_AGENT_API_URL=https://open.feedcoopapi.com/agent_api/agent/chat/completion
-VOLCENGINE_AGENT_FORCE_WEB=true
+POST /api/agent/analyze-file
+上传文件并进行旅行相关信息分析。
 ```
 
-控制台名称、简介、开场白和系统提示词见 `docs/volcengine-web-travel-guide-agent.md`。未配置凭证时,后端会使用本地降级文本并在审核检查中提示。
+智能分析请求示例：
 
-## 🤝 贡献指南
+```json
+{
+  "user_id": "u_0002",
+  "role": "admin",
+  "message": "统计最热门旅游城市",
+  "email": "demo@example.com"
+}
+```
 
-欢迎提交Pull Request或Issue!
+返回结构：
 
-## 📜 开源协议
+```json
+{
+  "success": true,
+  "intent": "city_rank",
+  "agent": "SQLAgent",
+  "tool": "sql_agent_tool",
+  "table": [],
+  "chart": {},
+  "result": "当前数据中最热门的目的地是成都，共有397条旅行计划。",
+  "permission": {
+    "role": "admin",
+    "allowed": true,
+    "reason": ""
+  }
+}
+```
 
-CC BY-NC-SA 4.0
+## 示例问题
 
-## 🙏 致谢
+```text
+分析我的旅行兴趣画像
+和我相似的用户最喜欢去哪些城市
+统计不同城市的平均预算
+生成热门目的地 Top10 图表
+预测下个月最热门的旅游城市
+查询所有用户手机号
+把我的画像报告发送到邮箱
+```
 
-- [HelloAgents](https://github.com/datawhalechina/Hello-Agents) - 智能体教程
-- [HelloAgents框架](https://github.com/jjyaoao/HelloAgents) - 智能体框架
-- [高德地图开放平台](https://lbs.amap.com/) - 地图服务
-- [amap-mcp-server](https://github.com/sugarforever/amap-mcp-server) - 高德地图MCP服务器
+## 环境变量
 
----
+后端参考：
 
-**灵途 AI 旅行规划师** - 让旅行计划变得简单而智能
+```text
+backend/.env.example
+```
+
+前端参考：
+
+```text
+frontend/.env.example
+```
+
+当前项目默认使用 SQLite，不需要 PostgreSQL 或 `DATABASE_URL`。
+
+## 验证命令
+
+```bash
+cd frontend
+npm run build
+```
+
+```bash
+conda activate LINGTU
+python backend/scripts/init_travel_sqlite.py --rows 10000
+```
+
+## 课程设计对应关系
+
+```text
+选择领域: 旅游
+数据集: 用户旅行计划数据，10000 条真实模拟记录
+后端: FastAPI
+多智能体: Security/Role/Router/SQL/Profile/Recommendation/Predict/Email/File/Chart/Report
+工具: sql_agent_tool、send_email_tool、chart_tool、profile_tool、permission_tool、sensitive_filter_tool
+权限: guest/user/manager/admin
+敏感词: 手机号、邮箱、联系人、危险 SQL
+前端展示: 弹窗式智能分析，表格 + ECharts 图表 + 中文结论
+```

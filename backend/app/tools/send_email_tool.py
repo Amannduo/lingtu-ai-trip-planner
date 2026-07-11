@@ -8,15 +8,29 @@ import socket
 from email.message import EmailMessage
 
 
-def send_email(to_email: str, subject: str, body: str) -> dict:
-    host = os.getenv("SMTP_HOST", "")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    username = os.getenv("SMTP_USERNAME", "")
-    password = os.getenv("SMTP_PASSWORD", "")
-    from_email = os.getenv("SMTP_FROM", username or "lingtu@example.com")
-    timeout = int(os.getenv("SMTP_TIMEOUT", "20"))
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
 
-    if not host or not username or not password:
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def send_email(to_email: str, subject: str, body: str) -> dict:
+    real_emails = _env_first("SEND_REAL_EMAILS", default="true")
+    host = _env_first("SMTP_HOST", "EMAIL_HOST")
+    port = int(_env_first("SMTP_PORT", "EMAIL_PORT", default="587"))
+    username = _env_first("SMTP_USERNAME", "EMAIL_USER")
+    password = _env_first("SMTP_PASSWORD", "EMAIL_PASSWORD")
+    from_email = _env_first("SMTP_FROM", "EMAIL_FROM", default=username or "lingtu@example.com")
+    timeout = int(_env_first("SMTP_TIMEOUT", "EMAIL_TIMEOUT", default="20"))
+    use_ssl = _truthy(_env_first("SMTP_SSL", "EMAIL_SSL", default="true" if port == 465 else "false"))
+
+    if not _truthy(real_emails) or not host or not username or not password:
         return {
             "sent": False,
             "dry_run": True,
@@ -33,8 +47,10 @@ def send_email(to_email: str, subject: str, body: str) -> dict:
     msg.set_content(body)
 
     try:
-        with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-            smtp.starttls()
+        smtp_cls = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        with smtp_cls(host, port, timeout=timeout) as smtp:
+            if not use_ssl:
+                smtp.starttls()
             smtp.login(username, password)
             smtp.send_message(msg)
         return {"sent": True, "dry_run": False, "message": "邮件发送成功。", "to": to_email}

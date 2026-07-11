@@ -150,10 +150,9 @@
                     <span class="form-label">住宿偏好</span>
                   </template>
                   <a-select v-model:value="formData.accommodation" size="large" class="custom-select">
-                    <a-select-option value="经济型酒店">经济型酒店</a-select-option>
-                    <a-select-option value="舒适型酒店">舒适型酒店</a-select-option>
-                    <a-select-option value="豪华酒店">豪华酒店</a-select-option>
-                    <a-select-option value="民宿">民宿</a-select-option>
+                    <a-select-option v-for="item in accommodationOptions" :key="item" :value="item">
+                      {{ item }}
+                    </a-select-option>
                   </a-select>
                 </a-form-item>
               </a-col>
@@ -245,7 +244,7 @@
           </div>
 
           <!-- 旅行历史 -->
-          <div v-if="history.stats.total_trips > 0" class="history-section">
+          <div v-if="currentUser && history.stats.total_trips > 0" class="history-section">
             <div class="section-header">
               <HistoryOutlined />
               <span>我的旅行历史</span>
@@ -375,7 +374,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, reactive, watch } from 'vue'
+import { computed, ref, reactive, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
@@ -390,9 +389,9 @@ import {
   SettingOutlined
 } from '@ant-design/icons-vue'
 import { chatDestinationRecommendation, fetchTripHistory, generateTripPlan } from '@/services/api'
+import { getCurrentUser, type LocalUser } from '@/services/auth'
 import type { ChatMessage, DestinationRecommendation, TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
-import { onMounted } from 'vue'
 
 type PlannerFormData = Omit<TripFormData, 'start_date' | 'end_date'> & {
   start_date: Dayjs | null
@@ -407,6 +406,7 @@ const assistantInput = ref('')
 const assistantOriginCity = ref('')
 const assistantLoading = ref(false)
 const recommendationCount = ref(3)
+const currentUser = ref<LocalUser | null>(getCurrentUser())
 const assistantMessages = ref<ChatMessage[]>([
   {
     role: 'assistant',
@@ -414,23 +414,44 @@ const assistantMessages = ref<ChatMessage[]>([
   }
 ])
 const recommendations = ref<DestinationRecommendation[]>([])
-const history = ref({
+const createEmptyHistory = () => ({
   stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
   fav_cities: [] as { city: string; count: number }[],
   trips: [] as any[]
 })
 
-onMounted(async () => {
-  history.value = await fetchTripHistory('u_current')
+const history = ref(createEmptyHistory())
+
+const loadHistory = async () => {
+  if (!currentUser.value) {
+    history.value = createEmptyHistory()
+    return
+  }
+  history.value = await fetchTripHistory(currentUser.value.user_id)
+}
+
+const syncAuth = () => {
+  currentUser.value = getCurrentUser()
+  loadHistory()
+}
+
+onMounted(() => {
+  window.addEventListener('lingtu-auth-change', syncAuth)
+  loadHistory()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('lingtu-auth-change', syncAuth)
 })
 
 // Refresh history after generating a plan
 const refreshHistory = async () => {
-  history.value = await fetchTripHistory('u_current')
+  await loadHistory()
 }
 
 const transportationOptions = ['公共交通', '自驾', '步行', '混合']
 const intercityTransportationOptions = ['自动选择', '火车/高铁', '飞机', '自驾']
+const accommodationOptions = ['经济型酒店', '舒适型酒店', '豪华酒店', '民宿', '亲子酒店']
 const quickPrompts = ['周末短途', '预算有限', '美食优先', '自然风光', '历史文化']
 const recommendationCountOptions = [
   { label: '1个', value: 1 },

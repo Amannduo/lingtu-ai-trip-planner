@@ -6,6 +6,7 @@ installed; falls back to a deterministic sequential runner otherwise.
 
 from __future__ import annotations
 
+import os
 from typing import Any, TypedDict
 
 from ...services.travel_plan_data_service import get_travel_plan_data_service
@@ -44,6 +45,15 @@ class AgentState(TypedDict, total=False):
 
 def _security_node(state: AgentState) -> dict:
     sensitive = check_sensitive_text(state["message"])
+    if sensitive["hits"] and not _is_email_report_request(state["message"]):
+        return {
+            "sensitive": sensitive,
+            "allowed": False,
+            "agent": "SecurityAgent",
+            "tool": "sensitive_filter_tool",
+            "permission_reason": sensitive["message"],
+            "result": "请求包含手机号、邮箱、联系人等敏感字段，系统已拒绝查询。",
+        }
     if sensitive["has_dangerous_sql"]:
         return {
             "sensitive": sensitive,
@@ -56,14 +66,76 @@ def _security_node(state: AgentState) -> dict:
     return {"sensitive": sensitive, "allowed": True}
 
 
+def _is_email_report_request(message: str) -> bool:
+    text = message or ""
+    has_email_action = any(word in text for word in ("邮件", "发送", "发给", "发到", "寄", "寄给"))
+    has_report_context = any(
+        word in text for word in ("报告", "画像", "分析结果", "邮箱", "自己", "我自己")
+    )
+    return has_email_action and has_report_context
+
+
+def _is_analysis_request(message: str) -> bool:
+    text = message or ""
+    return any(
+        word in text
+        for word in (
+            "统计",
+            "查询",
+            "分析",
+            "画像",
+            "兴趣",
+            "偏好",
+            "相似",
+            "推荐",
+            "预测",
+            "趋势",
+            "预算",
+            "消费",
+            "花费",
+            "热门",
+            "目的地",
+            "城市",
+            "行程",
+            "计划",
+            "明细",
+            "详情",
+            "全部",
+            "列表",
+            "所有",
+            "分类",
+            "分布",
+            "图表",
+            "表格",
+            "数据",
+        )
+    )
+
+
+def _resolve_email_recipient(state: AgentState) -> str:
+    explicit_email = (state.get("email") or "").strip()
+    if explicit_email:
+        return explicit_email
+    return (
+        os.getenv("SMTP_FROM")
+        or os.getenv("SMTP_USERNAME")
+        or os.getenv("EMAIL_FROM")
+        or os.getenv("EMAIL_USER")
+        or "demo@example.com"
+    )
+
+
 def _router_node(state: AgentState) -> dict:
     message = state["message"]
-    if any(word in message for word in ("邮件", "发送", "发给")):
+    if _is_email_report_request(message):
         intent = "email_report"
         agent = "EmailAgent"
     elif any(word in message for word in ("分析文件", "上传", "文件")):
         intent = "file_analysis"
         agent = "FileAnalysisAgent"
+    elif not _is_analysis_request(message):
+        intent = "assistant_chat"
+        agent = "AssistantAgent"
     else:
         intent = classify_sql_intent(message)
         agent = {
@@ -89,6 +161,17 @@ def _role_node(state: AgentState) -> dict:
 
 def _dispatch_node(state: AgentState) -> dict:
     intent = state["intent"]
+    if intent == "assistant_chat":
+        return {
+            "table": [],
+            "tool": "router_tool",
+            "result": (
+                "我能听懂自然语言问题，但我会先判断它是不是旅行数据分析任务。"
+                "你可以问我旅行画像、热门目的地、平均预算、趋势预测、相似用户推荐，"
+                "也可以让我把画像报告发送到邮箱。"
+            ),
+        }
+
     if intent == "recommendation":
         payload = recommend_by_profile(state["user_id"])
         table = [
@@ -113,8 +196,9 @@ def _dispatch_node(state: AgentState) -> dict:
             lines.append(
                 f"- {item['city']}: 相似用户计划数 {item['count']}, 平均预算 {item['avg_budget']} 元"
             )
+        recipient = _resolve_email_recipient(state)
         email_result = send_email(
-            state.get("email") or "demo@example.com",
+            recipient,
             "灵途旅行画像与推荐报告",
             "\n".join(lines),
         )
@@ -122,7 +206,7 @@ def _dispatch_node(state: AgentState) -> dict:
             "table": [
                 {
                     "邮件状态": email_result["message"],
-                    "收件人": email_result.get("to", state.get("email") or "demo@example.com"),
+                    "收件人": email_result.get("to", recipient),
                 }
             ],
             "extra": {"email": email_result},
@@ -143,6 +227,26 @@ def _dispatch_node(state: AgentState) -> dict:
 
 def _execute_sql_intent(state: AgentState) -> tuple:
     """Try LLM-generated SQL first, fall back to rule-based templates."""
+    stable_intent = classify_sql_intent(state["message"])
+    if stable_intent in {
+        "city_rank",
+        "avg_budget",
+        "budget_trend",
+        "profile",
+        "traveler_type_distribution",
+        "all_plan_detail",
+    }:
+        plan = build_sql_plan(state["message"], state["user_id"], state["role"])
+        table = run_sql_plan(plan, state["role"])
+        return (
+            table,
+            plan.intent,
+            plan.agent,
+            " ".join(plan.sql.split()),
+            plan.title,
+            "sql_agent_tool",
+        )
+
     try:
         from ...tools.llm_sql_agent_tool import build_sql_plan_with_llm, run_llm_sql_plan
 
@@ -186,6 +290,8 @@ def _chart_node(state: AgentState) -> dict:
 def _report_node(state: AgentState) -> dict:
     extra = state.get("extra") or {}
     reason = extra.get("reason", "")
+    if state.get("intent") == "assistant_chat":
+        return {"result": state.get("result", "我可以帮你做旅行数据分析。")}
     if state.get("intent") == "email_report":
         email_payload = extra.get("email", {})
         return {"result": email_payload.get("message", "邮件工具已执行。")}
@@ -332,7 +438,7 @@ class TravelAgentGraph:
         nodes sequentially to keep the API identical.
         """
         initial: AgentState = {
-            "user_id": user_id or "u_current",
+            "user_id": user_id or "",
             "role": normalize_role(role),
             "message": message,
             "email": email,

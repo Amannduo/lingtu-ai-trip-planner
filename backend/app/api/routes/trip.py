@@ -48,7 +48,14 @@ async def plan_trip(request: TripRequest, http_request: Request):
         print("✅ 旅行计划生成成功,准备返回响应\n")
 
         try:
-            user_id = http_request.headers.get("x-user-id") or "u_current"
+            user_id = (http_request.headers.get("x-user-id") or "").strip()
+            if not user_id:
+                print("[trip] anonymous request — generated plan will not be saved to user dataset")
+                return TripPlanResponse(
+                    success=True,
+                    message="旅行计划生成成功",
+                    data=trip_plan
+                )
             raw_role = (http_request.headers.get("x-user-role") or "user").strip().lower()
             # Only allow known role values; fall back to "user" for unknown ones
             if raw_role not in ("guest", "user", "manager", "admin"):
@@ -89,10 +96,19 @@ async def plan_trip(request: TripRequest, http_request: Request):
     summary="查询个人旅行历史",
     description="返回当前用户的历史行程列表和统计数据"
 )
-async def trip_history(user_id: str = "u_current", limit: int = 20):
+async def trip_history(user_id: str = "", limit: int = 20):
     """查询用户历史行程和统计"""
     from ...services.database_service import fetch_all, fetch_one
     from ...services.schema import init_db
+
+    if not user_id:
+        return {
+            "success": False,
+            "user_id": "",
+            "stats": {"total_trips": 0, "avg_budget": 0, "total_days": 0},
+            "fav_cities": [],
+            "trips": [],
+        }
 
     init_db()
     trips = fetch_all(
