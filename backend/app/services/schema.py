@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS travel_plans (
     preferences   TEXT NOT NULL DEFAULT '[]',
     free_text     TEXT,
     summary       TEXT,
+    plan_json     TEXT NOT NULL DEFAULT '{}',
     status        TEXT NOT NULL DEFAULT 'completed',
     source        TEXT NOT NULL DEFAULT 'generated',
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
@@ -77,5 +78,8 @@ def init_db() -> None:
         return
     with get_db_connection() as conn:
         conn.executescript(SCHEMA_SQL)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(travel_plans)")}
+        if "plan_json" not in columns:
+            conn.execute("ALTER TABLE travel_plans ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'")
     _inited = True
     print("[db] SQLite schema initialised")

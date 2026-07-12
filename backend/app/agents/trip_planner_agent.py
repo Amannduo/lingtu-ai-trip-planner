@@ -1,14 +1,20 @@
 """多智能体旅行规划系统"""
 
 import json
+import math
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from hello_agents import SimpleAgent
 from ..services.llm_service import get_llm
 from ..services.transport_budget_service import get_transport_budget_service
 from ..services.amap_service import get_amap_service
-from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo, Location, Hotel, RouteSegment
+from ..models.schemas import (
+    TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo,
+    Location, Hotel, RouteSegment, POIInfo
+)
 from ..config import get_settings
 from .web_travel_guide_agent import get_web_travel_guide_agent
 
@@ -184,7 +190,12 @@ class MultiAgentTripPlanner:
 
             # 步骤1: 直接通过高德 Web Service 搜索景点
             print("📍 步骤1: 搜索景点...")
-            attraction_response = self._search_attractions_text(request)
+            attraction_pois = self._search_attractions(request)
+            attraction_response = self._format_pois_for_prompt(
+                "高德景点搜索结果",
+                attraction_pois,
+                limit=min(20, max(12, request.travel_days * 3)),
+            )
             print(f"景点搜索结果: {attraction_response[:200]}...\n")
 
             # 步骤2: 直接通过高德 Web Service 查询天气
@@ -199,7 +210,8 @@ class MultiAgentTripPlanner:
 
             # 步骤3: 直接通过高德 Web Service 搜索酒店
             print("🏨 步骤3: 搜索酒店...")
-            hotel_response = self._search_hotels_text(request)
+            hotel_pois = self._search_hotels(request, attraction_pois)
+            hotel_response = self._format_pois_for_prompt("高德酒店搜索结果", hotel_pois, limit=10)
             print(f"酒店搜索结果: {hotel_response[:200]}...\n")
 
             # 步骤4: 行程规划Agent整合信息生成计划
@@ -215,6 +227,12 @@ class MultiAgentTripPlanner:
                 trip_plan,
                 weather_response,
                 source_weather
+            )
+            trip_plan = self._ground_trip_plan(
+                request,
+                trip_plan,
+                attraction_pois,
+                hotel_pois,
             )
 
             print(f"{'='*60}")
@@ -235,19 +253,61 @@ class MultiAgentTripPlanner:
             fallback_plan = self._apply_budget_estimate(request, fallback_plan)
             return self._apply_web_guide(request, fallback_plan)
     
-    def _search_attractions_text(self, request: TripRequest) -> str:
-        keywords = request.preferences[0] if request.preferences else "景点"
-        pois = self.amap_service.search_poi(keywords, request.city)
-        if not pois and keywords != "景点":
-            pois = self.amap_service.search_poi("景点", request.city)
-        return self._format_pois_for_prompt("高德景点搜索结果", pois, limit=12)
+    def _search_attractions(self, request: TripRequest) -> List[POIInfo]:
+        preference_queries = {
+            "历史文化": "博物馆",
+            "自然风光": "风景区",
+            "艺术": "美术馆",
+            "休闲": "公园",
+            "购物": "特色街区",
+        }
+        preferred: List[POIInfo] = []
+        for preference in request.preferences:
+            query = preference_queries.get(preference)
+            if query:
+                preferred = self._merge_pois(
+                    preferred,
+                    self.amap_service.search_poi(query, request.city),
+                )
+        general = self.amap_service.search_poi("景点", request.city)
+        return self._merge_pois(preferred, general)
 
-    def _search_hotels_text(self, request: TripRequest) -> str:
-        keyword = request.accommodation or "酒店"
-        pois = self.amap_service.search_poi(keyword, request.city)
-        if not pois and keyword != "酒店":
-            pois = self.amap_service.search_poi("酒店", request.city)
-        return self._format_pois_for_prompt("高德酒店搜索结果", pois, limit=8)
+    def _search_hotels(
+        self,
+        request: TripRequest,
+        attraction_pois: List[POIInfo],
+    ) -> List[POIInfo]:
+        city_hotels = self.amap_service.search_poi("酒店", request.city)
+        center = self._poi_centroid(attraction_pois[:12])
+        if center is None:
+            return city_hotels
+        nearby = self.amap_service.search_poi_around(
+            "酒店",
+            center,
+            radius=12000,
+            city=request.city,
+        )
+        return self._merge_pois(nearby, city_hotels)
+
+    def _merge_pois(self, *groups: List[POIInfo]) -> List[POIInfo]:
+        merged: List[POIInfo] = []
+        seen: set[str] = set()
+        for group in groups:
+            for poi in group:
+                key = poi.id or f"{poi.name}:{poi.location.longitude}:{poi.location.latitude}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(poi)
+        return merged
+
+    def _poi_centroid(self, pois: List[POIInfo]) -> Optional[Location]:
+        if not pois:
+            return None
+        return Location(
+            longitude=sum(poi.location.longitude for poi in pois) / len(pois),
+            latitude=sum(poi.location.latitude for poi in pois) / len(pois),
+        )
 
     def _search_weather_text(self, request: TripRequest) -> str:
         weather = self.amap_service.get_weather(request.city, request.start_date, request.end_date)
@@ -277,6 +337,195 @@ class MultiAgentTripPlanner:
             lines.append(f"{index}. {poi.name} | {poi_type} | {address}{location}")
         return "\n".join(lines)
 
+    def _ground_trip_plan(
+        self,
+        request: TripRequest,
+        trip_plan: TripPlan,
+        attraction_pois: List[POIInfo],
+        hotel_pois: List[POIInfo],
+    ) -> TripPlan:
+        """Replace model-generated locations with verified AMap POI records."""
+        source_pool = list(attraction_pois)
+        used_ids: set[str] = set()
+        fallback_index = 0
+        search_cache: Dict[str, List[POIInfo]] = {}
+
+        for day in trip_plan.days:
+            for attraction in day.attractions:
+                matched, score = self._best_poi_match(attraction.name, source_pool)
+                if score < 0.72:
+                    if attraction.name not in search_cache:
+                        search_cache[attraction.name] = self.amap_service.search_poi(
+                            attraction.name,
+                            request.city,
+                        )
+                    searched, searched_score = self._best_poi_match(
+                        attraction.name,
+                        search_cache[attraction.name],
+                    )
+                    if searched is not None and searched_score > score:
+                        matched, score = searched, searched_score
+
+                if matched is None or score < 0.45:
+                    matched = next(
+                        (poi for poi in source_pool if poi.id not in used_ids),
+                        None,
+                    )
+                    if matched is None and source_pool:
+                        matched = source_pool[fallback_index % len(source_pool)]
+                    fallback_index += 1
+                if matched is None:
+                    continue
+                used_ids.add(matched.id)
+                self._apply_verified_poi(attraction, matched)
+
+        selected_hotel = self._select_central_hotel(
+            request,
+            trip_plan,
+            hotel_pois,
+        )
+        if selected_hotel is not None:
+            for day in trip_plan.days:
+                day.hotel = selected_hotel.model_copy(deep=True)
+        return trip_plan
+
+    def _apply_verified_poi(self, attraction: Attraction, poi: POIInfo) -> None:
+        attraction.name = poi.name
+        attraction.address = poi.address
+        attraction.location = poi.location.model_copy(deep=True)
+        attraction.poi_id = poi.id
+        attraction.rating = poi.rating
+        attraction.photos = list(poi.photos)
+        attraction.image_url = poi.photos[0] if poi.photos else attraction.image_url
+        attraction.coordinate_source = "amap_poi"
+
+    def _best_poi_match(
+        self,
+        name: str,
+        candidates: List[POIInfo],
+    ) -> tuple[Optional[POIInfo], float]:
+        best: Optional[POIInfo] = None
+        best_score = 0.0
+        target = self._normalize_poi_name(name)
+        for candidate in candidates:
+            candidate_name = self._normalize_poi_name(candidate.name)
+            if not target or not candidate_name:
+                continue
+            if target == candidate_name:
+                score = 1.0
+            elif target in candidate_name or candidate_name in target:
+                score = 0.88
+            else:
+                score = SequenceMatcher(None, target, candidate_name).ratio()
+            if score > best_score:
+                best, best_score = candidate, score
+        return best, best_score
+
+    def _normalize_poi_name(self, value: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", value or "").lower()
+
+    def _select_central_hotel(
+        self,
+        request: TripRequest,
+        trip_plan: TripPlan,
+        hotel_pois: List[POIInfo],
+    ) -> Optional[Hotel]:
+        attractions = [
+            attraction
+            for day in trip_plan.days
+            for attraction in day.attractions
+            if attraction.coordinate_source == "amap_poi"
+        ]
+        if not attractions:
+            return None
+        center = Location(
+            longitude=sum(item.location.longitude for item in attractions) / len(attractions),
+            latitude=sum(item.location.latitude for item in attractions) / len(attractions),
+        )
+        nearby = self.amap_service.search_poi_around(
+            "酒店",
+            center,
+            radius=12000,
+            city=request.city,
+        )
+        candidates = self._merge_pois(nearby, hotel_pois)
+        ranked: List[tuple[float, float, POIInfo]] = []
+        for poi in candidates:
+            distances = [
+                self._distance_km(poi.location, attraction.location)
+                for attraction in attractions
+            ]
+            if not distances:
+                continue
+            average = sum(distances) / len(distances)
+            maximum = max(distances)
+            rating = poi.rating or 3.8
+            preference_penalty = self._hotel_preference_penalty(
+                request.accommodation,
+                poi,
+                rating,
+            )
+            score = average + maximum * 0.2 - rating * 0.8 + preference_penalty
+            ranked.append((score, average, poi))
+        if not ranked:
+            return None
+
+        _, average_distance, selected = min(ranked, key=lambda item: item[0])
+        unit_price = {
+            "经济型酒店": 180,
+            "舒适型酒店": 320,
+            "豪华酒店": 680,
+            "民宿": 260,
+        }.get(request.accommodation, 300)
+        return Hotel(
+            name=selected.name,
+            address=selected.address,
+            location=selected.location.model_copy(deep=True),
+            price_range=f"参考 {unit_price - 60}-{unit_price + 100} 元/晚",
+            rating=f"{selected.rating:.1f}" if selected.rating else "暂无",
+            distance=f"距行程景点平均约 {average_distance:.1f} 公里",
+            type=request.accommodation,
+            estimated_cost=unit_price,
+            poi_id=selected.id,
+            selection_reason=(
+                "基于全部行程景点的平均距离、最远距离、高德评分和住宿偏好综合排序；"
+                "优先选择行程中心附近、往返更均衡的住宿。"
+            ),
+        )
+
+    def _hotel_preference_penalty(
+        self,
+        accommodation: str,
+        poi: POIInfo,
+        rating: float,
+    ) -> float:
+        text = f"{poi.name} {poi.type}"
+        if accommodation == "豪华酒店" and rating < 4.2:
+            return 4.0
+        if accommodation == "民宿" and not any(word in text for word in ("民宿", "客栈", "公寓")):
+            return 2.5
+        if accommodation == "经济型酒店" and any(word in text for word in ("度假", "豪华", "国际")):
+            return 1.5
+        return 0.0
+
+    def _distance_km(self, origin: Location, destination: Location) -> float:
+        lon1, lat1, lon2, lat2 = map(
+            math.radians,
+            [
+                origin.longitude,
+                origin.latitude,
+                destination.longitude,
+                destination.latitude,
+            ],
+        )
+        delta_lon = lon2 - lon1
+        delta_lat = lat2 - lat1
+        value = (
+            math.sin(delta_lat / 2) ** 2
+            + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+        )
+        return 6371.0 * 2 * math.asin(min(1.0, math.sqrt(value)))
+
     def _build_planner_query(self, request: TripRequest, attractions: str, weather: str, hotels: str = "") -> str:
         """构建行程规划查询"""
         query = f"""请根据以下信息生成{request.city}的{request.travel_days}天旅行计划:
@@ -300,7 +549,7 @@ class MultiAgentTripPlanner:
 {hotels}
 
 **要求:**
-1. 每天安排2-3个景点
+1. 每天安排2-3个景点，只能从上方“高德景点搜索结果”中选择，不得编造景点名称或坐标
 2. 每天必须包含早中晚三餐
 3. 每天推荐一个具体的酒店(从酒店信息中选择)
 3. 考虑景点之间的距离和交通方式
@@ -566,12 +815,17 @@ class MultiAgentTripPlanner:
             origin_city=request.city,
             destination_city=request.city,
             route_type=route_type,
-            timeout=timeout
+            timeout=timeout,
+            origin_location=origin.location,
+            destination_location=destination.location,
         )
         if not data:
             return None
         distance = self._first_number_by_keys(data, ["distance", "walk_distance", "total_distance"])
         duration = int(self._first_number_by_keys(data, ["duration", "time", "cost_time"]))
+        if distance <= 0 and duration <= 0:
+            return None
+        path = self._extract_route_path(data)
         description = self._route_description(data, origin.name, destination.name, route_type)
 
         return RouteSegment(
@@ -582,8 +836,51 @@ class MultiAgentTripPlanner:
             route_type=route_type,
             distance=distance,
             duration=duration,
-            description=description
+            description=description,
+            path=path,
+            source="amap_route",
+            verified=len(path) >= 2,
         )
+
+    def _extract_route_path(self, data: Any) -> List[Location]:
+        route = data.get("route") if isinstance(data, dict) else None
+        if not isinstance(route, dict):
+            return []
+        options = route.get("paths") or route.get("transits") or []
+        root = options[0] if isinstance(options, list) and options else route
+        path: List[Location] = []
+
+        def append_polyline(value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            for pair in value.split(";"):
+                parts = pair.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    point = Location(longitude=float(parts[0]), latitude=float(parts[1]))
+                except (TypeError, ValueError):
+                    continue
+                if not path or (
+                    path[-1].longitude != point.longitude
+                    or path[-1].latitude != point.latitude
+                ):
+                    path.append(point)
+
+        def visit(value: Any) -> None:
+            if len(path) >= 2000:
+                return
+            if isinstance(value, dict):
+                append_polyline(value.get("polyline"))
+                for key, item in value.items():
+                    if key != "polyline":
+                        visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(root)
+        return path
 
     def _route_type_for_request(self, request: TripRequest) -> str:
         text = f"{request.transportation or ''} {request.free_text_input or ''}".lower()

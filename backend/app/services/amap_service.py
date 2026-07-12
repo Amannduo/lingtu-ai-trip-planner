@@ -53,6 +53,13 @@ def _parse_location(value: Any) -> Optional[Location]:
     return None
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _safe_int(value: Any) -> int:
     if value is None:
         return 0
@@ -125,6 +132,31 @@ class AmapService:
             return data
         return {}
 
+    def _parse_poi_item(self, item: Dict[str, Any], query: str, city: str) -> Optional[POIInfo]:
+        location = _parse_location(item.get("location") or item.get("point"))
+        if location is None:
+            return None
+        name = _to_text(item.get("name"))
+        if not name:
+            return None
+        biz_ext = item.get("biz_ext") if isinstance(item.get("biz_ext"), dict) else {}
+        photos = [
+            _to_text(photo.get("url"))
+            for photo in (item.get("photos") or [])
+            if isinstance(photo, dict) and photo.get("url")
+        ]
+        return POIInfo(
+            id=_to_text(item.get("id") or item.get("poiid") or name),
+            name=name,
+            type=_to_text(item.get("type") or item.get("typecode") or query),
+            address=_to_text(item.get("address") or item.get("pname") or city),
+            location=location,
+            tel=_to_text(item.get("tel")) or None,
+            rating=_safe_float(biz_ext.get("rating")),
+            photos=photos[:3],
+            district=_to_text(item.get("adname")),
+        )
+
     def search_poi(self, keywords: str, city: str, citylimit: bool = True) -> List[POIInfo]:
         """搜索 POI。"""
         cache_key = ("poi", (keywords or "").strip(), (city or "").strip(), bool(citylimit))
@@ -149,7 +181,7 @@ class AmapService:
                         "citylimit": str(citylimit).lower(),
                         "offset": 20,
                         "page": 1,
-                        "extensions": "base",
+                        "extensions": "all",
                     },
                 )
                 print(f"AMap POI result: {_preview(data)}...")
@@ -162,20 +194,9 @@ class AmapService:
                 for item in data.get("pois") or []:
                     if not isinstance(item, dict):
                         continue
-                    location = _parse_location(item.get("location") or item.get("point"))
-                    if location is None:
-                        continue
-                    name = _to_text(item.get("name"))
-                    if not name:
-                        continue
-                    pois.append(POIInfo(
-                        id=_to_text(item.get("id") or item.get("poiid") or name),
-                        name=name,
-                        type=_to_text(item.get("type") or item.get("typecode") or query),
-                        address=_to_text(item.get("address") or item.get("pname") or city),
-                        location=location,
-                        tel=_to_text(item.get("tel")) or None,
-                    ))
+                    poi = self._parse_poi_item(item, query, city)
+                    if poi is not None:
+                        pois.append(poi)
 
                 if pois:
                     self._cache_set(self._poi_cache, cache_key, pois)
@@ -189,6 +210,48 @@ class AmapService:
             return []
         except Exception as e:
             print(f"AMap POI failed: {str(e)}")
+            return []
+
+    def search_poi_around(
+        self,
+        keywords: str,
+        center: Location,
+        *,
+        radius: int = 10000,
+        city: str = "",
+    ) -> List[POIInfo]:
+        """Search POIs around a verified coordinate, used for location-aware hotels."""
+        location_text = f"{center.longitude:.6f},{center.latitude:.6f}"
+        cache_key = ("around", keywords.strip(), location_text, int(radius))
+        cached = self._cache_get(self._poi_cache, cache_key)
+        if cached is not None:
+            return cached
+        try:
+            data = self._get_json(
+                "https://restapi.amap.com/v3/place/around",
+                {
+                    "keywords": keywords,
+                    "location": location_text,
+                    "radius": max(1000, min(int(radius), 50000)),
+                    "sortrule": "distance",
+                    "offset": 20,
+                    "page": 1,
+                    "extensions": "all",
+                },
+            )
+            if data.get("status") != "1":
+                return []
+            pois = [
+                poi
+                for item in (data.get("pois") or [])
+                if isinstance(item, dict)
+                for poi in [self._parse_poi_item(item, keywords, city)]
+                if poi is not None
+            ]
+            self._cache_set(self._poi_cache, cache_key, pois)
+            return pois
+        except Exception as exc:
+            print(f"AMap around POI failed: {exc}")
             return []
 
     def get_weather(
@@ -412,13 +475,23 @@ class AmapService:
         origin_city: Optional[str] = None,
         destination_city: Optional[str] = None,
         route_type: str = "walking",
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        origin_location: Optional[Location] = None,
+        destination_location: Optional[Location] = None,
     ) -> Dict[str, Any]:
         """规划路线。"""
         timeout = timeout or get_settings().amap_route_timeout
         try:
-            origin = self._geocode_location(origin_address, origin_city, timeout)
-            destination = self._geocode_location(destination_address, destination_city, timeout)
+            origin = (
+                f"{origin_location.longitude:.6f},{origin_location.latitude:.6f}"
+                if origin_location is not None
+                else self._geocode_location(origin_address, origin_city, timeout)
+            )
+            destination = (
+                f"{destination_location.longitude:.6f},{destination_location.latitude:.6f}"
+                if destination_location is not None
+                else self._geocode_location(destination_address, destination_city, timeout)
+            )
             if not origin or not destination:
                 print(f"AMap route failed: geocode failed {origin_address} -> {destination_address}")
                 return {}

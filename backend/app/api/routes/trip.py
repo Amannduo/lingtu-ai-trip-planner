@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from ...models.schemas import (
     TripRequest,
+    TripPlan,
     TripPlanResponse,
     ErrorResponse
 )
@@ -47,6 +48,7 @@ async def plan_trip(request: TripRequest, http_request: Request):
 
         print("✅ 旅行计划生成成功,准备返回响应\n")
 
+        plan_no = None
         try:
             user_id = http_request.headers.get("x-user-id") or "u_current"
             raw_role = (http_request.headers.get("x-user-role") or "user").strip().lower()
@@ -71,7 +73,8 @@ async def plan_trip(request: TripRequest, http_request: Request):
         return TripPlanResponse(
             success=True,
             message="旅行计划生成成功",
-            data=trip_plan
+            data=trip_plan,
+            plan_no=plan_no,
         )
 
     except Exception as e:
@@ -97,7 +100,8 @@ async def trip_history(user_id: str = "u_current", limit: int = 20):
     init_db()
     trips = fetch_all(
         "SELECT plan_no, destination, start_date, end_date, travel_days, "
-        "budget, transportation, summary, created_at "
+        "budget, transportation, summary, created_at, "
+        "CASE WHEN plan_json IS NOT NULL AND plan_json <> '{}' THEN 1 ELSE 0 END AS has_detail "
         "FROM travel_plans WHERE user_id = :uid ORDER BY created_at DESC LIMIT :lim",
         {"uid": user_id, "lim": limit},
     )
@@ -118,8 +122,8 @@ async def trip_history(user_id: str = "u_current", limit: int = 20):
         "user_id": user_id,
         "stats": {
             "total_trips": stats.get("total", 0) if stats else 0,
-            "avg_budget": stats.get("avg_budget", 0) if stats else 0,
-            "total_days": stats.get("total_days", 0) if stats else 0,
+            "avg_budget": (stats.get("avg_budget") or 0) if stats else 0,
+            "total_days": (stats.get("total_days") or 0) if stats else 0,
         } if stats else {"total_trips": 0, "avg_budget": 0, "total_days": 0},
         "fav_cities": [{"city": r["city"], "count": r["count"]} for r in fav],
         "trips": [
@@ -132,10 +136,28 @@ async def trip_history(user_id: str = "u_current", limit: int = 20):
                 "budget": t["budget"],
                 "transportation": t["transportation"],
                 "summary": t["summary"],
+                "created_at": t["created_at"],
+                "has_detail": bool(t["has_detail"]),
             }
             for t in trips
         ],
     }
+
+
+@router.get("/history/{plan_no}", response_model=TripPlanResponse, summary="读取历史旅行计划")
+async def trip_history_detail(plan_no: str, user_id: str = "u_current"):
+    plan = get_travel_plan_data_service().get_trip_plan(plan_no, user_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="未找到该旅行计划，或当前用户无权访问")
+    return TripPlanResponse(success=True, message="旅行计划读取成功", data=plan, plan_no=plan_no)
+
+
+@router.put("/history/{plan_no}", response_model=TripPlanResponse, summary="保存旅行计划修改")
+async def update_trip_history(plan_no: str, plan: TripPlan, user_id: str = "u_current"):
+    updated = get_travel_plan_data_service().update_trip_plan(plan_no, user_id, plan)
+    if not updated:
+        raise HTTPException(status_code=404, detail="未找到该旅行计划，或当前用户无权修改")
+    return TripPlanResponse(success=True, message="旅行计划修改已保存", data=plan, plan_no=plan_no)
 
 
 @router.get(

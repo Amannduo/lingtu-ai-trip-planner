@@ -34,12 +34,12 @@ class TravelPlanDataService:
                (plan_no, user_id, user_role, origin_city, destination,
                 start_date, end_date, travel_days, travelers,
                 budget, actual_cost, transportation, accommodation,
-                preferences, free_text, summary, status, source)
+                preferences, free_text, summary, plan_json, status, source)
                VALUES
                (:plan_no, :user_id, :user_role, :origin_city, :destination,
                 :start_date, :end_date, :travel_days, :travelers,
                 :budget, :actual_cost, :transportation, :accommodation,
-                :preferences, :free_text, :summary, :status, :source)""",
+                :preferences, :free_text, :summary, :plan_json, :status, :source)""",
             {
                 "plan_no": plan_no,
                 "user_id": user_id,
@@ -57,12 +57,55 @@ class TravelPlanDataService:
                 "preferences": json.dumps(request.preferences, ensure_ascii=False),
                 "free_text": request.free_text_input or "",
                 "summary": summary,
+                "plan_json": json.dumps(trip_plan.model_dump(mode="json"), ensure_ascii=False),
                 "status": "completed",
                 "source": source,
             },
         )
         self._refresh_profile(user_id)
         return plan_no
+
+    def get_trip_plan(self, plan_no: str, user_id: str) -> TripPlan | None:
+        init_db()
+        row = fetch_one(
+            "SELECT plan_json FROM travel_plans WHERE plan_no = :plan_no AND user_id = :user_id",
+            {"plan_no": plan_no, "user_id": user_id},
+        )
+        if not row or not row.get("plan_json"):
+            return None
+        try:
+            return TripPlan.model_validate(json.loads(row["plan_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    def update_trip_plan(self, plan_no: str, user_id: str, trip_plan: TripPlan) -> bool:
+        init_db()
+        existing = fetch_one(
+            "SELECT plan_no FROM travel_plans WHERE plan_no = :plan_no AND user_id = :user_id",
+            {"plan_no": plan_no, "user_id": user_id},
+        )
+        if not existing:
+            return False
+        execute(
+            """UPDATE travel_plans
+               SET destination = :destination, start_date = :start_date, end_date = :end_date,
+                   travel_days = :travel_days, budget = :budget, summary = :summary,
+                   plan_json = :plan_json
+               WHERE plan_no = :plan_no AND user_id = :user_id""",
+            {
+                "destination": trip_plan.city,
+                "start_date": trip_plan.start_date,
+                "end_date": trip_plan.end_date,
+                "travel_days": len(trip_plan.days),
+                "budget": trip_plan.budget.total if trip_plan.budget else None,
+                "summary": _summary_from_plan(trip_plan),
+                "plan_json": json.dumps(trip_plan.model_dump(mode="json"), ensure_ascii=False),
+                "plan_no": plan_no,
+                "user_id": user_id,
+            },
+        )
+        self._refresh_profile(user_id)
+        return True
 
     def _refresh_profile(self, user_id: str) -> None:
         rows = fetch_all(

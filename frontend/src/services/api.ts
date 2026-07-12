@@ -4,7 +4,9 @@ import type {
   AgentChatResponse,
   DestinationChatRequest,
   DestinationChatResponse,
+  MapContextPOI,
   TripFormData,
+  TripPlan,
   TripPlanResponse
 } from '@/types'
 
@@ -155,6 +157,8 @@ export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
     budget: number
     transportation: string
     summary: string
+    created_at: string
+    has_detail: boolean
   }[]
 }> {
   try {
@@ -165,6 +169,66 @@ export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
   } catch (error: any) {
     console.error('获取历史行程失败:', error)
     return { success: false, user_id: userId, stats: { total_trips: 0, avg_budget: 0, total_days: 0 }, fav_cities: [], trips: [] }
+  }
+}
+
+export async function fetchTripPlan(
+  planNo: string,
+  userId: string = 'u_current'
+): Promise<TripPlanResponse> {
+  try {
+    const response = await apiClient.get<TripPlanResponse>(`/api/trip/history/${planNo}`, {
+      params: { user_id: userId }
+    })
+    return response.data
+  } catch (error: any) {
+    throw new Error(error.response?.data?.detail || error.message || '读取历史行程失败')
+  }
+}
+
+export async function updateTripPlan(
+  planNo: string,
+  plan: NonNullable<TripPlanResponse['data']>,
+  userId: string = 'u_current'
+): Promise<TripPlanResponse> {
+  try {
+    const response = await apiClient.put<TripPlanResponse>(
+      `/api/trip/history/${planNo}`,
+      plan,
+      { params: { user_id: userId } }
+    )
+    return response.data
+  } catch (error: any) {
+    throw new Error(error.response?.data?.detail || error.message || '保存旅行计划失败')
+  }
+}
+
+export async function fetchMapContext(plan: TripPlan): Promise<MapContextPOI[]> {
+  const locations = plan.days.flatMap(day =>
+    day.attractions
+      .map(attraction => attraction.location)
+      .filter(location =>
+        Number.isFinite(Number(location?.longitude))
+        && Number.isFinite(Number(location?.latitude))
+      )
+  )
+  if (!locations.length) return []
+
+  try {
+    const response = await apiClient.post<{
+      success: boolean
+      data: MapContextPOI[]
+    }>('/api/map/context', {
+      city: plan.city,
+      locations,
+      limit: 24
+    }, {
+      timeout: 45000
+    })
+    return response.data.data || []
+  } catch (error: any) {
+    console.warn('获取地图周边场所失败:', error)
+    return []
   }
 }
 

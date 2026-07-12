@@ -5,6 +5,15 @@ export interface Location {
   latitude: number
 }
 
+export interface MapContextPOI {
+  name: string
+  category: '餐饮' | '商店' | '周边景点' | '交通' | string
+  address: string
+  location: Location
+  poi_id?: string
+  source?: string
+}
+
 export interface Attraction {
   name: string
   address: string
@@ -14,6 +23,9 @@ export interface Attraction {
   category?: string
   rating?: number
   image_url?: string
+  photos?: string[]
+  poi_id?: string
+  coordinate_source?: string
   ticket_price?: number
 }
 
@@ -35,6 +47,9 @@ export interface RouteSegment {
   distance: number
   duration: number
   description: string
+  path?: Location[]
+  source?: string
+  verified?: boolean
 }
 
 export interface Hotel {
@@ -46,6 +61,8 @@ export interface Hotel {
   distance: string
   type: string
   estimated_cost?: number
+  poi_id?: string
+  selection_reason?: string
 }
 
 export interface Budget {
@@ -115,6 +132,7 @@ export interface TripPlan {
   web_guide?: string | null
   web_references: WebReference[]
   agent_audit?: AgentAuditResult | null
+  map_context?: MapContextPOI[]
 }
 
 export interface TripFormData {
@@ -136,6 +154,7 @@ export interface TripPlanResponse {
   success: boolean
   message: string
   data?: TripPlan
+  plan_no?: string | null
 }
 
 export interface ChatMessage {

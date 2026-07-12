@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # 高德地图API配置
     amap_api_key: str = ""
     amap_route_timeout: int = 12
-    amap_route_max_segments: int = 6
+    amap_route_max_segments: int = 24
 
     # Unsplash API配置
     unsplash_access_key: str = ""

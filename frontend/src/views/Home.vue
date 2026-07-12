@@ -257,12 +257,20 @@
               </span>
             </div>
             <div class="history-list">
-              <div v-for="trip in history.trips.slice(0, 6)" :key="trip.plan_no" class="history-card">
+              <button
+                v-for="trip in history.trips.slice(0, 6)"
+                :key="trip.plan_no"
+                type="button"
+                class="history-card"
+                :disabled="!trip.has_detail"
+                @click="openHistoryTrip(trip.plan_no)"
+              >
                 <strong>{{ trip.destination }}</strong>
                 <span>{{ trip.start_date }} ~ {{ trip.end_date }}</span>
                 <span>{{ trip.travel_days }}天 · {{ trip.transportation }}</span>
                 <span v-if="trip.budget">¥{{ trip.budget }}</span>
-              </div>
+                <span class="history-open">{{ trip.has_detail ? '查看计划 →' : '旧记录仅摘要' }}</span>
+              </button>
             </div>
           </div>
 
@@ -389,7 +397,13 @@ import {
   SendOutlined,
   SettingOutlined
 } from '@ant-design/icons-vue'
-import { chatDestinationRecommendation, fetchTripHistory, generateTripPlan } from '@/services/api'
+import {
+  chatDestinationRecommendation,
+  fetchTripHistory,
+  fetchTripPlan,
+  generateTripPlan
+} from '@/services/api'
+import { saveTripCache } from '@/services/tripCache'
 import type { ChatMessage, DestinationRecommendation, TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 import { onMounted } from 'vue'
@@ -427,6 +441,18 @@ onMounted(async () => {
 // Refresh history after generating a plan
 const refreshHistory = async () => {
   history.value = await fetchTripHistory('u_current')
+}
+
+const openHistoryTrip = async (planNo: string) => {
+  try {
+    const response = await fetchTripPlan(planNo, 'u_current')
+    if (!response.data) throw new Error('历史计划数据为空')
+    saveTripCache(response.data, planNo)
+    sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
+    await router.push({ path: '/result', query: { plan: planNo } })
+  } catch (error: any) {
+    message.error(error.message || '历史计划读取失败')
+  }
 }
 
 const transportationOptions = ['公共交通', '自驾', '步行', '混合']
@@ -594,6 +620,7 @@ const handleSubmit = async () => {
 
     if (response.success && response.data) {
       sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
+      saveTripCache(response.data, response.plan_no)
       refreshHistory()
       message.success('旅行计划生成成功')
       setTimeout(() => {
@@ -1080,6 +1107,11 @@ const handleSubmit = async () => {
 }
 
 .history-card {
+  width: 100%;
+  border: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
   padding: 12px;
   border: 1px solid #dce8e4;
   border-radius: 8px;
@@ -1092,6 +1124,27 @@ const handleSubmit = async () => {
 .history-card strong {
   color: #172033;
   font-size: 15px;
+}
+
+.history-card:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.history-card:disabled:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.history-card:hover {
+  transform: translateY(-1px);
+  border-color: #8cc8bd;
+  box-shadow: 0 6px 16px rgba(15, 118, 110, 0.1);
+}
+
+.history-open {
+  color: #0f766e !important;
+  font-weight: 700;
 }
 
 .history-card span {

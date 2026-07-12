@@ -88,6 +88,16 @@ class Location(BaseModel):
     latitude: float = Field(..., description="纬度")
 
 
+class MapContextPOI(BaseModel):
+    """用于打印地图的高德周边场所。"""
+    name: str = Field(..., description="场所名称")
+    category: str = Field(..., description="分类：餐饮/商店/周边景点/交通")
+    address: str = Field(default="", description="地址")
+    location: Location = Field(..., description="高德 GCJ-02 坐标")
+    poi_id: str = Field(default="", description="高德 POI ID")
+    source: str = Field(default="amap_poi", description="数据来源")
+
+
 class Attraction(BaseModel):
     """景点信息"""
     name: str = Field(..., description="景点名称")
@@ -100,6 +110,7 @@ class Attraction(BaseModel):
     photos: Optional[List[str]] = Field(default_factory=list, description="景点图片URL列表")
     poi_id: Optional[str] = Field(default="", description="POI ID")
     image_url: Optional[str] = Field(default=None, description="图片URL")
+    coordinate_source: str = Field(default="", description="坐标来源")
     ticket_price: int = Field(default=0, description="门票价格(元)")
 
 
@@ -123,6 +134,8 @@ class Hotel(BaseModel):
     distance: str = Field(default="", description="距离景点距离")
     type: str = Field(default="", description="酒店类型")
     estimated_cost: int = Field(default=0, description="预估费用(元/晚)")
+    poi_id: str = Field(default="", description="高德 POI ID")
+    selection_reason: str = Field(default="", description="酒店位置选择说明")
 
 
 class RouteSegment(BaseModel):
@@ -135,6 +148,9 @@ class RouteSegment(BaseModel):
     distance: float = Field(default=0, description="距离(米)")
     duration: int = Field(default=0, description="时间(秒)")
     description: str = Field(default="", description="路线说明")
+    path: List[Location] = Field(default_factory=list, description="高德路线折线坐标")
+    source: str = Field(default="", description="路线数据来源")
+    verified: bool = Field(default=False, description="是否由地图服务验证")
 
 
 class DayPlan(BaseModel):
@@ -223,6 +239,7 @@ class TripPlan(BaseModel):
     web_guide: Optional[str] = Field(default=None, description="联网智能体生成的旅行攻略补充")
     web_references: List[WebReference] = Field(default_factory=list, description="联网智能体引用来源")
     agent_audit: Optional[AgentAuditResult] = Field(default=None, description="联网智能体输出审核结果")
+    map_context: List[MapContextPOI] = Field(default_factory=list, description="地图手册周边场所")
 
 
 class TripPlanResponse(BaseModel):
@@ -230,6 +247,7 @@ class TripPlanResponse(BaseModel):
     success: bool = Field(..., description="是否成功")
     message: str = Field(default="", description="消息")
     data: Optional[TripPlan] = Field(default=None, description="旅行计划数据")
+    plan_no: Optional[str] = Field(default=None, description="已保存的旅行计划编号")
 
 
 class POIInfo(BaseModel):
@@ -240,6 +258,9 @@ class POIInfo(BaseModel):
     address: str = Field(..., description="地址")
     location: Location = Field(..., description="经纬度坐标")
     tel: Optional[str] = Field(default=None, description="电话")
+    rating: Optional[float] = Field(default=None, description="高德评分")
+    photos: List[str] = Field(default_factory=list, description="高德 POI 图片")
+    district: str = Field(default="", description="所在区县")
 
 
 class POISearchResponse(BaseModel):

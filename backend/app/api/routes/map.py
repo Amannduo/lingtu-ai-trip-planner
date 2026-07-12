@@ -1,8 +1,12 @@
 """地图服务API路由"""
 
+import math
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 from typing import Optional
 from ...models.schemas import (
+    Location,
+    MapContextPOI,
     POISearchRequest,
     POISearchResponse,
     RouteInfo,
@@ -13,6 +17,33 @@ from ...models.schemas import (
 from ...services.amap_service import get_amap_service
 
 router = APIRouter(prefix="/map", tags=["地图服务"])
+
+
+class MapContextRequest(BaseModel):
+    city: str = Field(..., description="目的地城市")
+    locations: list[Location] = Field(..., min_length=1, max_length=100)
+    limit: int = Field(default=24, ge=8, le=32)
+
+
+class MapContextResponse(BaseModel):
+    success: bool
+    center: Location
+    radius: int
+    data: list[MapContextPOI]
+
+
+def _distance_m(origin: Location, destination: Location) -> float:
+    lon1, lat1, lon2, lat2 = map(
+        math.radians,
+        [origin.longitude, origin.latitude, destination.longitude, destination.latitude],
+    )
+    delta_lon = lon2 - lon1
+    delta_lat = lat2 - lat1
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+    return 6371000 * 2 * math.asin(min(1.0, math.sqrt(value)))
 
 
 def _first_value_by_keys(data, keys):
@@ -222,6 +253,65 @@ async def plan_route(request: RouteRequest):
             status_code=500,
             detail=f"路线规划失败: {str(e)}"
         )
+
+
+@router.post(
+    "/context",
+    response_model=MapContextResponse,
+    summary="查询行程周边场所",
+    description="按行程坐标中心查询高德餐饮、商店、周边景点和交通站点",
+)
+async def get_map_context(request: MapContextRequest):
+    center = Location(
+        longitude=sum(item.longitude for item in request.locations) / len(request.locations),
+        latitude=sum(item.latitude for item in request.locations) / len(request.locations),
+    )
+    max_distance = max(_distance_m(center, item) for item in request.locations)
+    radius = max(3000, min(30000, int(max_distance + 2500)))
+    categories = [
+        ("餐饮", "餐厅", 7),
+        ("商店", "便利店", 5),
+        ("周边景点", "景点", 7),
+        ("交通", "公交站", 5),
+    ]
+
+    service = get_amap_service()
+    result: list[MapContextPOI] = []
+    seen: set[str] = set()
+    for category, keyword, quota in categories:
+        if len(result) >= request.limit:
+            break
+        pois = service.search_poi_around(
+            keyword,
+            center,
+            radius=radius,
+            city=request.city,
+        )
+        added = 0
+        for poi in pois:
+            if len(result) >= request.limit or added >= quota:
+                break
+            if poi.id in seen:
+                continue
+            if any(_distance_m(poi.location, item) < 80 for item in request.locations):
+                continue
+            seen.add(poi.id)
+            result.append(MapContextPOI(
+                name=poi.name,
+                category=category,
+                address=poi.address,
+                location=poi.location,
+                poi_id=poi.id,
+                source="amap_poi",
+            ))
+            added += 1
+
+    return MapContextResponse(
+        success=True,
+        center=center,
+        radius=radius,
+        data=result,
+    )
 
 
 @router.get(
