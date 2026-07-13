@@ -302,8 +302,14 @@
                   :key="meal.type"
                   :label="getMealLabel(meal.type)"
                 >
-                  {{ meal.name }}
-                  <span v-if="meal.description"> - {{ meal.description }}</span>
+                  <div class="meal-detail">
+                    <div class="meal-heading">
+                      <strong>{{ meal.name }}</strong>
+                      <span v-if="meal.estimated_cost" class="meal-cost">参考 ¥{{ meal.estimated_cost }}</span>
+                    </div>
+                    <div v-if="meal.address" class="meal-address">地址：{{ meal.address }}</div>
+                    <p v-if="meal.description" class="meal-description">{{ meal.description }}</p>
+                  </div>
                 </a-descriptions-item>
               </a-descriptions>
             </a-collapse-panel>
@@ -884,7 +890,11 @@ const loadAttractionPhotos = async () => {
 
   tripPlan.value.days.forEach(day => {
     day.attractions.forEach(attraction => {
-      if (attraction.image_url || attraction.photos?.length) return
+      const primaryImage = attraction.image_url || attraction.photos?.[0]
+      const fallbackImage = attractionPhotos.value[attraction.name]
+      const primaryImageFailed = brokenAttractionImages.value.has(attraction.name)
+      if (fallbackImage || (primaryImage && !primaryImageFailed)) return
+
       const promise = apiClient.get('/api/poi/photo', {
         params: { name: attraction.name },
         timeout: PHOTO_REQUEST_TIMEOUT_MS
@@ -907,10 +917,12 @@ const loadAttractionPhotos = async () => {
 
 // 获取景点图片
 const getAttractionImage = (attraction: Attraction): string | undefined => {
-  if (brokenAttractionImages.value.has(attraction.name)) return undefined
+  const fallbackImage = attractionPhotos.value[attraction.name]
+  if (brokenAttractionImages.value.has(attraction.name)) return fallbackImage
+
   return attraction.image_url
     || attraction.photos?.[0]
-    || attractionPhotos.value[attraction.name]
+    || fallbackImage
     || undefined
 }
 
@@ -925,6 +937,7 @@ const expandAllDaysForExport = async () => {
   if (!tripPlan.value) return
 
   activeDays.value = tripPlan.value.days.map((_, index) => index)
+  await loadAttractionPhotos()
   await nextTick()
   await new Promise(resolve => window.setTimeout(resolve, 350))
 }
@@ -1038,6 +1051,32 @@ const createExportContainer = async () => {
     .export-render .export-summary__metrics > div {
       background: #f8fafc !important;
     }
+    .export-render .attraction-card {
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+    .export-render .attraction-image-wrapper {
+      min-height: 260px !important;
+      border: 1px solid #dbe4e1 !important;
+      border-radius: 12px !important;
+      overflow: hidden !important;
+      background: #eef6f3 !important;
+    }
+    .export-render .attraction-image {
+      width: 100% !important;
+      height: 260px !important;
+      object-fit: cover !important;
+      object-position: center center !important;
+      display: block !important;
+      background: #eef6f3 !important;
+    }
+    .export-render .attraction-no-photo {
+      min-height: 260px !important;
+      padding: 18px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      justify-content: flex-end !important;
+    }
     .export-render .export-summary {
       margin-bottom: 20px;
       padding: 22px 24px;
@@ -1136,7 +1175,7 @@ const downloadCanvas = async (canvas: HTMLCanvasElement, filename: string) => {
     canvas.toBlob(
       value => value ? resolve(value) : reject(new Error('图片压缩失败')),
       'image/jpeg',
-      0.9
+      0.92
     )
   })
   const url = URL.createObjectURL(blob)
@@ -1153,7 +1192,7 @@ const exportAsImage = async () => {
     message.loading({ content: '正在生成高清图片...', key: 'export', duration: 0 })
     await expandAllDaysForExport()
     container = await createExportContainer()
-    const canvas = await renderExportCanvas(container, 2)
+    const canvas = await renderExportCanvas(container, 2.3)
     await downloadCanvas(
       canvas,
       `旅行计划_${tripPlan.value?.city}_${new Date().getTime()}.jpg`
@@ -1217,7 +1256,7 @@ const exportAsPDF = async () => {
     message.loading({ content: '正在生成高清 PDF...', key: 'export', duration: 0 })
     await expandAllDaysForExport()
     container = await createExportContainer()
-    const canvas = await renderExportCanvas(container, 2)
+    const canvas = await renderExportCanvas(container, 2.15)
 
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true })
     const pageWidth = 194
@@ -1240,7 +1279,7 @@ const exportAsPDF = async () => {
         0, slice.start, canvas.width, height,
         0, 0, pageCanvas.width, height
       )
-      const imageData = pageCanvas.toDataURL('image/jpeg', 0.84)
+      const imageData = pageCanvas.toDataURL('image/jpeg', 0.86)
       const renderedHeight = Math.min(pageHeightMm, height * pageWidth / canvas.width)
       pdf.addImage(imageData, 'JPEG', 8, 10, pageWidth, renderedHeight, undefined, 'FAST')
     })
@@ -1793,6 +1832,45 @@ const drawRoutes = (AMap: any) => {
 .hotel-title {
   color: white !important;
   font-weight: 600;
+
+.meal-detail {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.meal-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.meal-heading strong {
+  color: #172033;
+  font-size: 14px;
+}
+
+.meal-cost {
+  flex: 0 0 auto;
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.meal-address,
+.meal-description {
+  margin: 0;
+  color: #475467;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.meal-description {
+  margin-top: 2px;
+}
 }
 
 /* 顶部信息区布局 */

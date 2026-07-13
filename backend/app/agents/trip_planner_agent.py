@@ -56,7 +56,7 @@ PLANNER_AGENT_PROMPT = """你是行程规划专家。你的任务是根据景点
           "name": "景点名称",
           "address": "详细地址",
           "location": {"longitude": 116.397128, "latitude": 39.916527},
-          "visit_duration": 120,
+          "visit_duration": 150,
           "description": "景点详细描述",
           "category": "景点类别",
           "ticket_price": 60
@@ -103,6 +103,9 @@ PLANNER_AGENT_PROMPT = """你是行程规划专家。你的任务是根据景点
    - 餐饮预估费用(estimated_cost)
    - 酒店预估费用(estimated_cost)
    - 预算汇总(budget)包含各项总费用
+8. 景点游览时间必须按景点体量和类型分别估算，不要把所有景点统一写成120分钟
+9. 景点描述应简要说明可看的内容和推荐原因，不要使用“这是某地的著名景点”等空泛句式
+10. 三餐名称应尽量具体，不能只写“早餐推荐”“午餐推荐”“晚餐推荐”等占位内容
 """
 
 
@@ -234,6 +237,7 @@ class MultiAgentTripPlanner:
                 attraction_pois,
                 hotel_pois,
             )
+            trip_plan = self._finalize_generated_content(request, trip_plan)
 
             print(f"{'='*60}")
             print(f"✅ 旅行计划生成完成!")
@@ -248,6 +252,13 @@ class MultiAgentTripPlanner:
             import traceback
             traceback.print_exc()
             fallback_plan = self._create_fallback_plan(request)
+            fallback_plan = self._ground_trip_plan(
+                request,
+                fallback_plan,
+                attraction_pois if 'attraction_pois' in locals() else [],
+                hotel_pois if 'hotel_pois' in locals() else [],
+            )
+            fallback_plan = self._finalize_generated_content(request, fallback_plan)
             fallback_plan = self._normalize_plan_dates_and_weather(request, fallback_plan)
             fallback_plan = self._apply_route_planning(request, fallback_plan)
             fallback_plan = self._apply_budget_estimate(request, fallback_plan)
@@ -397,7 +408,311 @@ class MultiAgentTripPlanner:
         attraction.rating = poi.rating
         attraction.photos = list(poi.photos)
         attraction.image_url = poi.photos[0] if poi.photos else attraction.image_url
+        if not attraction.category or attraction.category == "景点":
+            categories = [item.strip() for item in (poi.type or "").split(";") if item.strip()]
+            attraction.category = categories[-1] if categories else attraction.category
         attraction.coordinate_source = "amap_poi"
+
+    def _finalize_generated_content(self, request: TripRequest, trip_plan: TripPlan) -> TripPlan:
+        for day in trip_plan.days:
+            durations = [
+                max(0, int(attraction.visit_duration or 0))
+                for attraction in day.attractions
+            ]
+            use_suggested_durations = len(durations) > 1 and len(set(durations)) == 1
+            for attraction in day.attractions:
+                attraction.visit_duration = self._normalized_visit_duration(
+                    attraction,
+                    force_suggested=use_suggested_durations,
+                )
+                if self._needs_generated_attraction_description(attraction, request.city):
+                    attraction.description = self._build_attraction_description(request, attraction)
+
+            if self._needs_generated_day_description(day.description):
+                names = [item.name for item in day.attractions[:3] if item.name]
+                if names:
+                    joined_names = "、".join(names)
+                    day.description = (
+                        f"第{day.day_index + 1}天围绕{joined_names}展开"
+                        "，整体节奏以顺路游览和减少折返为主。"
+                    )
+                else:
+                    day.description = f"第{day.day_index + 1}天围绕{request.city}核心区域展开游览。"
+
+            day.meals = self._finalize_day_meals(request, day)
+        return trip_plan
+
+    def _normalized_visit_duration(self, attraction: Attraction, force_suggested: bool = False) -> int:
+        current = max(0, int(attraction.visit_duration or 0))
+        suggested = self._suggest_visit_duration_minutes(attraction)
+        if force_suggested or current <= 0 or current == 120:
+            return suggested
+        return max(30, min(480, current))
+
+    def _suggest_visit_duration_minutes(self, attraction: Attraction) -> int:
+        text = f"{attraction.name or ''} {attraction.category or ''}"
+        name = (attraction.name or "").strip()
+        category = (attraction.category or "").strip()
+        if any(keyword in text for keyword in ("迪士尼", "欢乐谷", "主题乐园", "游乐园", "度假区")):
+            return 360
+        if (
+            any(keyword in text for keyword in ("长城", "大型景区", "风景区", "名胜区", "动物园", "海洋馆"))
+            or category in {"山", "山岳", "山峰"}
+            or name.endswith(("山", "峰"))
+        ):
+            return 210
+        if any(keyword in text for keyword in ("博物馆", "美术馆", "艺术馆", "展览馆", "科技馆", "纪念馆")):
+            return 150
+        if any(keyword in text for keyword in ("古镇", "古城", "园林", "公园", "湖", "湿地", "海滩", "沙滩", "植物园")):
+            return 120
+        if any(keyword in text for keyword in ("步行街", "老街", "街区", "商圈", "夜市", "集市")):
+            return 90
+        if any(keyword in text for keyword in ("寺", "庙", "祠", "塔", "宫", "府", "城墙", "遗址", "教堂")):
+            return 75
+        if any(keyword in text for keyword in ("商场", "观景台", "广场")):
+            return 75
+        return 90
+
+    def _needs_generated_attraction_description(self, attraction: Attraction, city: str) -> bool:
+        text = (attraction.description or "").strip()
+        if not text or len(text) < 10:
+            return True
+        placeholders = (
+            "景点详细描述",
+            "著名景点",
+            "景点介绍",
+            "值得一游",
+            f"这是{city}的著名景点",
+        )
+        return any(token in text for token in placeholders)
+
+    def _build_attraction_description(self, request: TripRequest, attraction: Attraction) -> str:
+        category_text = f"{attraction.name or ''} {attraction.category or ''}"
+        area = self._short_place_label(attraction.address or request.city)
+        preference_note = self._preference_note(request.preferences, category_text)
+
+        if any(keyword in category_text for keyword in ("博物馆", "美术馆", "艺术馆", "展览馆", "科技馆", "纪念馆")):
+            experience = "以展览、馆藏和室内参观为主，适合系统了解相关文化内容"
+        elif any(keyword in category_text for keyword in ("公园", "园林", "湖", "湿地", "海滩", "沙滩", "植物园")):
+            experience = "以户外景观和步行游览为主，适合散步、拍照并调节当天节奏"
+        elif any(keyword in category_text for keyword in ("古镇", "古城", "老街", "步行街", "街区", "城墙")):
+            experience = "适合边走边看，体验当地街区肌理和城市风貌"
+        elif any(keyword in category_text for keyword in ("寺", "庙", "祠", "塔", "宫", "府", "遗址", "教堂")):
+            experience = "以历史建筑和人文景观为主，适合了解当地历史脉络"
+        elif any(keyword in category_text for keyword in ("主题乐园", "游乐园", "动物园", "海洋馆")):
+            experience = "项目和游览区域较多，适合安排较完整的半日体验"
+        else:
+            category = (attraction.category or "城市游览").strip()
+            experience = f"以{category}体验为主，适合作为当天线路中的一处停留点"
+
+        pieces = [f"{attraction.name}位于{area}", experience]
+        if preference_note:
+            pieces.append(preference_note)
+        return "，".join(pieces) + "。"
+
+    def _preference_note(self, preferences: List[str], text: str) -> str:
+        if not preferences:
+            return "整体游览压力较小，适合与周边景点顺路组合"
+        if "历史文化" in preferences and any(keyword in text for keyword in ("博物馆", "古镇", "古城", "遗址", "寺", "庙", "祠", "塔", "宫", "府", "城墙")):
+            return "与本次历史文化偏好匹配度较高"
+        if "艺术" in preferences and any(keyword in text for keyword in ("美术馆", "艺术馆", "展览馆")):
+            return "适合作为艺术向行程的重点停留点"
+        if "自然风光" in preferences and any(keyword in text for keyword in ("公园", "园林", "湖", "湿地", "海滩", "山")):
+            return "适合安排自然风光和轻松漫步体验"
+        if "休闲" in preferences and any(keyword in text for keyword in ("公园", "街区", "步行街", "商圈", "湖")):
+            return "适合作为轻松游览和补给休息的一段"
+        if "购物" in preferences and any(keyword in text for keyword in ("商场", "商圈", "步行街", "街区")):
+            return "便于串联逛街、补给和城市漫步"
+        return f"与本次{'、'.join(preferences[:2])}偏好基本匹配"
+
+    def _needs_generated_day_description(self, description: str) -> bool:
+        text = (description or "").strip()
+        if not text:
+            return True
+        return bool(re.fullmatch(r"第\d+天行程", text))
+
+    def _finalize_day_meals(self, request: TripRequest, day: DayPlan) -> List[Meal]:
+        if not self._needs_generated_meals(day.meals):
+            return [self._normalize_existing_meal(meal) for meal in day.meals]
+        return self._recommend_day_meals(request, day)
+
+    def _needs_generated_meals(self, meals: List[Meal]) -> bool:
+        required_types = {"breakfast", "lunch", "dinner"}
+        by_type = {meal.type: meal for meal in meals if meal.type in required_types}
+        if set(by_type) != required_types:
+            return True
+
+        for meal in by_type.values():
+            name = (meal.name or "").strip()
+            description = (meal.description or "").strip()
+            if re.fullmatch(r"第\d+天(早餐|午餐|晚餐)", name):
+                return True
+            if name in {"早餐推荐", "午餐推荐", "晚餐推荐"}:
+                return True
+            if description in {"当地特色早餐", "午餐推荐", "晚餐推荐", "早餐描述", "午餐描述", "晚餐描述"}:
+                return True
+
+        # 模型生成的餐厅名没有坐标和地址时无法核验，统一用高德周边 POI 替换。
+        return not all(meal.address and meal.location for meal in by_type.values())
+
+    def _normalize_existing_meal(self, meal: Meal) -> Meal:
+        normalized = meal.model_copy(deep=True) if hasattr(meal, 'model_copy') else meal.copy(deep=True)
+        normalized.estimated_cost = max(0, int(normalized.estimated_cost or 0))
+        if not normalized.description:
+            normalized.description = f"适合作为{self._meal_label(normalized.type)}安排"
+        return normalized
+
+    def _recommend_day_meals(self, request: TripRequest, day: DayPlan) -> List[Meal]:
+        breakfast_center = self._meal_anchor(day, 0, prefer_hotel=True)
+        lunch_center = self._meal_anchor(day, 1)
+        dinner_center = self._meal_anchor(day, -1)
+        used_ids: set[str] = set()
+
+        return [
+            self._pick_meal_candidate(request, day, "breakfast", breakfast_center, used_ids),
+            self._pick_meal_candidate(request, day, "lunch", lunch_center, used_ids),
+            self._pick_meal_candidate(request, day, "dinner", dinner_center, used_ids),
+        ]
+
+    def _meal_anchor(self, day: DayPlan, attraction_index: int, prefer_hotel: bool = False) -> Location:
+        if prefer_hotel and day.hotel and day.hotel.location:
+            return day.hotel.location.model_copy(deep=True)
+        attractions = day.attractions or []
+        if attractions:
+            target = attractions[attraction_index if attraction_index >= 0 else len(attractions) - 1]
+            return target.location.model_copy(deep=True)
+        if day.hotel and day.hotel.location:
+            return day.hotel.location.model_copy(deep=True)
+        return Location(longitude=116.397128, latitude=39.916527)
+
+    def _pick_meal_candidate(
+        self,
+        request: TripRequest,
+        day: DayPlan,
+        meal_type: str,
+        center: Location,
+        used_ids: set[str],
+    ) -> Meal:
+        primary_keyword = {
+            "breakfast": "早餐",
+            "lunch": "餐厅",
+            "dinner": "餐厅",
+        }.get(meal_type, "餐厅")
+        fallback_keywords = {
+            "breakfast": [primary_keyword, "早餐店", "小吃"],
+            "lunch": [primary_keyword, "中餐厅", "特色菜"],
+            "dinner": [primary_keyword, "本地菜", "美食"],
+        }.get(meal_type, [primary_keyword, "美食"])
+
+        candidate: Optional[POIInfo] = None
+        for keyword in fallback_keywords:
+            candidates = self.amap_service.search_poi_around(
+                keyword,
+                center,
+                radius=3000 if meal_type == "breakfast" else 5000,
+                city=request.city,
+            )
+            ranked = sorted(
+                enumerate(candidates),
+                key=lambda item: self._meal_candidate_score(item[1], meal_type, item[0]),
+                reverse=True,
+            )
+            for _, poi in ranked:
+                candidate_key = poi.id or self._normalize_poi_name(poi.name)
+                if candidate_key in used_ids or not self._is_food_poi(poi):
+                    continue
+                candidate = poi
+                used_ids.add(candidate_key)
+                break
+            if candidate is not None:
+                break
+
+        if candidate is None:
+            reference_name = self._meal_reference_name(day, meal_type)
+            return Meal(
+                type=meal_type,
+                name=f"{reference_name}附近{self._meal_label(meal_type)}",
+                description=(
+                    "暂未取得可靠的具体商家数据；"
+                    f"建议在{reference_name}附近选择高德评分较高、步行距离合适的"
+                    f"{self._meal_label(meal_type)}店，并在出发前核对营业时间"
+                ),
+                estimated_cost=self._estimated_meal_cost(meal_type),
+            )
+
+        reference_name = self._meal_reference_name(day, meal_type)
+        district = candidate.district or self._short_place_label(candidate.address or request.city)
+        details = [f"位于{district}，方便衔接{reference_name}"]
+        if candidate.rating:
+            details.append(f"高德参考评分{candidate.rating:.1f}")
+        details.append("建议出发前核对营业时间和排队情况")
+        return Meal(
+            type=meal_type,
+            name=candidate.name,
+            address=candidate.address,
+            location=candidate.location.model_copy(deep=True),
+            description="；".join(details) + "。",
+            estimated_cost=self._estimated_meal_cost(meal_type),
+        )
+
+    def _is_food_poi(self, poi: POIInfo) -> bool:
+        text = f"{poi.name or ''} {poi.type or ''}"
+        food_markers = (
+            "餐饮服务", "餐厅", "餐馆", "饭店", "酒家", "小吃", "快餐",
+            "早餐", "面馆", "粉店", "粥店", "火锅", "烧烤", "咖啡", "甜品",
+        )
+        return any(marker in text for marker in food_markers)
+
+    def _meal_candidate_score(self, poi: POIInfo, meal_type: str, index: int) -> float:
+        text = f"{poi.name or ''} {poi.type or ''}"
+        meal_markers = {
+            "breakfast": ("早餐", "包子", "粥", "面", "粉", "小吃", "快餐"),
+            "lunch": ("中餐", "餐厅", "餐馆", "饭店", "本地菜", "特色菜"),
+            "dinner": ("中餐", "餐厅", "餐馆", "饭店", "本地菜", "火锅", "烧烤"),
+        }.get(meal_type, ("餐厅", "餐馆"))
+        type_score = 2.0 if "餐饮服务" in text else 0.0
+        meal_score = 1.5 if any(marker in text for marker in meal_markers) else 0.0
+        rating_score = max(0.0, float(poi.rating or 0)) * 0.35
+        proximity_score = max(0.0, 1.5 - index * 0.08)
+        return type_score + meal_score + rating_score + proximity_score
+
+    def _meal_reference_name(self, day: DayPlan, meal_type: str) -> str:
+        attractions = day.attractions or []
+        if not attractions:
+            return "当天行程"
+        if meal_type == "breakfast":
+            return attractions[0].name
+        if meal_type == "lunch":
+            return attractions[min(1, len(attractions) - 1)].name
+        return attractions[-1].name
+
+    def _meal_label(self, meal_type: str) -> str:
+        return {
+            "breakfast": "早餐",
+            "lunch": "午餐",
+            "dinner": "晚餐",
+            "snack": "加餐",
+        }.get(meal_type, meal_type)
+
+    def _estimated_meal_cost(self, meal_type: str) -> int:
+        return {
+            "breakfast": 28,
+            "lunch": 58,
+            "dinner": 88,
+            "snack": 25,
+        }.get(meal_type, 50)
+
+    def _short_place_label(self, value: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            return "目的地区域"
+        if len(text) <= 18:
+            return text
+        for separator in ("区", "县", "市", "路", "街"):
+            index = text.find(separator)
+            if 0 < index < 12:
+                return text[: index + 1]
+        return text[:18]
 
     def _best_poi_match(
         self,

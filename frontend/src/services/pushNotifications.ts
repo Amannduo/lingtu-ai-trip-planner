@@ -15,6 +15,7 @@ export interface PushUnsubscribeResult {
 }
 
 let registrationPromise: Promise<ServiceWorkerRegistration> | null = null
+const PUSH_FLOW_TIMEOUT_MS = 12000
 
 export const isPushSupported = (): boolean => (
   typeof window !== 'undefined'
@@ -48,9 +49,42 @@ export const registerPushServiceWorker = async (): Promise<ServiceWorkerRegistra
   return registrationPromise
 }
 
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  let timer: number | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = window.setTimeout(() => {
+          reject(new Error(`${label}\u8d85\u65f6\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5`))
+        }, timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer !== null) {
+      window.clearTimeout(timer)
+    }
+  }
+}
+
 const getReadyRegistration = async (): Promise<ServiceWorkerRegistration> => {
-  const registration = await registerPushServiceWorker()
-  return registration.active ? registration : navigator.serviceWorker.ready
+  try {
+    const registration = await withTimeout(
+      registerPushServiceWorker(),
+      PUSH_FLOW_TIMEOUT_MS,
+      'Service Worker \u6ce8\u518c'
+    )
+    if (registration.active) return registration
+
+    return withTimeout(
+      navigator.serviceWorker.ready,
+      PUSH_FLOW_TIMEOUT_MS,
+      'Service Worker \u521d\u59cb\u5316'
+    )
+  } catch (error) {
+    registrationPromise = null
+    throw error
+  }
 }
 
 const decodeVapidKey = (publicKey: string): Uint8Array => {
@@ -83,15 +117,29 @@ const serializeSubscription = (
 
 export const getExistingPushSubscription = async (): Promise<PushSubscription | null> => {
   if (!isPushSupported()) return null
-  const registration = await navigator.serviceWorker.getRegistration('/')
-  return registration ? registration.pushManager.getSubscription() : null
+  const registration = await withTimeout(
+    navigator.serviceWorker.getRegistration('/'),
+    PUSH_FLOW_TIMEOUT_MS,
+    '\u8bfb\u53d6\u6d4f\u89c8\u5668\u901a\u77e5\u72b6\u6001'
+  )
+  if (!registration) return null
+
+  return withTimeout(
+    registration.pushManager.getSubscription(),
+    PUSH_FLOW_TIMEOUT_MS,
+    '\u8bfb\u53d6\u73b0\u6709\u63a8\u9001\u8ba2\u9605'
+  )
 }
 
 export const syncExistingPushSubscription = async (): Promise<boolean> => {
   if (getPushPermissionState() !== 'granted') return false
   const subscription = await getExistingPushSubscription()
   if (!subscription) return false
-  await savePushSubscription(serializeSubscription(subscription))
+  await withTimeout(
+    savePushSubscription(serializeSubscription(subscription)),
+    PUSH_FLOW_TIMEOUT_MS,
+    '\u540c\u6b65\u63a8\u9001\u8ba2\u9605'
+  )
   return true
 }
 
@@ -105,22 +153,42 @@ export const subscribeToPush = async (): Promise<PushSubscription> => {
   }
 
   const permission = permissionState === 'default'
-    ? await Notification.requestPermission()
+    ? await withTimeout(
+        Notification.requestPermission(),
+        PUSH_FLOW_TIMEOUT_MS,
+        '\u901a\u77e5\u6743\u9650\u786e\u8ba4'
+      )
     : permissionState
   if (permission !== 'granted') {
     throw new Error('\u672a\u83b7\u5f97\u684c\u9762\u901a\u77e5\u6743\u9650')
   }
 
   const registration = await getReadyRegistration()
-  let subscription = await registration.pushManager.getSubscription()
+  let subscription = await withTimeout(
+    registration.pushManager.getSubscription(),
+    PUSH_FLOW_TIMEOUT_MS,
+    '\u8bfb\u53d6\u73b0\u6709\u63a8\u9001\u8ba2\u9605'
+  )
   if (!subscription) {
-    const publicKey = await fetchVapidPublicKey()
-    subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: decodeVapidKey(publicKey) as BufferSource
-    })
+    const publicKey = await withTimeout(
+      fetchVapidPublicKey(),
+      PUSH_FLOW_TIMEOUT_MS,
+      '\u83b7\u53d6\u63a8\u9001\u516c\u94a5'
+    )
+    subscription = await withTimeout(
+      registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: decodeVapidKey(publicKey) as BufferSource
+      }),
+      PUSH_FLOW_TIMEOUT_MS,
+      '\u521b\u5efa\u6d4f\u89c8\u5668\u63a8\u9001\u8ba2\u9605'
+    )
   }
-  await savePushSubscription(serializeSubscription(subscription))
+  await withTimeout(
+    savePushSubscription(serializeSubscription(subscription)),
+    PUSH_FLOW_TIMEOUT_MS,
+    '\u4fdd\u5b58\u63a8\u9001\u8ba2\u9605'
+  )
   return subscription
 }
 
@@ -136,14 +204,22 @@ export const unsubscribeFromPush = async (
   let cleanupError: string | undefined
   if (notifyServer) {
     try {
-      const response = await deletePushSubscription(serializeSubscription(subscription))
+      const response = await withTimeout(
+        deletePushSubscription(serializeSubscription(subscription)),
+        PUSH_FLOW_TIMEOUT_MS,
+        '\u6e05\u7406\u670d\u52a1\u7aef\u8ba2\u9605'
+      )
       serverRemoved = response.success
     } catch (error: any) {
       cleanupError = error.message || '\u670d\u52a1\u7aef\u8ba2\u9605\u6e05\u7406\u5931\u8d25'
     }
   }
 
-  const unsubscribed = await subscription.unsubscribe()
+  const unsubscribed = await withTimeout(
+    subscription.unsubscribe(),
+    PUSH_FLOW_TIMEOUT_MS,
+    '\u53d6\u6d88\u6d4f\u89c8\u5668\u63a8\u9001\u8ba2\u9605'
+  )
   if (!unsubscribed) {
     throw new Error('\u6d4f\u89c8\u5668\u672a\u80fd\u53d6\u6d88\u540e\u53f0\u901a\u77e5\u8ba2\u9605')
   }
