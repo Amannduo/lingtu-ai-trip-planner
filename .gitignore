@@ -26,6 +26,16 @@ coverage/
 *.log
 *.pid
 
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+
 # Local browser/test artifacts
 .chrome-map-test/
 

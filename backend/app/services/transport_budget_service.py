@@ -446,6 +446,8 @@ class TransportBudgetService:
     def _map_accommodation_filters(self, accommodation: str) -> tuple[Optional[str], Optional[str]]:
         if "民宿" in accommodation:
             return "homestay", None
+        if "亲子" in accommodation:
+            return "hotel", "3,4"
         if "经济" in accommodation:
             return "hotel", "2,3"
         if "舒适" in accommodation:
@@ -457,6 +459,8 @@ class TransportBudgetService:
     def _fallback_hotel_price(self, accommodation: str) -> int:
         if "民宿" in accommodation:
             return 280
+        if "亲子" in accommodation:
+            return 560
         if "经济" in accommodation:
             return 220
         if "舒适" in accommodation:

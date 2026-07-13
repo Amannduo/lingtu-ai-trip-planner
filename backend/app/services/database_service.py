@@ -1,18 +1,64 @@
-"""SQLite database helpers — zero-config, auto-creates backend/data/travel.db."""
+"""Database helpers backed by SQLAlchemy for SQLite and PostgreSQL."""
 
 from __future__ import annotations
 
 import re
-import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator, Mapping, Sequence
+
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from ..config import get_settings
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = BACKEND_DIR / "data" / "travel.db"
-
-# Convert psycopg pyformat %(name)s → SQLite :name
 _PYFORMAT_RE = re.compile(r"%\((\w+)\)s")
+
+
+def _normalize_database_url(raw_url: str) -> str:
+    value = raw_url.strip()
+    if not value:
+        return f"sqlite:///{DB_PATH.as_posix()}"
+    if value.startswith("postgresql://"):
+        return value.replace("postgresql://", "postgresql+psycopg://", 1)
+    return value
+
+
+DATABASE_URL = _normalize_database_url(get_settings().database_url)
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+DIALECT_NAME = "sqlite" if IS_SQLITE else "postgresql"
+
+_engine_options: dict[str, Any] = {"future": True}
+if IS_SQLITE:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _engine_options["connect_args"] = {
+        "timeout": 30,
+        "check_same_thread": False,
+    }
+else:
+    _engine_options.update(
+        {
+            "pool_pre_ping": True,
+            "pool_size": 5,
+            "max_overflow": 10,
+            "pool_recycle": 1800,
+        }
+    )
+
+engine: Engine = create_engine(DATABASE_URL, **_engine_options)
+
+if IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=10000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 
 def _normalize_sql(sql: str) -> str:
@@ -20,38 +66,79 @@ def _normalize_sql(sql: str) -> str:
 
 
 @contextmanager
-def get_db_connection() -> Iterator[sqlite3.Connection]:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+def get_db_connection() -> Iterator[Connection]:
+    with engine.begin() as connection:
+        yield connection
+
+
+def fetch_all(
+    sql: str,
+    params: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    with engine.connect() as connection:
+        result = connection.execute(text(_normalize_sql(sql)), dict(params or {}))
+        return [dict(row) for row in result.mappings().all()]
+
+
+def fetch_one(
+    sql: str,
+    params: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(_normalize_sql(sql)),
+            dict(params or {}),
+        ).mappings().first()
+        return dict(row) if row is not None else None
+
+
+def fetch_scalar(
+    sql: str,
+    params: Mapping[str, Any] | None = None,
+) -> Any:
+    with engine.connect() as connection:
+        return connection.execute(
+            text(_normalize_sql(sql)),
+            dict(params or {}),
+        ).scalar_one_or_none()
+
+
+def execute(
+    sql: str,
+    params: Mapping[str, Any] | None = None,
+) -> int:
+    with engine.begin() as connection:
+        result = connection.execute(text(_normalize_sql(sql)), dict(params or {}))
+        return int(result.rowcount or 0)
+
+
+def execute_many(
+    sql: str,
+    rows: Sequence[Mapping[str, Any]],
+) -> int:
+    if not rows:
+        return 0
+    with engine.begin() as connection:
+        result = connection.execute(
+            text(_normalize_sql(sql)),
+            [dict(row) for row in rows],
+        )
+        return int(result.rowcount or 0)
+
+
+def _database_metadata() -> dict[str, str]:
+    return {
+        "dialect": DIALECT_NAME,
+        "database_url": "sqlite" if IS_SQLITE else "postgresql",
+    }
+
+def database_status() -> dict[str, str]:
+    """Return a connection-safe health summary without exposing the DSN."""
+    metadata = _database_metadata()
+
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def fetch_all(sql: str, params: dict | tuple | None = None) -> list[dict]:
-    sql = _normalize_sql(sql)
-    with get_db_connection() as conn:
-        cur = conn.execute(sql, params or {})
-        return [dict(row) for row in cur.fetchall()]
-
-
-def fetch_one(sql: str, params: dict | tuple | None = None) -> dict | None:
-    sql = _normalize_sql(sql)
-    with get_db_connection() as conn:
-        cur = conn.execute(sql, params or {})
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-
-def execute(sql: str, params: dict | tuple | None = None) -> None:
-    sql = _normalize_sql(sql)
-    with get_db_connection() as conn:
-        conn.execute(sql, params or {})
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        return {"status": "unavailable", **metadata}
+    return {"status": "healthy", **metadata}

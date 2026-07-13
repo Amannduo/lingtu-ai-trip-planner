@@ -1,4 +1,4 @@
-"""Travel-plan persistence — saves generated plans to SQLite."""
+"""Travel-plan persistence for SQLite and PostgreSQL."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from ..models.schemas import TripPlan, TripRequest
-from .database_service import execute, fetch_all, fetch_one, get_db_connection
+from .database_service import execute, fetch_all, fetch_one
 from .schema import init_db
 
 
@@ -20,10 +20,12 @@ class TravelPlanDataService:
         request: TripRequest,
         trip_plan: TripPlan,
         *,
-        user_id: str = "u_current",
+        user_id: str = "",
         user_role: str = "user",
         source: str = "generated",
     ) -> str:
+        if not user_id:
+            raise ValueError("user_id is required when saving a trip plan")
         init_db()
         plan_no = f"P{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
         summary = _summary_from_plan(trip_plan)
@@ -128,9 +130,17 @@ class TravelPlanDataService:
         fav_cities = _top_n(cities, 5)
 
         execute(
-            """INSERT OR REPLACE INTO user_profiles
+            """INSERT INTO user_profiles
                (user_id, plan_count, top_tags, fav_cities, avg_budget, avg_days, traveler_type, updated_at)
-               VALUES (:uid, :cnt, :tags, :cities, :avg_b, :avg_d, :ttype, datetime('now'))""",
+               VALUES (:uid, :cnt, :tags, :cities, :avg_b, :avg_d, :ttype, CURRENT_TIMESTAMP)
+               ON CONFLICT (user_id) DO UPDATE SET
+                   plan_count = excluded.plan_count,
+                   top_tags = excluded.top_tags,
+                   fav_cities = excluded.fav_cities,
+                   avg_budget = excluded.avg_budget,
+                   avg_days = excluded.avg_days,
+                   traveler_type = excluded.traveler_type,
+                   updated_at = CURRENT_TIMESTAMP""",
             {
                 "uid": user_id,
                 "cnt": len(rows),

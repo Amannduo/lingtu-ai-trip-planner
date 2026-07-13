@@ -32,9 +32,37 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # 数据库：留空时使用本地 SQLite，生产环境推荐 PostgreSQL
+    database_url: str = ""
+
     # CORS配置 - 使用字符串,在代码中分割
     cors_origins: str = "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000"
     cors_origin_regex: str = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
+
+    # 服务端认证配置
+    auth_secret_key: str = ""
+    auth_access_token_minutes: int = 480
+    auth_cookie_name: str = "lingtu_access_token"
+    auth_cookie_secure: bool = False
+    auth_manager_invite_code: str = ""
+    auth_admin_invite_code: str = ""
+    # Web Push / VAPID configuration. The private key must remain server-side.
+    web_push_vapid_public_key: str = ""
+    web_push_vapid_private_key: str = ""
+    web_push_vapid_subject: str = ""
+    web_push_max_retries: int = 2
+    web_push_retry_delay_seconds: float = 0.25
+    web_push_ttl_seconds: int = 300
+    web_push_timeout_seconds: float = 15.0
+    web_push_dns_timeout_seconds: float = 3.0
+    web_push_max_subscriptions_per_user: int = 20
+    web_push_delivery_budget_seconds: float = 30.0
+    web_push_allowed_host_suffixes: str = ""
+
+    # Real SMTP attempts are limited per authenticated user and peer IP.
+    email_quota_enabled: bool = True
+    email_user_daily_limit: int = 10
+    email_ip_hourly_limit: int = 30
 
     # 高德地图API配置
     amap_api_key: str = ""
@@ -96,6 +124,9 @@ def validate_config():
     if not settings.amap_api_key:
         errors.append("AMAP_API_KEY未配置")
 
+    if len(settings.auth_secret_key) < 32:
+        errors.append("AUTH_SECRET_KEY必须配置且至少为32个字符")
+
     # HelloAgentsLLM会自动从LLM_API_KEY读取,不强制要求OPENAI_API_KEY
     llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not llm_api_key:
@@ -125,6 +156,7 @@ def print_config():
     print(f"版本: {settings.app_version}")
     print(f"服务器: {settings.host}:{settings.port}")
     print(f"高德地图API Key: {'已配置' if settings.amap_api_key else '未配置'}")
+    print(f"后端认证: {'已配置' if len(settings.auth_secret_key) >= 32 else '未配置'}")
 
     # 检查LLM配置
     llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")

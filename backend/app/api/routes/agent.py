@@ -6,11 +6,21 @@ import os
 import tempfile
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request as HttpRequest,
+    UploadFile,
+)
+from pydantic import BaseModel, EmailStr, Field
 from starlette.concurrency import run_in_threadpool
 
 from ...agents.graph.travel_agent_graph import get_travel_agent_graph
+from ...services.auth_service import AuthenticatedUser
+from ..auth import get_current_user
 
 router = APIRouter(prefix="/agent", tags=["多智能体数据分析"])
 
@@ -18,10 +28,8 @@ router = APIRouter(prefix="/agent", tags=["多智能体数据分析"])
 # ── Chat models ──────────────────────────────────────────────────────────
 
 class AgentChatRequest(BaseModel):
-    user_id: str = Field(default="u_current", description="当前用户 ID")
-    role: str = Field(default="user", description="用户角色: guest/user/manager/admin")
-    message: str = Field(..., description="自然语言问题")
-    email: Optional[str] = Field(default=None, description="邮件发送目标")
+    message: str = Field(..., min_length=1, max_length=4000, description="自然语言问题")
+    email: Optional[EmailStr] = Field(default=None, description="邮件发送目标")
 
 
 class PermissionResult(BaseModel):
@@ -57,15 +65,20 @@ class FileAnalysisResponse(BaseModel):
 # ── Chat endpoint ────────────────────────────────────────────────────────
 
 @router.post("/chat", response_model=AgentChatResponse)
-async def agent_chat(request: AgentChatRequest):
+async def agent_chat(
+    request: AgentChatRequest,
+    http_request: HttpRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
     try:
         graph = get_travel_agent_graph()
         return await run_in_threadpool(
             graph.run,
-            request.user_id,
-            request.role,
+            current_user.user_id,
+            current_user.role,
             request.message,
-            request.email,
+            str(request.email) if request.email else current_user.email,
+            http_request.client.host if http_request.client else "unknown",
         )
     except Exception as exc:
         print(f"[agent] chat failed: {exc}")
@@ -78,8 +91,7 @@ async def agent_chat(request: AgentChatRequest):
 async def analyze_file(
     file: UploadFile = File(..., description="上传文件（支持 TXT/MD/PDF/DOCX/XLSX）"),
     question: str = Form(default="", description="额外的分析问题（可选）"),
-    user_id: str = Form(default="u_current"),
-    role: str = Form(default="user"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Upload a travel document and get AI analysis."""
     suffix = ""
@@ -112,8 +124,8 @@ async def analyze_file(
 
             data_service = get_travel_plan_data_service()
             data_service.log_query(
-                user_id=user_id,
-                user_role=role,
+                user_id=current_user.user_id,
+                user_role=current_user.role,
                 question=f"[文件分析] {file.filename} {question}".strip(),
                 intent="file_analysis",
                 result_summary=result.get("summary", ""),

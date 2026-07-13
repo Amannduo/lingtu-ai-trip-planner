@@ -148,6 +148,17 @@ export interface TripFormData {
   accommodation: string
   preferences: string[]
   free_text_input: string
+  email_on_completion?: boolean
+  delivery_email?: string | null
+}
+
+export interface EmailDeliveryResult {
+  requested: boolean
+  sent: boolean
+  dry_run: boolean
+  blocked: boolean
+  to?: string | null
+  message: string
 }
 
 export interface TripPlanResponse {
@@ -155,6 +166,7 @@ export interface TripPlanResponse {
   message: string
   data?: TripPlan
   plan_no?: string | null
+  email_delivery?: EmailDeliveryResult | null
 }
 
 export interface ChatMessage {
@@ -208,8 +220,6 @@ export interface DestinationChatResponse {
 }
 
 export interface AgentChatRequest {
-  user_id: string
-  role: 'guest' | 'user' | 'manager' | 'admin'
   message: string
   email?: string | null
 }

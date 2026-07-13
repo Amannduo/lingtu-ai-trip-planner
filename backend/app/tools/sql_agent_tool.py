@@ -1,4 +1,4 @@
-"""SQL agent for the local travel dataset (SQLite).
+"""SQL agent for the local travel dataset (SQLite/PostgreSQL).
 
 Safe, read-only, template-driven SQL for common analytics intents.
 """
@@ -23,6 +23,8 @@ class SQLPlan:
 
 def classify_sql_intent(message: str) -> str:
     text = message or ""
+    if any(w in text for w in ("预测", "下个月", "下月", "未来", "forecast")):
+        return "prediction"
     if any(w in text for w in ("画像", "兴趣", "偏好", "类型", "profile")):
         return "profile"
     if any(w in text for w in ("相似", "推荐", "适合我")):
@@ -41,7 +43,9 @@ def classify_sql_intent(message: str) -> str:
 def build_sql_plan(message: str, user_id: str, role: str) -> SQLPlan:
     intent = classify_sql_intent(message)
     role = normalize_role(role)
-    is_scoped = role in ("guest", "user")
+    text = message or ""
+    is_personal_query = any(word in text for word in ("我的", "我", "自己"))
+    is_scoped = role in ("guest", "user") and is_personal_query
 
     base_filter = "WHERE user_id = :user_id" if is_scoped else "WHERE 1=1"
     params: dict = {"user_id": user_id} if is_scoped else {}
@@ -67,7 +71,7 @@ def build_sql_plan(message: str, user_id: str, role: str) -> SQLPlan:
     if intent == "budget_trend":
         return SQLPlan(
             intent=intent, title="月度预算趋势",
-            sql=f"SELECT strftime('%Y-%m', start_date) AS 月份, "
+            sql=f"SELECT substr(start_date, 1, 7) AS 月份, "
                 f"ROUND(AVG(budget), 0) AS 平均预算 "
                 f"FROM travel_plans {base_filter} GROUP BY 月份 ORDER BY 月份 LIMIT 12",
             params=params,

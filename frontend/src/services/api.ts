@@ -12,6 +12,7 @@ import type {
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
 const DEFAULT_REQUEST_TIMEOUT_MS = 120000
+
 const readTimeoutMs = (rawValue: string | undefined, fallbackMs: number) => {
   const timeoutMs = Number(rawValue)
   return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : fallbackMs
@@ -23,47 +24,90 @@ export const PHOTO_REQUEST_TIMEOUT_MS = readTimeoutMs(import.meta.env.VITE_PHOTO
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
   timeout: DEFAULT_REQUEST_TIMEOUT_MS,
+  withCredentials: true,
   headers: {
     'Content-Type': 'application/json'
   }
 })
 
-const isTimeoutError = (error: any) => {
-  return error?.code === 'ECONNABORTED' || String(error?.message || '').toLowerCase().includes('timeout')
+export interface PushSubscriptionPayload {
+  endpoint: string
+  expirationTime: number | null
+  keys: {
+    p256dh: string
+    auth: string
+  }
 }
+
+type VapidPublicKeyResponse = {
+  success: boolean
+  public_key: string
+}
+
+type SavePushSubscriptionResponse = {
+  success: boolean
+  subscription_id: string
+  created: boolean
+}
+
+type DeletePushSubscriptionResponse = {
+  success: boolean
+  deleted: boolean
+}
+
+const isTimeoutError = (error: any) =>
+  error?.code === 'ECONNABORTED' || String(error?.message || '').toLowerCase().includes('timeout')
 
 const formatTimeout = (timeoutMs: number) => {
   const minutes = Math.round(timeoutMs / 60000)
-  return minutes >= 1 ? `${minutes}分钟` : `${Math.round(timeoutMs / 1000)}秒`
+  return minutes >= 1 ? `${minutes} 分钟` : `${Math.round(timeoutMs / 1000)} 秒`
 }
 
-// 请求拦截器
-apiClient.interceptors.request.use(
-  (config) => {
-    console.log('发送请求:', config.method?.toUpperCase(), config.url)
-    return config
-  },
-  (error) => {
-    console.error('请求错误:', error)
-    return Promise.reject(error)
-  }
-)
+const responseError = (error: any, fallback: string) =>
+  error?.response?.data?.detail || error?.message || fallback
 
-// 响应拦截器
-apiClient.interceptors.response.use(
-  (response) => {
-    console.log('收到响应:', response.status, response.config.url)
-    return response
-  },
-  (error) => {
-    console.error('响应错误:', error.response?.status, error.message)
-    return Promise.reject(error)
-  }
-)
 
-/**
- * 生成旅行计划
- */
+export async function fetchVapidPublicKey(): Promise<string> {
+  try {
+    const response = await apiClient.get<VapidPublicKeyResponse>(
+      '/api/push/vapid-public-key'
+    )
+    if (!response.data.public_key) {
+      throw new Error('\u670d\u52a1\u7aef\u672a\u63d0\u4f9b Web Push \u516c\u94a5')
+    }
+    return response.data.public_key
+  } catch (error: any) {
+    throw new Error(responseError(error, '\u65e0\u6cd5\u83b7\u53d6 Web Push \u516c\u94a5'))
+  }
+}
+
+export async function savePushSubscription(
+  subscription: PushSubscriptionPayload
+): Promise<SavePushSubscriptionResponse> {
+  try {
+    const response = await apiClient.post<SavePushSubscriptionResponse>(
+      '/api/push/subscriptions',
+      { subscription }
+    )
+    return response.data
+  } catch (error: any) {
+    throw new Error(responseError(error, '\u4fdd\u5b58\u540e\u53f0\u901a\u77e5\u8ba2\u9605\u5931\u8d25'))
+  }
+}
+
+export async function deletePushSubscription(
+  subscription: PushSubscriptionPayload
+): Promise<DeletePushSubscriptionResponse> {
+  try {
+    const response = await apiClient.delete<DeletePushSubscriptionResponse>(
+      '/api/push/subscriptions',
+      { data: { subscription } }
+    )
+    return response.data
+  } catch (error: any) {
+    throw new Error(responseError(error, '\u53d6\u6d88\u540e\u53f0\u901a\u77e5\u8ba2\u9605\u5931\u8d25'))
+  }
+}
 export async function generateTripPlan(formData: TripFormData): Promise<TripPlanResponse> {
   try {
     const response = await apiClient.post<TripPlanResponse>('/api/trip/plan', formData, {
@@ -71,17 +115,13 @@ export async function generateTripPlan(formData: TripFormData): Promise<TripPlan
     })
     return response.data
   } catch (error: any) {
-    console.error('生成旅行计划失败:', error)
     if (isTimeoutError(error)) {
-      throw new Error(`旅行计划生成耗时较长，已超过${formatTimeout(TRIP_PLAN_TIMEOUT_MS)}等待时间，请减少天数或稍后重试`)
+      throw new Error(`旅行计划生成时间较长，已超过 ${formatTimeout(TRIP_PLAN_TIMEOUT_MS)}，请减少天数或稍后重试`)
     }
-    throw new Error(error.response?.data?.detail || error.message || '生成旅行计划失败')
+    throw new Error(responseError(error, '生成旅行计划失败'))
   }
 }
 
-/**
- * 目的地推荐对话
- */
 export async function chatDestinationRecommendation(
   payload: DestinationChatRequest
 ): Promise<DestinationChatResponse> {
@@ -89,32 +129,22 @@ export async function chatDestinationRecommendation(
     const response = await apiClient.post<DestinationChatResponse>('/api/recommend/chat', payload)
     return response.data
   } catch (error: any) {
-    console.error('目的地推荐失败:', error)
-    throw new Error(error.response?.data?.detail || error.message || '目的地推荐失败')
+    throw new Error(responseError(error, '目的地推荐失败'))
   }
 }
 
-/**
- * 多智能体自然语言数据分析
- */
 export async function chatAgentAnalysis(payload: AgentChatRequest): Promise<AgentChatResponse> {
   try {
     const response = await apiClient.post<AgentChatResponse>('/api/agent/chat', payload)
     return response.data
   } catch (error: any) {
-    console.error('多智能体分析失败:', error)
-    throw new Error(error.response?.data?.detail || error.message || '多智能体分析失败')
+    throw new Error(responseError(error, '智能分析失败'))
   }
 }
 
-/**
- * 文件分析 — 上传旅行文档并获取 AI 分析结果
- */
 export async function analyzeFile(
   file: File,
-  question: string = '',
-  userId: string = 'u_current',
-  role: string = 'user'
+  question: string = ''
 ): Promise<{
   success: boolean
   summary: string
@@ -127,23 +157,17 @@ export async function analyzeFile(
     const formData = new FormData()
     formData.append('file', file)
     formData.append('question', question)
-    formData.append('user_id', userId)
-    formData.append('role', role)
     const response = await apiClient.post('/api/agent/analyze-file', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 300000 // 5 minutes for file analysis
+      timeout: 300000
     })
     return response.data
   } catch (error: any) {
-    console.error('文件分析失败:', error)
-    throw new Error(error.response?.data?.detail || error.message || '文件分析失败')
+    throw new Error(responseError(error, '文件分析失败'))
   }
 }
 
-/**
- * 获取用户旅行历史
- */
-export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
+export type TripHistoryResponse = {
   success: boolean
   user_id: string
   stats: { total_trips: number; avg_budget: number; total_days: number }
@@ -160,46 +184,46 @@ export async function fetchTripHistory(userId: string = 'u_current'): Promise<{
     created_at: string
     has_detail: boolean
   }[]
-}> {
+}
+
+const emptyHistory = (): TripHistoryResponse => ({
+  success: false,
+  user_id: '',
+  stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
+  fav_cities: [],
+  trips: []
+})
+
+export async function fetchTripHistory(): Promise<TripHistoryResponse> {
   try {
-    const response = await apiClient.get('/api/trip/history', {
-      params: { user_id: userId }
-    })
+    const response = await apiClient.get<TripHistoryResponse>('/api/trip/history')
     return response.data
-  } catch (error: any) {
-    console.error('获取历史行程失败:', error)
-    return { success: false, user_id: userId, stats: { total_trips: 0, avg_budget: 0, total_days: 0 }, fav_cities: [], trips: [] }
+  } catch {
+    return emptyHistory()
   }
 }
 
-export async function fetchTripPlan(
-  planNo: string,
-  userId: string = 'u_current'
-): Promise<TripPlanResponse> {
+export async function fetchTripPlan(planNo: string): Promise<TripPlanResponse> {
   try {
-    const response = await apiClient.get<TripPlanResponse>(`/api/trip/history/${planNo}`, {
-      params: { user_id: userId }
-    })
+    const response = await apiClient.get<TripPlanResponse>(`/api/trip/history/${planNo}`)
     return response.data
   } catch (error: any) {
-    throw new Error(error.response?.data?.detail || error.message || '读取历史行程失败')
+    throw new Error(responseError(error, '读取历史行程失败'))
   }
 }
 
 export async function updateTripPlan(
   planNo: string,
-  plan: NonNullable<TripPlanResponse['data']>,
-  userId: string = 'u_current'
+  plan: NonNullable<TripPlanResponse['data']>
 ): Promise<TripPlanResponse> {
   try {
     const response = await apiClient.put<TripPlanResponse>(
       `/api/trip/history/${planNo}`,
-      plan,
-      { params: { user_id: userId } }
+      plan
     )
     return response.data
   } catch (error: any) {
-    throw new Error(error.response?.data?.detail || error.message || '保存旅行计划失败')
+    throw new Error(responseError(error, '保存旅行计划失败'))
   }
 }
 
@@ -232,15 +256,11 @@ export async function fetchMapContext(plan: TripPlan): Promise<MapContextPOI[]> 
   }
 }
 
-/**
- * 健康检查
- */
 export async function healthCheck(): Promise<any> {
   try {
     const response = await apiClient.get('/health')
     return response.data
   } catch (error: any) {
-    console.error('健康检查失败:', error)
     throw new Error(error.message || '健康检查失败')
   }
 }

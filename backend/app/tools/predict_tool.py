@@ -1,4 +1,4 @@
-"""Simple forecast tool for destination popularity (SQLite)."""
+"""Simple forecast tool for destination popularity (SQLite/PostgreSQL)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ def predict_next_month_hot_destinations(limit: int = 8) -> list[dict]:
     rows = fetch_all(
         """WITH monthly AS (
              SELECT destination,
-                    strftime('%Y-%m', start_date) AS month,
+                    substr(start_date, 1, 7) AS month,
                     COUNT(*) AS plan_count
              FROM travel_plans
-             GROUP BY destination, strftime('%Y-%m', start_date)
+             GROUP BY destination, substr(start_date, 1, 7)
            ),
            scored AS (
              SELECT destination,

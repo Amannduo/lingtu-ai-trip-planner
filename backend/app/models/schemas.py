@@ -1,7 +1,7 @@
 """数据模型定义"""
 
 from typing import List, Optional, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import date
 
 
@@ -19,9 +19,11 @@ class TripRequest(BaseModel):
     transportation: str = Field(..., description="交通方式", example="公共交通")
     intercity_transportation: Optional[str] = Field(default=None, description="城际交通方式", example="火车/高铁")
     accommodation: str = Field(..., description="住宿偏好", example="经济型酒店")
-    preferences: List[str] = Field(default=[], description="旅行偏好标签", example=["历史文化", "美食"])
+    preferences: List[str] = Field(default_factory=list, description="旅行偏好标签", example=["历史文化", "美食"])
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
-    
+    email_on_completion: bool = Field(default=False, description="生成完成后发送邮件")
+    delivery_email: Optional[EmailStr] = Field(default=None, description="本次行程收件邮箱")
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -242,12 +244,24 @@ class TripPlan(BaseModel):
     map_context: List[MapContextPOI] = Field(default_factory=list, description="地图手册周边场所")
 
 
+class EmailDeliveryResult(BaseModel):
+    """旅行计划邮件投递状态。"""
+
+    requested: bool = True
+    sent: bool = False
+    dry_run: bool = False
+    blocked: bool = False
+    to: Optional[str] = None
+    message: str = ""
+
+
 class TripPlanResponse(BaseModel):
     """旅行计划响应"""
     success: bool = Field(..., description="是否成功")
     message: str = Field(default="", description="消息")
     data: Optional[TripPlan] = Field(default=None, description="旅行计划数据")
     plan_no: Optional[str] = Field(default=None, description="已保存的旅行计划编号")
+    email_delivery: Optional[EmailDeliveryResult] = None
 
 
 class POIInfo(BaseModel):

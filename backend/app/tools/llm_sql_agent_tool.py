@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 
+from ..services.database_service import DIALECT_NAME
 from .permission_tool import normalize_role, scope_user_filter
 from .sql_agent_tool import SQLPlan, classify_sql_intent, run_sql_plan
 
@@ -17,8 +18,8 @@ from .sql_agent_tool import SQLPlan, classify_sql_intent, run_sql_plan
 # Compact schema description fed to the LLM
 # ---------------------------------------------------------------------------
 
-DB_SCHEMA_PROMPT = """
-你是一个 SQLite SQL 查询专家。你只能生成只读 SELECT 语句。
+DB_SCHEMA_PROMPT = f"""
+你是一个 {DIALECT_NAME} SQL 查询专家。你只能生成只读 SELECT 语句。
 以下是 travel 数据库的表结构：
 
 -- 旅行计划表（核心数据，每次生成行程自动写入）
@@ -85,11 +86,11 @@ CREATE TABLE query_logs (
 
 重要规则：
 1. 只能生成 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE
-2. 参数占位符使用 :name 语法（SQLite 风格，如 :user_id）
-3. 日期函数用 strftime()，如 strftime('%Y-%m', start_date) 按月分组
+2. 参数占位符使用 :name 语法（如 :user_id）
+3. 日期函数用 strftime()，如 substr(start_date, 1, 7) 按月分组
 4. 统计/排行类查询加上 LIMIT 20
 5. 字段别名使用中文（如 AS 目的地, AS 平均预算）
-6. preferences 是 JSON 字符串，可用 json_extract() 但非必须
+6. preferences 是 JSON 字符串；除非确认方言兼容，否则不要调用数据库专有 JSON 函数
 """
 
 LLM_SQL_SYSTEM_PROMPT = f"""{DB_SCHEMA_PROMPT}
@@ -114,7 +115,7 @@ _SAFE_INSERT_POINTS = re.compile(
     r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|OFFSET)\b", re.IGNORECASE
 )
 
-_SQLITE_PARAM = ":user_id"
+_USER_ID_PARAM = ":user_id"
 
 # Marker for all user_id references in SQL
 _USER_ID_IN_SQL = re.compile(r":user_id|%\(user_id\)s|user_id\s*=", re.IGNORECASE)
@@ -133,7 +134,7 @@ def _validate_sql(sql: str) -> tuple[bool, str]:
 
 
 def _normalize_placeholders(sql: str) -> str:
-    """Convert %(param_name)s → :param_name for SQLite compatibility."""
+    """Convert %(param_name)s → :param_name for SQLAlchemy compatibility."""
     return _PYFORMAT_RE.sub(r":\1", sql)
 
 
@@ -147,7 +148,7 @@ def _sql_already_has_user_id(sql: str) -> bool:
 
 def _inject_user_filter(sql: str) -> str:
     """Insert 'WHERE user_id = :user_id' into an existing SQL statement."""
-    clause = f"user_id = {_SQLITE_PARAM}"
+    clause = f"user_id = {_USER_ID_PARAM}"
 
     if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
         # Already has a WHERE → append with AND
@@ -225,7 +226,7 @@ def _build_llm_sql_plan(message: str, user_id: str, role: str) -> SQLPlan | None
     # ── 2nd attempt (retry with error hint) ────────────────────────
     retry_prompt = (
         f"上次生成的 SQL 校验未通过。请生成一个合法的只读 SELECT 语句。\n"
-        f"参数占位符使用 :user_id 格式（SQLite 风格）。\n"
+        f"参数占位符使用 :user_id 格式。\n"
         f"原问题：{message}"
     )
     sql, title, intent = _try_generate_sql(agent, retry_prompt, message)

@@ -2,10 +2,12 @@
 
 import sys
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
-from .routes import trip, poi, recommend, agent, map as map_routes
+from ..services.database_service import database_status
+from ..services.schema import init_db
+from .routes import auth, trip, poi, push, recommend, agent, map as map_routes
 
 
 def _configure_stdio() -> None:
@@ -50,6 +52,8 @@ app.add_middleware(
 )
 
 # 注册路由
+app.include_router(auth.router, prefix="/api")
+app.include_router(push.router, prefix="/api")
 app.include_router(trip.router, prefix="/api")
 app.include_router(poi.router, prefix="/api")
 app.include_router(recommend.router, prefix="/api")
@@ -70,7 +74,8 @@ async def startup_event():
     # 验证配置
     try:
         validate_config()
-        print("\n✅ 配置验证通过")
+        init_db()
+        print("\n✅ 配置与数据库验证通过")
     except ValueError as e:
         print(f"\n❌ 配置验证失败:\n{e}")
         print("\n请检查.env文件并确保所有必要的配置项都已设置")
@@ -103,12 +108,17 @@ async def root():
 
 
 @app.get("/health")
-async def health():
+async def health(response: Response):
     """健康检查"""
+    db_status = database_status()
+    healthy = db_status["status"] == "healthy"
+    if not healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
-        "status": "healthy",
+        "status": "healthy" if healthy else "unavailable",
         "service": settings.app_name,
-        "version": settings.app_version
+        "version": settings.app_version,
+        "database": db_status,
     }
 
 

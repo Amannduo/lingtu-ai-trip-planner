@@ -1,85 +1,65 @@
-"""SQLite schema initialisation — called once on first access."""
+"""Portable schema initialization for SQLite and PostgreSQL."""
 
 from __future__ import annotations
 
-from .database_service import get_db_connection
+from threading import Lock
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS travel_plans (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_no       TEXT UNIQUE NOT NULL,
-    user_id       TEXT NOT NULL DEFAULT 'u_current',
-    user_role     TEXT NOT NULL DEFAULT 'user',
-    origin_city   TEXT,
-    destination   TEXT NOT NULL,
-    start_date    TEXT NOT NULL,
-    end_date      TEXT NOT NULL,
-    travel_days   INTEGER NOT NULL,
-    travelers     INTEGER NOT NULL DEFAULT 1,
-    budget        REAL,
-    actual_cost   REAL,
-    transportation TEXT,
-    accommodation TEXT,
-    preferences   TEXT NOT NULL DEFAULT '[]',
-    free_text     TEXT,
-    summary       TEXT,
-    plan_json     TEXT NOT NULL DEFAULT '{}',
-    status        TEXT NOT NULL DEFAULT 'completed',
-    source        TEXT NOT NULL DEFAULT 'generated',
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-);
+from sqlalchemy import inspect, text
 
-CREATE INDEX IF NOT EXISTS idx_plans_user ON travel_plans(user_id);
-CREATE INDEX IF NOT EXISTS idx_plans_dest ON travel_plans(destination);
-CREATE INDEX IF NOT EXISTS idx_plans_date ON travel_plans(start_date);
-
-CREATE TABLE IF NOT EXISTS user_profiles (
-    user_id        TEXT PRIMARY KEY,
-    plan_count     INTEGER NOT NULL DEFAULT 0,
-    top_tags       TEXT NOT NULL DEFAULT '[]',
-    fav_cities     TEXT NOT NULL DEFAULT '[]',
-    avg_budget     REAL,
-    avg_days       REAL,
-    traveler_type  TEXT,
-    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       TEXT,
-    user_role     TEXT,
-    message       TEXT,
-    agent         TEXT,
-    tool          TEXT,
-    allowed       INTEGER NOT NULL DEFAULT 1,
-    sensitive_hit INTEGER NOT NULL DEFAULT 0,
-    detail        TEXT NOT NULL DEFAULT '{}',
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS query_logs (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       TEXT,
-    user_role     TEXT,
-    question      TEXT NOT NULL,
-    intent        TEXT,
-    sql_text      TEXT,
-    result_summary TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-);
-"""
+from .database_service import DIALECT_NAME, engine
+from .db_models import metadata
 
 _inited = False
+_init_lock = Lock()
+
+
+def _column_names(table_name: str) -> set[str]:
+    return {column["name"] for column in inspect(engine).get_columns(table_name)}
+
+
+def _run_compatibility_migrations() -> None:
+    tables = set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        if "travel_plans" in tables:
+            columns = _column_names("travel_plans")
+            if "plan_json" not in columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE travel_plans "
+                        "ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                )
+
+        if "users" in tables:
+            columns = _column_names("users")
+            if "email" not in columns:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN email VARCHAR(254)")
+                )
+            # Both supported databases understand lower() expression indexes.
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_users_username_lower ON users (lower(username))"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_users_email_lower ON users (lower(email))"
+                )
+            )
 
 
 def init_db() -> None:
     global _inited
     if _inited:
         return
-    with get_db_connection() as conn:
-        conn.executescript(SCHEMA_SQL)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(travel_plans)")}
-        if "plan_json" not in columns:
-            conn.execute("ALTER TABLE travel_plans ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'")
-    _inited = True
-    print("[db] SQLite schema initialised")
+
+    with _init_lock:
+        if _inited:
+            return
+        metadata.create_all(engine, checkfirst=True)
+        _run_compatibility_migrations()
+        _inited = True
+        print(f"[db] {DIALECT_NAME} schema initialised")

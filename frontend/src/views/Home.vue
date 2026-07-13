@@ -150,10 +150,9 @@
                     <span class="form-label">住宿偏好</span>
                   </template>
                   <a-select v-model:value="formData.accommodation" size="large" class="custom-select">
-                    <a-select-option value="经济型酒店">经济型酒店</a-select-option>
-                    <a-select-option value="舒适型酒店">舒适型酒店</a-select-option>
-                    <a-select-option value="豪华酒店">豪华酒店</a-select-option>
-                    <a-select-option value="民宿">民宿</a-select-option>
+                    <a-select-option v-for="item in accommodationOptions" :key="item" :value="item">
+                      {{ item }}
+                    </a-select-option>
                   </a-select>
                 </a-form-item>
               </a-col>
@@ -226,6 +225,45 @@
             </a-form-item>
           </div>
 
+          <div class="delivery-settings">
+            <div class="delivery-channel">
+              <div class="delivery-toggle">
+                <span>
+                  <MailOutlined />
+                  生成后发送邮件
+                </span>
+                <a-switch v-model:checked="emailOnCompletion" :disabled="!currentUser" />
+              </div>
+              <a-input
+                v-if="emailOnCompletion"
+                v-model:value="deliveryEmail"
+                type="email"
+                autocomplete="email"
+                :placeholder="currentUser?.email || '收件邮箱'"
+                class="delivery-email"
+              />
+            </div>
+
+            <div class="delivery-channel">
+              <div class="delivery-toggle">
+                <span>
+                  <BellOutlined />
+                  桌面提醒
+                </span>
+                <a-switch
+                  :checked="desktopNotification"
+                  :loading="pushBusy"
+                  :disabled="pushBusy || !currentUser || !pushSupported || notificationPermission === 'denied'"
+                  @change="handleDesktopNotificationChange"
+                />
+              </div>
+              <div class="delivery-status" :class="`is-${notificationStatusTone}`">
+                <span class="delivery-status-dot"></span>
+                {{ notificationStatusText }}
+              </div>
+            </div>
+          </div>
+
           <div class="action-row">
             <a-button
               type="primary"
@@ -245,7 +283,7 @@
           </div>
 
           <!-- 旅行历史 -->
-          <div v-if="history.stats.total_trips > 0" class="history-section">
+          <div v-if="currentUser && history.stats.total_trips > 0" class="history-section">
             <div class="section-header">
               <HistoryOutlined />
               <span>我的旅行历史</span>
@@ -383,15 +421,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, reactive, watch } from 'vue'
+import { computed, ref, reactive, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
+  BellOutlined,
   BulbOutlined,
   CheckOutlined,
   CompassOutlined,
   EnvironmentOutlined,
   HistoryOutlined,
+  MailOutlined,
   MessageOutlined,
   RocketOutlined,
   SendOutlined,
@@ -403,10 +443,19 @@ import {
   fetchTripPlan,
   generateTripPlan
 } from '@/services/api'
+import {
+  getExistingPushSubscription,
+  getPushPermissionState,
+  isPushSupported,
+  subscribeToPush,
+  syncExistingPushSubscription,
+  unsubscribeFromPush,
+  type PushPermissionState
+} from '@/services/pushNotifications'
+import { getCurrentUser, type LocalUser } from '@/services/auth'
 import { saveTripCache } from '@/services/tripCache'
 import type { ChatMessage, DestinationRecommendation, TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
-import { onMounted } from 'vue'
 
 type PlannerFormData = Omit<TripFormData, 'start_date' | 'end_date'> & {
   start_date: Dayjs | null
@@ -421,31 +470,123 @@ const assistantInput = ref('')
 const assistantOriginCity = ref('')
 const assistantLoading = ref(false)
 const recommendationCount = ref(3)
+const currentUser = ref<LocalUser | null>(getCurrentUser())
+const emailOnCompletion = ref(false)
+const pushBusy = ref(false)
+const pushSupported = isPushSupported()
+const notificationPermission = ref<PushPermissionState>(getPushPermissionState())
+const deliveryEmail = ref(currentUser.value?.email || '')
+const desktopNotification = ref(false)
 const assistantMessages = ref<ChatMessage[]>([
   {
     role: 'assistant',
     content: '不确定去哪也没关系。告诉我预算、天数和你想要的旅行感觉,我会给你几个可选目的地。'
   }
 ])
+const notificationStatusText = computed(() => {
+  if (!pushSupported) {
+    return '\u5f53\u524d\u73af\u5883\u4e0d\u652f\u6301 Web Push\uff08\u751f\u4ea7\u73af\u5883\u9700 HTTPS\uff09'
+  }
+  if (!currentUser.value) return '\u767b\u5f55\u540e\u53ef\u5f00\u542f\u540e\u53f0\u901a\u77e5'
+  if (notificationPermission.value === 'denied') {
+    return '\u6743\u9650\uff1a\u5df2\u62d2\u7edd\uff08\u8bf7\u5728\u6d4f\u89c8\u5668\u7f51\u7ad9\u8bbe\u7f6e\u4e2d\u91cd\u65b0\u5141\u8bb8\uff09'
+  }
+  if (notificationPermission.value === 'default') {
+    return '\u6743\u9650\uff1a\u672a\u51b3\u5b9a'
+  }
+  return desktopNotification.value
+    ? '\u6743\u9650\uff1a\u5df2\u5141\u8bb8 \u00b7 \u540e\u53f0\u63a8\u9001\u5df2\u8ba2\u9605'
+    : '\u6743\u9650\uff1a\u5df2\u5141\u8bb8 \u00b7 \u5c1a\u672a\u8ba2\u9605'
+})
+
+const notificationStatusTone = computed(() => {
+  if (desktopNotification.value) return 'success'
+  if (notificationPermission.value === 'denied') return 'warning'
+  return 'muted'
+})
+
 const recommendations = ref<DestinationRecommendation[]>([])
-const history = ref({
+const createEmptyHistory = () => ({
   stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
   fav_cities: [] as { city: string; count: number }[],
   trips: [] as any[]
 })
 
-onMounted(async () => {
-  history.value = await fetchTripHistory('u_current')
+const history = ref(createEmptyHistory())
+
+const loadHistory = async () => {
+  if (!currentUser.value) {
+    history.value = createEmptyHistory()
+    return
+  }
+  history.value = await fetchTripHistory()
+}
+
+const refreshPushState = async () => {
+  notificationPermission.value = getPushPermissionState()
+  if (
+    !pushSupported
+    || notificationPermission.value !== 'granted'
+    || !currentUser.value
+  ) {
+    desktopNotification.value = false
+    return
+  }
+  try {
+    desktopNotification.value = Boolean(await getExistingPushSubscription())
+  } catch (error) {
+    desktopNotification.value = false
+    console.warn('[push] Failed to read browser subscription:', error)
+  }
+}
+
+const syncAuth = () => {
+  currentUser.value = getCurrentUser()
+  deliveryEmail.value = currentUser.value?.email || ''
+  if (!currentUser.value) {
+    emailOnCompletion.value = false
+    desktopNotification.value = false
+    void unsubscribeFromPush(false).catch(error => {
+      console.warn('[push] Failed to unsubscribe after logout:', error)
+    })
+  } else {
+    void syncExistingPushSubscription()
+      .then(isSubscribed => {
+        desktopNotification.value = isSubscribed
+      })
+      .catch(async error => {
+        await unsubscribeFromPush(false).catch(() => undefined)
+        desktopNotification.value = false
+        console.warn('[push] Failed to restore subscription binding:', error)
+      })
+  }
+  void loadHistory()
+}
+
+const handlePushEnvironmentChange = () => {
+  if (!document.hidden) void refreshPushState()
+}
+
+onMounted(() => {
+  window.addEventListener('lingtu-auth-change', syncAuth)
+  document.addEventListener('visibilitychange', handlePushEnvironmentChange)
+  void loadHistory()
+  void refreshPushState()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('lingtu-auth-change', syncAuth)
+  document.removeEventListener('visibilitychange', handlePushEnvironmentChange)
 })
 
 // Refresh history after generating a plan
 const refreshHistory = async () => {
-  history.value = await fetchTripHistory('u_current')
+  await loadHistory()
 }
 
 const openHistoryTrip = async (planNo: string) => {
   try {
-    const response = await fetchTripPlan(planNo, 'u_current')
+    const response = await fetchTripPlan(planNo)
     if (!response.data) throw new Error('历史计划数据为空')
     saveTripCache(response.data, planNo)
     sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
@@ -457,6 +598,7 @@ const openHistoryTrip = async (planNo: string) => {
 
 const transportationOptions = ['公共交通', '自驾', '步行', '混合']
 const intercityTransportationOptions = ['自动选择', '火车/高铁', '飞机', '自驾']
+const accommodationOptions = ['经济型酒店', '舒适型酒店', '豪华酒店', '民宿', '亲子酒店']
 const quickPrompts = ['周末短途', '预算有限', '美食优先', '自然风光', '历史文化']
 const recommendationCountOptions = [
   { label: '1个', value: 1 },
@@ -568,9 +710,63 @@ watch([() => formData.start_date, () => formData.end_date], ([start, end]) => {
   }
 })
 
+const handleDesktopNotificationChange = async (checked: boolean) => {
+  if (pushBusy.value) return
+  if (!currentUser.value) {
+    desktopNotification.value = false
+    message.warning('\u8bf7\u5148\u767b\u5f55\u518d\u5f00\u542f\u540e\u53f0\u901a\u77e5')
+    return
+  }
+
+  pushBusy.value = true
+  try {
+    if (checked) {
+      await subscribeToPush()
+      desktopNotification.value = true
+      message.success(
+        '\u540e\u53f0\u901a\u77e5\u5df2\u5f00\u542f\uff1b\u5173\u95ed\u6d4f\u89c8\u5668\u540e\u80fd\u5426\u9001\u8fbe\u53d6\u51b3\u4e8e\u6d4f\u89c8\u5668\u548c\u7cfb\u7edf\u7b56\u7565'
+      )
+    } else {
+      const result = await unsubscribeFromPush()
+      desktopNotification.value = false
+      if (result.cleanupError) {
+        message.warning(`\u6d4f\u89c8\u5668\u8ba2\u9605\u5df2\u53d6\u6d88\uff1b${result.cleanupError}`)
+      } else {
+        message.success('\u540e\u53f0\u901a\u77e5\u5df2\u5173\u95ed')
+      }
+    }
+  } catch (error: any) {
+    if (checked) {
+      await unsubscribeFromPush(false).catch(() => undefined)
+    }
+    desktopNotification.value = false
+    message.error(
+      error.message
+      || (checked ? '\u5f00\u542f\u540e\u53f0\u901a\u77e5\u5931\u8d25' : '\u5173\u95ed\u540e\u53f0\u901a\u77e5\u5931\u8d25')
+    )
+  } finally {
+    notificationPermission.value = getPushPermissionState()
+    pushBusy.value = false
+  }
+}
+
 const handleSubmit = async () => {
   if (!formData.start_date || !formData.end_date) {
     message.error('请选择日期')
+    return
+  }
+
+  const recipient = (deliveryEmail.value.trim() || currentUser.value?.email || '').trim()
+  if (emailOnCompletion.value && !currentUser.value) {
+    message.error('请先登录再发送旅行计划邮件')
+    return
+  }
+  if (emailOnCompletion.value && !recipient) {
+    message.error('请填写收件邮箱或先在账号中绑定邮箱')
+    return
+  }
+  if (emailOnCompletion.value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+    message.error('请输入有效的收件邮箱')
     return
   }
 
@@ -606,7 +802,9 @@ const handleSubmit = async () => {
       intercity_transportation: formData.intercity_transportation || null,
       accommodation: formData.accommodation,
       preferences: formData.preferences,
-      free_text_input: formData.free_text_input.trim()
+      free_text_input: formData.free_text_input.trim(),
+      email_on_completion: emailOnCompletion.value,
+      delivery_email: emailOnCompletion.value ? recipient : null
     }
 
     const response = await generateTripPlan(requestData)
@@ -623,8 +821,19 @@ const handleSubmit = async () => {
       saveTripCache(response.data, response.plan_no)
       refreshHistory()
       message.success('旅行计划生成成功')
+      const delivery = response.email_delivery
+      if (delivery?.sent) {
+        message.success(`旅行计划已发送至 ${delivery.to}`)
+      } else if (delivery?.dry_run) {
+        message.warning(delivery.message || 'SMTP 未配置，邮件未真实发送')
+      } else if (delivery?.requested) {
+        message.warning(delivery.message || '邮件发送失败')
+      }
       setTimeout(() => {
-        router.push('/result')
+        router.push({
+          path: '/result',
+          query: response.plan_no ? { plan: response.plan_no } : {}
+        })
       }, 500)
     } else {
       message.error(response.message || '生成失败')
@@ -1049,9 +1258,77 @@ const handleSubmit = async () => {
   transition: border-color 0.2s ease, background-color 0.2s ease;
 }
 
+.delivery-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 9px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.delivery-status-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #98a2b3;
+}
+
+.delivery-status.is-success {
+  color: #067647;
+}
+
+.delivery-status.is-success .delivery-status-dot {
+  background: #12b76a;
+}
+
+.delivery-status.is-warning {
+  color: #b54708;
+}
+
+.delivery-status.is-warning .delivery-status-dot {
+  background: #f79009;
+}
+
 .preference-grid :deep(.ant-checkbox-wrapper:hover) {
   border-color: #0f766e;
   background: #f0fdfa;
+}
+
+.delivery-settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 18px 0 20px;
+  border-top: 1px solid #e6ecea;
+}
+
+.delivery-channel {
+  min-width: 0;
+}
+
+.delivery-toggle {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.delivery-toggle > span {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #344054;
+  font-weight: 700;
+}
+
+.delivery-email {
+  margin-top: 10px;
 }
 
 .action-row {
@@ -1258,6 +1535,10 @@ const handleSubmit = async () => {
 
   .quick-prompts button {
     flex: 1 1 auto;
+  }
+
+  .delivery-settings {
+    grid-template-columns: 1fr;
   }
 
   .action-row {

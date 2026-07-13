@@ -672,7 +672,7 @@ const activatePlan = async (raw: unknown, planNo?: string | null) => {
   if (!normalized.map_context?.length) {
     normalized.map_context = await fetchMapContext(normalized)
     if (normalized.map_context.length && currentPlanNo.value) {
-      updateTripPlan(currentPlanNo.value, normalized, 'u_current').catch(error => {
+      updateTripPlan(currentPlanNo.value, normalized).catch(error => {
         console.warn('[result] map context persistence skipped:', error)
       })
     }
@@ -690,10 +690,14 @@ onMounted(async () => {
   const queryPlanNo = typeof route.query.plan === 'string' ? route.query.plan : ''
   try {
     if (queryPlanNo) {
-      const response = await fetchTripPlan(queryPlanNo, 'u_current')
-      if (response.data) {
-        await activatePlan(response.data, response.plan_no || queryPlanNo)
-        return
+      try {
+        const response = await fetchTripPlan(queryPlanNo)
+        if (response.data) {
+          await activatePlan(response.data, response.plan_no || queryPlanNo)
+          return
+        }
+      } catch (error) {
+        console.warn('[result] historical plan unavailable, using local draft', error)
       }
     }
 
@@ -764,7 +768,7 @@ const saveChanges = async () => {
     saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
     if (currentPlanNo.value) {
       try {
-        await updateTripPlan(currentPlanNo.value, tripPlan.value, 'u_current')
+        await updateTripPlan(currentPlanNo.value, tripPlan.value)
         message.success('修改已保存到历史记录')
       } catch (error: any) {
         message.warning(`修改已保存在本地草稿，但同步历史记录失败：${error.message}`)
