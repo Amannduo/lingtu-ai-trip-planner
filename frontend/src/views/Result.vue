@@ -410,6 +410,9 @@
       </div>
     </div>
 
+    <div v-else-if="isPlanLoading" class="result-loading">
+      <a-spin size="large" :tip="planLoadingText" />
+    </div>
     <a-empty v-else description="没有找到旅行计划数据">
       <template #image>
         <div style="font-size: 80px;">🗺️</div>
@@ -454,7 +457,9 @@ import apiClient, {
 import {
   getCacheRetention,
   loadTripCache,
+  loadTripSession,
   saveTripCache,
+  saveTripSession,
   setCacheRetention,
   type CacheRetentionMinutes
 } from '@/services/tripCache'
@@ -463,6 +468,8 @@ import type { Attraction, TripPlan } from '@/types'
 const route = useRoute()
 const router = useRouter()
 const tripPlan = ref<TripPlan | null>(null)
+const isPlanLoading = ref(true)
+const planLoadingText = '\u6b63\u5728\u6062\u590d\u65c5\u884c\u8ba1\u5212...'
 const currentPlanNo = ref<string | null>(null)
 const cacheRetention = ref<CacheRetentionMinutes>(getCacheRetention())
 const editMode = ref(false)
@@ -669,17 +676,22 @@ const activatePlan = async (raw: unknown, planNo?: string | null) => {
   const normalized = normalizeTripPlan(raw)
   if (!normalized) throw new Error('旅行计划数据格式无效')
   currentPlanNo.value = planNo || null
+  tripPlan.value = normalized
+  saveTripCache(normalized, currentPlanNo.value, cacheRetention.value)
+  saveTripSession(normalized)
   if (!normalized.map_context?.length) {
-    normalized.map_context = await fetchMapContext(normalized)
-    if (normalized.map_context.length && currentPlanNo.value) {
-      updateTripPlan(currentPlanNo.value, normalized).catch(error => {
-        console.warn('[result] map context persistence skipped:', error)
-      })
+    const mapContext = await fetchMapContext(normalized)
+    if (mapContext.length && tripPlan.value) {
+      tripPlan.value.map_context = mapContext
+      saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
+      saveTripSession(tripPlan.value)
+      if (currentPlanNo.value) {
+        updateTripPlan(currentPlanNo.value, tripPlan.value).catch(error => {
+          console.warn('[result] map context persistence skipped:', error)
+        })
+      }
     }
   }
-  tripPlan.value = normalized
-  sessionStorage.setItem('tripPlan', JSON.stringify(normalized))
-  saveTripCache(normalized, currentPlanNo.value, cacheRetention.value)
   await nextTick()
   if (!isMobileViewport.value) initMap()
   loadAttractionPhotos()
@@ -707,15 +719,17 @@ onMounted(async () => {
       return
     }
 
-    const legacy = sessionStorage.getItem('tripPlan')
+    const legacy = loadTripSession()
     if (legacy) {
-      await activatePlan(JSON.parse(legacy), null)
+      await activatePlan(legacy, null)
       return
     }
     console.warn('[result] no cached or historical trip plan found')
   } catch (error: any) {
     console.error('[result] failed to load trip plan', error)
     message.error(error.message || '结果页数据无效，请重新生成行程')
+  } finally {
+    isPlanLoading.value = false
   }
 })
 
@@ -764,7 +778,7 @@ const toggleEditMode = () => {
 const saveChanges = async () => {
   editMode.value = false
   if (tripPlan.value) {
-    sessionStorage.setItem('tripPlan', JSON.stringify(tripPlan.value))
+    saveTripSession(tripPlan.value)
     saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
     if (currentPlanNo.value) {
       try {
@@ -1370,6 +1384,12 @@ const drawRoutes = (AMap: any) => {
     linear-gradient(120deg, rgba(15, 118, 110, 0.07), rgba(37, 99, 235, 0.06)),
     #f7faf9;
   padding: 28px 24px 56px;
+}
+
+.result-loading {
+  min-height: 50vh;
+  display: grid;
+  place-items: center;
 }
 
 .draft-retention {

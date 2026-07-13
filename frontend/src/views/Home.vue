@@ -453,7 +453,7 @@ import {
   type PushPermissionState
 } from '@/services/pushNotifications'
 import { getCurrentUser, type LocalUser } from '@/services/auth'
-import { saveTripCache } from '@/services/tripCache'
+import { saveTripCache, saveTripSession } from '@/services/tripCache'
 import type { ChatMessage, DestinationRecommendation, TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
@@ -589,7 +589,7 @@ const openHistoryTrip = async (planNo: string) => {
     const response = await fetchTripPlan(planNo)
     if (!response.data) throw new Error('历史计划数据为空')
     saveTripCache(response.data, planNo)
-    sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
+    saveTripSession(response.data)
     await router.push({ path: '/result', query: { plan: planNo } })
   } catch (error: any) {
     message.error(error.message || '历史计划读取失败')
@@ -817,8 +817,8 @@ const handleSubmit = async () => {
     loadingStatus.value = '完成'
 
     if (response.success && response.data) {
-      sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
       saveTripCache(response.data, response.plan_no)
+      saveTripSession(response.data)
       refreshHistory()
       message.success('旅行计划生成成功')
       const delivery = response.email_delivery
