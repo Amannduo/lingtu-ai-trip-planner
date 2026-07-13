@@ -942,13 +942,33 @@ const waitForExportImages = async (root: HTMLElement) => {
   }))
 }
 
+const buildExportSummary = () => {
+  const summary = document.createElement('section')
+  summary.className = 'export-summary pdf-break-unit'
+  summary.innerHTML = `
+    <div class="export-summary__kicker">LINGTU TRIP DOSSIER</div>
+    <div class="export-summary__headline">
+      <div>
+        <h1>${tripPlan.value?.city || '旅行计划'}</h1>
+        <p>${tripPlan.value?.start_date || ''} 至 ${tripPlan.value?.end_date || ''}</p>
+      </div>
+      <div class="export-summary__metrics">
+        <div><span>天数</span><strong>${totalDays.value}</strong></div>
+        <div><span>景点</span><strong>${totalAttractions.value}</strong></div>
+        <div><span>预算</span><strong>${totalBudgetText.value}</strong></div>
+      </div>
+    </div>
+  `
+  return summary
+}
+
 const createExportContainer = async () => {
   const element = document.querySelector('.main-content') as HTMLElement | null
-  if (!element) throw new Error('未找到内容元素')
+  if (!element) throw new Error('未找到导出内容区域')
 
   const container = element.cloneNode(true) as HTMLElement
   container.classList.add('export-render')
-  container.style.width = '1040px'
+  container.style.width = '1120px'
   container.style.padding = '24px'
   container.style.background = '#ffffff'
   container.style.position = 'fixed'
@@ -962,6 +982,7 @@ const createExportContainer = async () => {
       color: #101828 !important;
       background: #ffffff !important;
       font-family: Arial, "Microsoft YaHei", "Noto Sans CJK SC", sans-serif !important;
+      line-height: 1.6 !important;
     }
     .export-render .ant-card,
     .export-render .ant-collapse,
@@ -971,14 +992,18 @@ const createExportContainer = async () => {
     .export-render .poster-section,
     .export-render .route-segment,
     .export-render .hotel-card,
-    .export-render .weather-card {
+    .export-render .weather-card,
+    .export-render .web-guide-content,
+    .export-render .reference-list,
+    .export-render .audit-grid {
       color: #101828 !important;
       background: #ffffff !important;
       box-shadow: none !important;
     }
     .export-render .ant-card,
     .export-render .ant-collapse,
-    .export-render .poster-section {
+    .export-render .poster-section,
+    .export-render .export-summary {
       border: 1px solid #cbd5d1 !important;
     }
     .export-render .ant-card-head {
@@ -1009,19 +1034,71 @@ const createExportContainer = async () => {
     }
     .export-render .attraction-no-photo,
     .export-render .budget-item,
-    .export-render .day-info {
+    .export-render .day-info,
+    .export-render .export-summary__metrics > div {
       background: #f8fafc !important;
+    }
+    .export-render .export-summary {
+      margin-bottom: 20px;
+      padding: 22px 24px;
+      border-radius: 8px;
+    }
+    .export-render .export-summary__kicker {
+      color: #0f766e !important;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+    }
+    .export-render .export-summary__headline {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+    }
+    .export-render .export-summary__headline h1 {
+      margin: 0 0 6px;
+      font-size: 30px;
+      line-height: 1.15;
+    }
+    .export-render .export-summary__headline p {
+      margin: 0;
+      font-size: 14px;
+      color: #475467 !important;
+    }
+    .export-render .export-summary__metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .export-render .export-summary__metrics > div {
+      min-height: 68px;
+      padding: 10px 12px;
+      border: 1px solid #dbe4e1;
+      border-radius: 8px;
+    }
+    .export-render .export-summary__metrics span {
+      display: block;
+      margin-bottom: 6px;
+      color: #667085 !important;
+      font-size: 12px;
+    }
+    .export-render .export-summary__metrics strong {
+      display: block;
+      font-size: 20px;
+      line-height: 1.2;
     }
   `
   container.prepend(printStyle)
+  container.prepend(buildExportSummary())
   container.querySelectorAll('.interactive-map-card, .export-hidden').forEach(node => node.remove())
   const topInfo = container.querySelector('.top-info-section') as HTMLElement | null
   if (topInfo) {
     topInfo.style.display = 'block'
-    topInfo.querySelectorAll('.left-info').forEach(node => {
-      (node as HTMLElement).style.width = '100%'
-    })
   }
+  container.querySelectorAll('.left-info').forEach(node => {
+    (node as HTMLElement).style.width = '100%'
+  })
   container.querySelectorAll('.ant-collapse-content').forEach(node => {
     const content = node as HTMLElement
     content.style.display = 'block'
@@ -1031,23 +1108,29 @@ const createExportContainer = async () => {
   document.body.appendChild(container)
   if (document.fonts?.ready) await document.fonts.ready
   await waitForExportImages(container)
-  await new Promise(resolve => window.setTimeout(resolve, 150))
+  await new Promise(resolve => window.setTimeout(resolve, 220))
   return container
 }
 
 const renderExportCanvas = async (container: HTMLElement, preferredScale: number) => {
   const safeHeight = Math.max(1, container.scrollHeight)
-  const scale = Math.min(preferredScale, 24000 / safeHeight)
+  const safeWidth = Math.max(1, container.scrollWidth)
+  const maxDimensionScale = Math.min(30000 / safeHeight, 16000 / safeWidth)
+  const maxAreaScale = Math.sqrt(268000000 / (safeWidth * safeHeight))
+  const scale = Math.max(1, Math.min(preferredScale, maxDimensionScale, maxAreaScale))
   return html2canvas(container, {
     backgroundColor: '#ffffff',
-    scale: Math.max(1, scale),
+    scale,
     logging: false,
     useCORS: true,
     allowTaint: false,
-    imageTimeout: 8000
+    imageTimeout: 10000,
+    windowWidth: safeWidth,
+    windowHeight: safeHeight,
+    scrollX: 0,
+    scrollY: 0
   })
 }
-
 const downloadCanvas = async (canvas: HTMLCanvasElement, filename: string) => {
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
@@ -1070,7 +1153,7 @@ const exportAsImage = async () => {
     message.loading({ content: '正在生成高清图片...', key: 'export', duration: 0 })
     await expandAllDaysForExport()
     container = await createExportContainer()
-    const canvas = await renderExportCanvas(container, 1.5)
+    const canvas = await renderExportCanvas(container, 2)
     await downloadCanvas(
       canvas,
       `旅行计划_${tripPlan.value?.city}_${new Date().getTime()}.jpg`
@@ -1094,7 +1177,7 @@ const calculatePdfSlices = (
   const rect = container.getBoundingClientRect()
   const scale = canvas.width / rect.width
   const units: PdfUnit[] = Array.from(container.querySelectorAll(
-    '.pdf-break-unit, .ant-collapse-item, .attraction-card, .route-segment, .hotel-card'
+    '.pdf-break-unit, .ant-collapse-item, .attraction-card, .route-segment, .hotel-card, .weather-card, .web-guide-card, .web-meta-card, .agent-audit-card, .reference-list, .web-guide-content, .audit-grid'
   )).map(node => {
     const itemRect = (node as HTMLElement).getBoundingClientRect()
     return {
@@ -1131,10 +1214,10 @@ const calculatePdfSlices = (
 const exportAsPDF = async () => {
   let container: HTMLElement | null = null
   try {
-    message.loading({ content: '正在生成压缩 PDF...', key: 'export', duration: 0 })
+    message.loading({ content: '正在生成高清 PDF...', key: 'export', duration: 0 })
     await expandAllDaysForExport()
     container = await createExportContainer()
-    const canvas = await renderExportCanvas(container, 1.5)
+    const canvas = await renderExportCanvas(container, 2)
 
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true })
     const pageWidth = 194
