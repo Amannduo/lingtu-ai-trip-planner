@@ -1,4 +1,4 @@
-"""Natural language multi-agent analysis routes."""
+"""Natural-language, role-scoped travel analytics routes."""
 
 from __future__ import annotations
 
@@ -6,26 +6,17 @@ import os
 import tempfile
 from typing import Any, Optional
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    File,
-    Form,
-    HTTPException,
-    Request as HttpRequest,
-    UploadFile,
-)
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request as HttpRequest, UploadFile
 from pydantic import BaseModel, EmailStr, Field
 from starlette.concurrency import run_in_threadpool
 
 from ...agents.graph.travel_agent_graph import get_travel_agent_graph
 from ...services.auth_service import AuthenticatedUser
+from ...tools.analytics_context_tool import get_data_status, get_role_capabilities
 from ..auth import get_current_user
 
 router = APIRouter(prefix="/agent", tags=["多智能体数据分析"])
 
-
-# ── Chat models ──────────────────────────────────────────────────────────
 
 class AgentChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000, description="自然语言问题")
@@ -51,8 +42,6 @@ class AgentChatResponse(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
-# ── File analysis models ─────────────────────────────────────────────────
-
 class FileAnalysisResponse(BaseModel):
     success: bool
     summary: str = ""
@@ -62,7 +51,21 @@ class FileAnalysisResponse(BaseModel):
     file_type: str = ""
 
 
-# ── Chat endpoint ────────────────────────────────────────────────────────
+@router.get("/capabilities")
+async def agent_capabilities(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Describe what the current server-authenticated role may analyse."""
+    return get_role_capabilities(current_user.role)
+
+
+@router.get("/data-status")
+async def agent_data_status(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Return data coverage for the current role's enforced row scope."""
+    return await run_in_threadpool(get_data_status, current_user.user_id, current_user.role)
+
 
 @router.post("/chat", response_model=AgentChatResponse)
 async def agent_chat(
@@ -80,12 +83,12 @@ async def agent_chat(
             str(request.email) if request.email else current_user.email,
             http_request.client.host if http_request.client else "unknown",
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
         print(f"[agent] chat failed: {exc}")
-        raise HTTPException(status_code=500, detail=f"多智能体分析失败: {exc}")
+        raise HTTPException(status_code=500, detail="智能分析暂时不可用，请稍后重试。") from exc
 
-
-# ── File analysis endpoint ───────────────────────────────────────────────
 
 @router.post("/analyze-file", response_model=FileAnalysisResponse)
 async def analyze_file(
@@ -93,37 +96,26 @@ async def analyze_file(
     question: str = Form(default="", description="额外的分析问题（可选）"),
     current_user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Upload a travel document and get AI analysis."""
-    suffix = ""
-    if file.filename and "." in file.filename:
-        suffix = os.path.splitext(file.filename)[1].lower()
-
+    suffix = os.path.splitext(file.filename or "")[1].lower()
     allowed = {".txt", ".md", ".pdf", ".docx", ".xlsx", ".xls"}
     if suffix not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"不支持的文件类型: {suffix}。支持: {', '.join(allowed)}",
-        )
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {suffix}")
 
-    # Save to temp file
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix or ".txt")
     try:
         content = await file.read()
-        with os.fdopen(tmp_fd, "wb") as fh:
-            fh.write(content)
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="文件不能超过 20 MB")
+        with os.fdopen(tmp_fd, "wb") as handle:
+            handle.write(content)
 
         from ...tools.file_analysis_tool import process_uploaded_file
 
-        result = await run_in_threadpool(
-            process_uploaded_file, tmp_path, question or None
-        )
-
-        # Log the file analysis query
+        result = await run_in_threadpool(process_uploaded_file, tmp_path, question or None)
         try:
             from ...services.travel_plan_data_service import get_travel_plan_data_service
 
-            data_service = get_travel_plan_data_service()
-            data_service.log_query(
+            get_travel_plan_data_service().log_query(
                 user_id=current_user.user_id,
                 user_role=current_user.role,
                 question=f"[文件分析] {file.filename} {question}".strip(),
@@ -132,13 +124,12 @@ async def analyze_file(
             )
         except Exception:
             pass
-
         return result
     except HTTPException:
         raise
     except Exception as exc:
         print(f"[agent] file analysis failed: {exc}")
-        raise HTTPException(status_code=500, detail=f"文件分析失败: {exc}")
+        raise HTTPException(status_code=500, detail="文件分析暂时不可用。") from exc
     finally:
         try:
             os.unlink(tmp_path)
@@ -146,24 +137,25 @@ async def analyze_file(
             pass
 
 
-# ── Health endpoint ──────────────────────────────────────────────────────
-
 @router.get("/health")
 async def agent_health():
     graph = get_travel_agent_graph()
     return {
         "status": "healthy",
         "graph_available": graph.graph_available,
+        "authorization": "server_role_scoped",
         "agents": [
             "SecurityAgent",
+            "IntentAgent",
             "RoleAgent",
-            "RouterAgent",
             "SQLAgent",
+            "QualityAgent",
             "ChartAgent",
             "ProfileAgent",
             "RecommendationAgent",
             "PredictAgent",
             "EmailAgent",
+            "AuditAgent",
             "ReportAgent",
             "FileAnalysisAgent",
         ],
