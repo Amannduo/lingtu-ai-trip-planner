@@ -15,11 +15,52 @@ from ...models.schemas import (
     ErrorResponse
 )
 from ...agents.trip_planner_agent import get_trip_planner_agent
+from ...services.trip_generation_errors import TripPlanQualityRejectedError
 from ...services.auth_service import AuthenticatedUser
 from ...services.trip_email_service import deliver_trip_plan_email
 from ...services.travel_plan_data_service import get_travel_plan_data_service
 from ...services.web_push_service import notify_trip_plan_ready
 from ..auth import get_current_user, get_optional_current_user
+
+
+def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
+    """Map quality rejection to frontend-compatible detail {message, issues}."""
+    issues: list[dict] = []
+    quality = getattr(exc, "quality", None)
+    for issue in getattr(quality, "issues", None) or []:
+        code = getattr(issue, "code", None)
+        severity = getattr(issue, "severity", None)
+        message = getattr(issue, "message", None)
+        if hasattr(code, "value"):
+            code = code.value
+        if hasattr(severity, "value"):
+            severity = severity.value
+        item = {
+            "code": str(code or "TRIP_PLAN_QUALITY_REJECTED"),
+            "severity": str(severity or "error"),
+            "message": str(message or "生成的行程未通过质量检查"),
+        }
+        suggestion = getattr(issue, "suggestion", None)
+        if suggestion:
+            if hasattr(suggestion, "value"):
+                suggestion = suggestion.value
+            item["suggestion"] = str(suggestion)
+        issues.append(item)
+
+    if not issues:
+        issues.append(
+            {
+                "code": "TRIP_PLAN_QUALITY_REJECTED",
+                "severity": "error",
+                "message": "生成的行程未通过质量检查",
+            }
+        )
+
+    return {
+        "message": "生成的行程未通过质量检查",
+        "issues": issues,
+    }
+
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 
@@ -143,6 +184,13 @@ async def plan_trip(
             email_delivery=email_delivery,
         )
 
+    except TripPlanQualityRejectedError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_quality_rejection_detail(exc),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ 生成旅行计划失败: {str(e)}")
         import traceback
