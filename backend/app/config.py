@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     web_push_delivery_budget_seconds: float = 30.0
     web_push_allowed_host_suffixes: str = ""
 
+    # Civil-date timezone for weekend / relative-date semantics.
+    business_timezone: str = "Asia/Shanghai"
+
     # Real SMTP attempts are limited per authenticated user and peer IP.
     email_quota_enabled: bool = True
     email_user_daily_limit: int = 10

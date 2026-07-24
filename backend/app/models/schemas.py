@@ -1,7 +1,7 @@
 """数据模型定义"""
 
-from typing import List, Optional, Union
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from datetime import date
 
 
@@ -21,8 +21,51 @@ class TripRequest(BaseModel):
     accommodation: str = Field(..., description="住宿偏好", example="经济型酒店")
     preferences: List[str] = Field(default_factory=list, description="旅行偏好标签", example=["历史文化", "美食"])
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
+    destination_source: Literal["manual", "recommendation"] = Field(
+        default="manual",
+        description="目的地来源：用户直接指定或智能推荐",
+    )
+    semantic_contract: Optional["SemanticTripContract"] = Field(
+        default=None,
+        description="跨跳语义契约快照",
+    )
+    semantic_risks_acknowledged: bool = Field(
+        default=False,
+        description="用户已二次确认语义风险",
+    )
+    date_pattern: Optional[Literal["weekend", "explicit", "unknown"]] = Field(
+        default=None,
+        description="日期模式：周末推断 / 明确日期 / 未知",
+    )
+    weekend_style: Optional[Literal["sat_sun", "fri_sun_optional"]] = Field(
+        default=None,
+        description="周末形态：默认六日两天，或用户确认的周五—周日",
+    )
+    early_arrival_hint: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description="周五下午提前抵达建议（建议文案，不自动改日期）",
+    )
+    departure_mode: Optional[Literal["morning_first_day", "evening_before"]] = Field(
+        default=None,
+        description="出发模式：首日上午抵达 / 前一晚提前抵达",
+    )
     email_on_completion: bool = Field(default=False, description="生成完成后发送邮件")
     delivery_email: Optional[EmailStr] = Field(default=None, description="本次行程收件邮箱")
+
+    @model_validator(mode="after")
+    def validate_date_consistency(self):
+        try:
+            start = date.fromisoformat(self.start_date)
+            end = date.fromisoformat(self.end_date)
+        except ValueError as exc:
+            raise ValueError("出行日期必须使用 YYYY-MM-DD 格式") from exc
+        if end < start:
+            raise ValueError("结束日期不能早于开始日期")
+        expected_days = (end - start).days + 1
+        if expected_days != self.travel_days:
+            raise ValueError(f"旅行天数应为 {expected_days} 天")
+        return self
 
     class Config:
         json_schema_extra = {
@@ -70,16 +113,146 @@ class RecommendationContext(BaseModel):
     origin_city: Optional[str] = Field(default=None, description="出发城市")
     budget: Optional[int] = Field(default=None, description="旅行总预算(元)", ge=0)
     travel_days: Optional[int] = Field(default=None, description="旅行天数", ge=1, le=30)
+    travelers: Optional[int] = Field(default=None, description="出行人数", ge=1, le=20)
+    start_date: Optional[str] = Field(default=None, description="已确认开始日期 YYYY-MM-DD")
+    end_date: Optional[str] = Field(default=None, description="已确认结束日期 YYYY-MM-DD")
     recommendation_count: int = Field(default=3, description="推荐数量", ge=1, le=3)
-    preferences: List[str] = Field(default=[], description="旅行偏好")
+    preferences: List[str] = Field(default_factory=list, description="旅行偏好")
     transportation: Optional[str] = Field(default=None, description="交通方式")
     accommodation: Optional[str] = Field(default=None, description="住宿偏好")
+
+    @model_validator(mode="after")
+    def normalize_date_window(self):
+        if not self.start_date and not self.end_date:
+            return self
+        try:
+            start = date.fromisoformat(self.start_date) if self.start_date else None
+            end = date.fromisoformat(self.end_date) if self.end_date else None
+        except ValueError as exc:
+            raise ValueError("推荐上下文日期必须使用 YYYY-MM-DD 格式") from exc
+        if start and end:
+            if end < start:
+                raise ValueError("推荐上下文结束日期不能早于开始日期")
+            self.travel_days = (end - start).days + 1
+        return self
 
 
 class DestinationChatRequest(BaseModel):
     """目的地推荐对话请求"""
     messages: List[ChatMessage] = Field(..., description="对话消息")
     context: RecommendationContext = Field(default_factory=RecommendationContext, description="当前表单上下文")
+
+
+
+FieldSource = Literal[
+    "user_explicit",
+    "rule_inferred",
+    "form_confirmed",
+    "system_default",
+    "unknown",
+]
+FieldConfidence = Literal["high", "medium", "low"]
+
+
+class FieldBinding(BaseModel):
+    """Single field with provenance for semantic contract."""
+
+    value: Optional[Any] = Field(default=None, description="字段值")
+    source: FieldSource = Field(default="unknown", description="字段来源")
+    confidence: FieldConfidence = Field(default="low", description="置信度")
+    pending_confirmation: bool = Field(default=False, description="是否待确认")
+    evidence: str = Field(default="", description="抽取证据")
+    conflicts: List[str] = Field(default_factory=list, description="字段级冲突")
+
+    def is_known(self) -> bool:
+        if self.source == "unknown":
+            return False
+        if self.value is None:
+            return False
+        if isinstance(self.value, str) and not self.value.strip():
+            return False
+        if isinstance(self.value, list) and len(self.value) == 0:
+            return False
+        return True
+
+    def is_apply_safe(self) -> bool:
+        if self.pending_confirmation or not self.is_known():
+            return False
+        if self.source == "form_confirmed":
+            return True
+        if self.source == "user_explicit" and self.confidence == "high":
+            return True
+        if self.source == "rule_inferred" and self.confidence == "high":
+            return True
+        return False
+
+
+class SemanticTripContract(BaseModel):
+    """跨跳传递的旅行语义契约。"""
+
+    IDENTITY_FIELDS: ClassVar[List[str]] = [
+        "origin_city",
+        "destination_city",
+        "start_date",
+        "end_date",
+        "travel_days",
+        "travelers",
+        "travel_party",
+        "budget",
+        "pace",
+        "date_pattern",
+        "weekend_style",
+        "departure_mode",
+    ]
+
+    raw_text: str = Field(default="", description="触发本次抽取的用户原文")
+    origin_city: FieldBinding = Field(default_factory=FieldBinding)
+    destination_city: FieldBinding = Field(default_factory=FieldBinding)
+    start_date: FieldBinding = Field(default_factory=FieldBinding)
+    end_date: FieldBinding = Field(default_factory=FieldBinding)
+    travel_days: FieldBinding = Field(default_factory=FieldBinding)
+    travelers: FieldBinding = Field(default_factory=FieldBinding)
+    travel_party: FieldBinding = Field(default_factory=FieldBinding)
+    budget: FieldBinding = Field(default_factory=FieldBinding)
+    pace: FieldBinding = Field(default_factory=FieldBinding)
+    preferences: FieldBinding = Field(default_factory=FieldBinding)
+    transportation: FieldBinding = Field(default_factory=FieldBinding)
+    accommodation: FieldBinding = Field(default_factory=FieldBinding)
+    date_pattern: FieldBinding = Field(default_factory=FieldBinding)
+    weekend_style: FieldBinding = Field(default_factory=FieldBinding)
+    early_arrival_hint: FieldBinding = Field(default_factory=FieldBinding)
+    departure_mode: FieldBinding = Field(default_factory=FieldBinding)
+    conflicts: List[str] = Field(default_factory=list)
+    pending_fields: List[str] = Field(default_factory=list)
+
+    def refresh_pending_fields(self) -> None:
+        pending: List[str] = []
+        tracked = self.IDENTITY_FIELDS + [
+            "preferences",
+            "transportation",
+            "accommodation",
+            "early_arrival_hint",
+        ]
+        for name in tracked:
+            binding = getattr(self, name)
+            if not isinstance(binding, FieldBinding):
+                continue
+            if binding.pending_confirmation:
+                pending.append(name)
+            elif not binding.is_known() and name in {
+                "origin_city",
+                "travel_days",
+                "travelers",
+                "budget",
+            }:
+                pending.append(name)
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for item in pending:
+            if item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        self.pending_fields = ordered
 
 
 # ============ 响应模型 ============
@@ -309,25 +482,48 @@ class WeatherResponse(BaseModel):
 class RecommendationFormPatch(BaseModel):
     """推荐结果可回填到旅行表单的数据"""
     city: str = Field(..., description="推荐城市")
+    destination_source: Literal["manual", "recommendation"] = Field(
+        default="recommendation",
+        description="目的地来自用户明确指定或系统自动推荐",
+    )
+    origin_city: Optional[str] = Field(default=None, description="识别出的出发城市")
+    start_date: Optional[str] = Field(default=None, description="识别出的开始日期")
+    end_date: Optional[str] = Field(default=None, description="识别出的结束日期")
     travel_days: Optional[int] = Field(default=None, description="建议天数")
+    travelers: Optional[int] = Field(default=None, description="识别出的出行人数")
     budget: Optional[int] = Field(default=None, description="建议预算")
     transportation: Optional[str] = Field(default=None, description="交通方式")
     accommodation: Optional[str] = Field(default=None, description="住宿偏好")
     preferences: List[str] = Field(default=[], description="建议偏好")
     free_text_input: str = Field(default="", description="建议写入额外要求的内容")
+    date_pattern: Optional[Literal["weekend", "explicit", "unknown"]] = Field(default=None)
+    weekend_style: Optional[Literal["sat_sun", "fri_sun_optional"]] = Field(default=None)
+    early_arrival_hint: Optional[str] = Field(default=None, max_length=500)
+    departure_mode: Optional[Literal["morning_first_day", "evening_before"]] = Field(default=None)
+    schedule_option: Optional[Literal["default_weekend", "friday_early"]] = Field(default=None)
 
 
 class DestinationRecommendation(BaseModel):
     """目的地推荐卡片"""
     city: str = Field(..., description="城市")
     reason: str = Field(..., description="推荐理由")
+    decision_label: str = Field(default="综合匹配", description="方案的核心取舍标签")
+    tradeoff: str = Field(default="", description="选择该方案需要接受的取舍")
     suggested_days: int = Field(default=3, description="建议游玩天数")
+    estimated_budget: Optional[int] = Field(default=None, description="按人数与天数估算的总预算")
+    pace: str = Field(default="适中", description="行程节奏")
     budget_fit: str = Field(default="可控", description="预算匹配度")
     origin_note: Optional[str] = Field(default=None, description="从出发地出行的说明")
     highlights: List[str] = Field(default=[], description="代表景点/亮点")
     weather_summary: Optional[str] = Field(default=None, description="天气摘要")
     suggested_preferences: List[str] = Field(default=[], description="推荐偏好")
     form_patch: RecommendationFormPatch = Field(..., description="一键回填数据")
+    date_pattern: Optional[Literal["weekend", "explicit", "unknown"]] = Field(default=None)
+    weekend_style: Optional[Literal["sat_sun", "fri_sun_optional"]] = Field(default=None)
+    early_arrival_hint: Optional[str] = Field(default=None, max_length=500)
+    departure_mode: Optional[Literal["morning_first_day", "evening_before"]] = Field(default=None)
+    schedule_option: Optional[Literal["default_weekend", "friday_early"]] = Field(default=None)
+    schedule_summary: Optional[str] = Field(default=None, max_length=200)
 
 
 class DestinationChatResponse(BaseModel):
@@ -336,7 +532,12 @@ class DestinationChatResponse(BaseModel):
     message: str = Field(default="", description="消息")
     reply: str = Field(default="", description="AI回复")
     needs_more_info: bool = Field(default=False, description="是否需要继续追问")
+    interpreted_context: Dict[str, Any] = Field(default_factory=dict)
+    semantic_contract: Optional[SemanticTripContract] = Field(default=None)
     recommendations: List[DestinationRecommendation] = Field(default=[], description="目的地推荐列表")
+
+
+TripRequest.model_rebuild()
 
 
 # ============ 错误响应 ============
