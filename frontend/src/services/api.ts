@@ -11,6 +11,19 @@ import type {
 } from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
+
+const resolveTripStreamUrl = (rawUrl: string): string => {
+  const apiOrigin = new URL(API_BASE_URL || window.location.origin, window.location.origin)
+  const target = new URL(rawUrl, apiOrigin)
+  if (target.origin !== apiOrigin.origin) {
+    throw new Error('服务器返回了不受信任的进度地址')
+  }
+  if (!/^\/api\/trip\/plan-jobs\/[a-f0-9]{32}\/events$/.test(target.pathname)) {
+    throw new Error('服务器返回了无法识别的进度地址')
+  }
+  return target.toString()
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 120000
 
 const readTimeoutMs = (rawValue: string | undefined, fallbackMs: number) => {
@@ -63,8 +76,132 @@ const formatTimeout = (timeoutMs: number) => {
   return minutes >= 1 ? `${minutes} 分钟` : `${Math.round(timeoutMs / 1000)} 秒`
 }
 
-const responseError = (error: any, fallback: string) =>
-  error?.response?.data?.detail || error?.message || fallback
+/** Structured issue from backend 422 hard-block / validation payloads. */
+export type ApiIssue = {
+  code?: string
+  severity?: string
+  path?: string
+  message?: string
+  suggestion?: string
+  fields?: string[]
+  conflicts?: string[]
+  details?: string[]
+  auto_repaired?: boolean
+}
+
+export class ApiClientError extends Error {
+  status?: number
+  issues: ApiIssue[]
+
+  constructor(
+    message: string,
+    options?: { status?: number; issues?: ApiIssue[] }
+  ) {
+    super(message)
+    this.name = 'ApiClientError'
+    this.status = options?.status
+    this.issues = options?.issues || []
+  }
+}
+
+const asIssue = (value: unknown): ApiIssue | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const message = typeof raw.message === 'string' ? raw.message : ''
+  const msg = typeof raw.msg === 'string' ? raw.msg : ''
+  const text = message || msg
+  if (!text && !raw.code) return null
+  return {
+    code: typeof raw.code === 'string' ? raw.code : undefined,
+    severity: typeof raw.severity === 'string' ? raw.severity : undefined,
+    path: typeof raw.path === 'string'
+      ? raw.path
+      : Array.isArray(raw.loc)
+        ? raw.loc.join('.')
+        : undefined,
+    message: text || undefined,
+    suggestion: typeof raw.suggestion === 'string' ? raw.suggestion : undefined,
+    fields: Array.isArray(raw.fields)
+      ? raw.fields.filter((item): item is string => typeof item === 'string')
+      : undefined,
+    conflicts: Array.isArray(raw.conflicts)
+      ? raw.conflicts.filter((item): item is string => typeof item === 'string')
+      : undefined,
+    details: Array.isArray(raw.details)
+      ? raw.details.filter((item): item is string => typeof item === 'string')
+      : undefined,
+    auto_repaired: typeof raw.auto_repaired === 'boolean' ? raw.auto_repaired : undefined
+  }
+}
+
+export const parseApiErrorDetail = (
+  detail: unknown
+): { message: string; issues: ApiIssue[] } => {
+  if (typeof detail === 'string' && detail.trim()) {
+    return { message: detail.trim(), issues: [] }
+  }
+
+  // FastAPI request-validation style: [{loc, msg, type}, ...]
+  if (Array.isArray(detail)) {
+    const issues = detail
+      .map((item) => asIssue(item))
+      .filter((item): item is ApiIssue => item !== null)
+    const message = issues
+      .map((item) => item.message)
+      .filter(Boolean)
+      .slice(0, 3)
+      .join('；')
+    return { message: message || '请求参数无效', issues }
+  }
+
+  if (detail && typeof detail === 'object') {
+    const raw = detail as Record<string, unknown>
+    const issues = Array.isArray(raw.issues)
+      ? raw.issues
+          .map((item) => asIssue(item))
+          .filter((item): item is ApiIssue => item !== null)
+      : []
+    let message =
+      typeof raw.message === 'string' && raw.message.trim()
+        ? raw.message.trim()
+        : ''
+    if (!message && issues.length) {
+      message = issues
+        .map((item) => item.message)
+        .filter(Boolean)
+        .slice(0, 2)
+        .join('；')
+    }
+    // Append first concrete issue when summary is too generic
+    if (
+      message
+      && issues[0]?.message
+      && !message.includes(issues[0].message)
+    ) {
+      message = `${message} ${issues[0].message}`
+    }
+    return { message: message || '请求被拒绝', issues }
+  }
+
+  return { message: '', issues: [] }
+}
+
+const responseError = (error: any, fallback: string) => {
+  const parsed = parseApiErrorDetail(error?.response?.data?.detail)
+  if (parsed.message) return parsed.message
+  return error?.message || fallback
+}
+
+const toApiClientError = (error: any, fallback: string) => {
+  const status = error?.response?.status
+  const parsed = parseApiErrorDetail(error?.response?.data?.detail)
+  const message = parsed.message || error?.message || fallback
+  return new ApiClientError(message, {
+    status: typeof status === 'number' ? status : undefined,
+    issues: parsed.issues
+  })
+}
+
 
 
 export async function fetchVapidPublicKey(): Promise<string> {
@@ -118,9 +255,99 @@ export async function generateTripPlan(formData: TripFormData): Promise<TripPlan
     if (isTimeoutError(error)) {
       throw new Error(`旅行计划生成时间较长，已超过 ${formatTimeout(TRIP_PLAN_TIMEOUT_MS)}，请减少天数或稍后重试`)
     }
-    throw new Error(responseError(error, '生成旅行计划失败'))
+    throw toApiClientError(error, '生成旅行计划失败')
   }
 }
+
+export interface TripGenerationProgress {
+  id: number
+  type: 'stage' | 'result' | 'error'
+  stage?: string
+  progress?: number
+  message?: string
+  detail?: string
+  meta?: Record<string, string | number | boolean>
+}
+
+export async function generateTripPlanWithProgress(
+  formData: TripFormData,
+  onProgress: (event: TripGenerationProgress) => void
+): Promise<TripPlanResponse> {
+  if (typeof EventSource === 'undefined') {
+    return generateTripPlan(formData)
+  }
+
+  let response
+  try {
+    response = await apiClient.post<{
+      success: boolean
+      job_id: string
+      stream_url: string
+    }>('/api/trip/plan-jobs', formData)
+  } catch (error: any) {
+    throw toApiClientError(error, '无法创建旅行规划任务')
+  }
+
+  return new Promise((resolve, reject) => {
+    let streamUrl: string
+    try {
+      streamUrl = resolveTripStreamUrl(response.data.stream_url)
+    } catch (error) {
+      reject(error)
+      return
+    }
+    const source = new EventSource(streamUrl, { withCredentials: true })
+    let settled = false
+    let timeoutId = 0
+
+    const cleanup = () => {
+      settled = true
+      window.clearTimeout(timeoutId)
+      source.close()
+    }
+    const failMalformedEvent = () => {
+      if (settled) return
+      cleanup()
+      reject(new Error('服务器返回了无法识别的进度数据，请稍后重试'))
+    }
+    timeoutId = window.setTimeout(() => {
+      if (settled) return
+      cleanup()
+      reject(new Error('旅行规划生成时间超过 ' + formatTimeout(TRIP_PLAN_TIMEOUT_MS) + '，请稍后重试'))
+    }, TRIP_PLAN_TIMEOUT_MS)
+
+    source.addEventListener('stage', rawEvent => {
+      try {
+        const event = JSON.parse((rawEvent as MessageEvent).data) as TripGenerationProgress
+        onProgress(event)
+      } catch {
+        failMalformedEvent()
+      }
+    })
+    source.addEventListener('result', rawEvent => {
+      if (settled) return
+      try {
+        const event = JSON.parse((rawEvent as MessageEvent).data)
+        if (!event.data) throw new Error('missing result')
+        cleanup()
+        resolve(event.data as TripPlanResponse)
+      } catch {
+        failMalformedEvent()
+      }
+    })
+    source.addEventListener('error', rawEvent => {
+      if (settled || !(rawEvent as MessageEvent).data) return
+      try {
+        const event = JSON.parse((rawEvent as MessageEvent).data)
+        cleanup()
+        reject(new Error(event.message || '旅行规划生成失败'))
+      } catch {
+        failMalformedEvent()
+      }
+    })
+  })
+}
+
 
 export async function chatDestinationRecommendation(
   payload: DestinationChatRequest
