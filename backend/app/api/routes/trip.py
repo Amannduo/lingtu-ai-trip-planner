@@ -125,14 +125,14 @@ def _plan_is_publishable(plan: TripPlan) -> bool:
     quality = plan.quality
     if quality is None:
         return False
+    from ...services.trip_plan_quality_service import issue_disposition
     return bool(
         quality.publishable
-        and quality.status in {"passed", "warning"}
-        and quality.score >= 75
+        and quality.status in {"passed", "warning", "review"}
         and plan.generation_mode != "map_fallback"
         and not any(
-            str(issue.severity).strip().lower() == "error"
-            for issue in quality.issues
+            issue_disposition(issue) == "blocking"
+            for issue in (quality.issues or [])
         )
     )
 
