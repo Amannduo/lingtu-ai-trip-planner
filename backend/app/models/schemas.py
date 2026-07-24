@@ -398,8 +398,41 @@ class AgentAuditResult(BaseModel):
     status: str = Field(default="warning", description="审核状态: passed/warning/failed")
     source: str = Field(default="", description="输出来源")
     checked_items: List[str] = Field(default_factory=list, description="已检查项目")
+    audit_level: Literal["format_only", "semantic_verified"] = Field(
+        default="format_only",
+        description="Audit capability: format/citation checks or semantic verification",
+    )
     issues: List[str] = Field(default_factory=list, description="审核发现的问题")
     suggestions: List[str] = Field(default_factory=list, description="后续建议")
+
+
+
+class TripPlanQualityIssue(BaseModel):
+    """行程质量门发现的结构化问题。"""
+    code: str = Field(..., description="稳定的问题代码")
+    severity: str = Field(default="warning", description="info/warning/error")
+    path: str = Field(default="", description="问题在TripPlan中的字段路径")
+    message: str = Field(..., description="面向用户的问题说明")
+    suggestion: str = Field(default="", description="可执行的修复建议")
+    auto_repaired: bool = Field(default=False, description="是否已自动修复")
+
+
+class TripPlanQualityResult(BaseModel):
+    """行程业务校验结果。"""
+    status: str = Field(default="warning", description="passed/warning/failed")
+    score: int = Field(default=100, ge=0, le=100)
+    constraint_score: int = Field(default=100, ge=0, le=100)
+    executability_score: int = Field(default=100, ge=0, le=100)
+    evidence_score: int = Field(default=0, ge=0, le=100)
+    readiness_score: int = Field(default=100, ge=0, le=100)
+    publishable: bool = Field(
+        default=False,
+        description="Whether automatic persistence and delivery are allowed",
+    )
+    checked_items: List[str] = Field(default_factory=list)
+    issues: List[TripPlanQualityIssue] = Field(default_factory=list)
+    verified_facts: int = Field(default=0)
+    generated_at: str = Field(default="")
 
 
 class TripPlan(BaseModel):
@@ -407,6 +440,10 @@ class TripPlan(BaseModel):
     city: str = Field(..., description="目的地城市")
     start_date: str = Field(..., description="开始日期")
     end_date: str = Field(..., description="结束日期")
+    generation_mode: Literal["primary", "repaired", "map_fallback"] = Field(
+        default="primary",
+        description="生成路径：主规划、条件式结构修复或地图降级",
+    )
     days: List[DayPlan] = Field(..., description="每日行程")
     weather_info: List[WeatherInfo] = Field(default=[], description="天气信息")
     overall_suggestions: str = Field(..., description="总体建议")
@@ -414,6 +451,7 @@ class TripPlan(BaseModel):
     web_guide: Optional[str] = Field(default=None, description="联网智能体生成的旅行攻略补充")
     web_references: List[WebReference] = Field(default_factory=list, description="联网智能体引用来源")
     agent_audit: Optional[AgentAuditResult] = Field(default=None, description="联网智能体输出审核结果")
+    quality: Optional[TripPlanQualityResult] = Field(default=None, description="规划完成前的业务质量校验结果")
     map_context: List[MapContextPOI] = Field(default_factory=list, description="地图手册周边场所")
 
 
