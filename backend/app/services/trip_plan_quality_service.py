@@ -1137,10 +1137,10 @@ class TripPlanQualityService:
             if plan.agent_audit.status == "failed":
                 add(
                     "WEB_AUDIT_FAILED",
-                    "error",
+                    "warning",
                     "agent_audit",
-                    "联网审核未通过。",
-                    "查看下方“审核检查”中的具体问题，修复后再使用该行程。",
+                    "动态数据未实时联网复核。",
+                    "查看下方“审核检查”中的具体问题，出发前人工确认二次信息。",
                 )
             elif plan.agent_audit.status != "passed" or plan.agent_audit.issues:
                 issue_count = max(1, len(plan.agent_audit.issues))

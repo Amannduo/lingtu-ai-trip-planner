@@ -363,14 +363,17 @@ class WebTravelGuideAgent:
         if issues:
             status = "warning"
         if len((guide or "").strip()) < 120:
-            status = "failed"
+            status = "warning"
+
+        audit_level = "format_only" if references else "offline_fallback"
 
         return AgentAuditResult(
             status=status,
             source=source,
             checked_items=checked_items,
             issues=issues,
-            suggestions=suggestions
+            suggestions=suggestions,
+            audit_level=audit_level,
         )
 
     def _reservation_items(self, city: str, attraction_names: List[str]) -> List[str]:

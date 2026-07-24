@@ -398,7 +398,7 @@ class AgentAuditResult(BaseModel):
     status: str = Field(default="warning", description="审核状态: passed/warning/failed")
     source: str = Field(default="", description="输出来源")
     checked_items: List[str] = Field(default_factory=list, description="已检查项目")
-    audit_level: Literal["format_only", "semantic_verified"] = Field(
+    audit_level: Literal["format_only", "semantic_verified", "offline_fallback"] = Field(
         default="format_only",
         description="Audit capability: format/citation checks or semantic verification",
     )
