@@ -5,9 +5,16 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     HTTPException,
+    Path,
+    Query,
     Request as HttpRequest,
+    Response,
 )
+from fastapi.encoders import jsonable_encoder
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
+import json
+from ...config import get_settings
 from ...models.schemas import (
     TripRequest,
     TripPlan,
@@ -20,6 +27,11 @@ from ...services.auth_service import AuthenticatedUser
 from ...services.trip_email_service import deliver_trip_plan_email
 from ...services.travel_plan_data_service import get_travel_plan_data_service
 from ...services.web_push_service import notify_trip_plan_ready
+from ...services.trip_generation_job_service import (
+    TripGenerationCapacityError,
+    get_trip_generation_job_service,
+    run_with_generation_capacity,
+)
 from ..auth import get_current_user, get_optional_current_user
 
 
@@ -60,6 +72,48 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
         "message": "生成的行程未通过质量检查",
         "issues": issues,
     }
+
+
+
+def _plan_is_publishable(plan: TripPlan) -> bool:
+    quality = plan.quality
+    if quality is None:
+        return False
+    return bool(
+        quality.publishable
+        and quality.status in {"passed", "warning"}
+        and quality.score >= 75
+        and plan.generation_mode != "map_fallback"
+        and not any(
+            str(issue.severity).strip().lower() == "error"
+            for issue in quality.issues
+        )
+    )
+
+
+def _job_owner(current_user: AuthenticatedUser | None, http_request: HttpRequest) -> str:
+    if current_user is not None:
+        return f"user:{current_user.user_id}"
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    return f"anonymous:{client_ip}"
+
+
+def _job_cookie_name(job_id: str) -> str:
+    return f"lingtu_trip_job_{job_id}"
+
+
+def _raise_if_generation_cancelled(progress) -> None:
+    checker = getattr(progress, "raise_if_cancelled", None)
+    if callable(checker):
+        checker()
+
+
+def _begin_generation_finalization(progress) -> None:
+    begin = getattr(progress, "begin_finalization", None)
+    if callable(begin):
+        begin()
+    else:
+        _raise_if_generation_cancelled(progress)
 
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
@@ -286,6 +340,170 @@ async def update_trip_history(
     if not updated:
         raise HTTPException(status_code=404, detail="未找到该旅行计划，或当前用户无权修改")
     return TripPlanResponse(success=True, message="旅行计划修改已保存", data=plan, plan_no=plan_no)
+
+
+
+@router.post("/plan-jobs", summary="创建带实时进度的旅行规划任务")
+def create_trip_plan_job(
+    request: TripRequest,
+    http_request: HttpRequest,
+    response: Response,
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+):
+    owner_key = _job_owner(current_user, http_request)
+
+    def worker(progress):
+        _raise_if_generation_cancelled(progress)
+        trip_plan = run_with_generation_capacity(
+            lambda: get_trip_planner_agent().plan_trip(
+                request,
+                progress_callback=progress,
+            )
+        )
+        _raise_if_generation_cancelled(progress)
+
+        if not _plan_is_publishable(trip_plan):
+            raise TripPlanQualityRejectedError(
+                quality=getattr(trip_plan, "quality", None),
+                plan=trip_plan,
+            )
+
+        plan_no = None
+        if current_user is not None:
+            _begin_generation_finalization(progress)
+            progress(
+                stage="finalizing",
+                progress=99,
+                message="正在安全保存并准备结果",
+                detail="质量检查已完成，正在保存行程。",
+                meta={},
+            )
+            _raise_if_generation_cancelled(progress)
+            plan_no = get_travel_plan_data_service().save_trip_plan(
+                request,
+                trip_plan,
+                user_id=current_user.user_id,
+                user_role=current_user.role,
+                source="generated",
+            )
+        else:
+            progress(
+                stage="finalizing",
+                progress=99,
+                message="正在整理生成结果",
+                detail="匿名请求不会保存历史记录。",
+                meta={},
+            )
+
+        _raise_if_generation_cancelled(progress)
+        return jsonable_encoder(
+            TripPlanResponse(
+                success=True,
+                message="旅行计划生成成功",
+                data=trip_plan,
+                plan_no=plan_no,
+                email_delivery=None,
+            )
+        )
+
+    service = get_trip_generation_job_service()
+    try:
+        job = service.start(owner_key, worker)
+    except TripGenerationCapacityError:
+        raise HTTPException(
+            status_code=429,
+            detail="当前规划任务较多，请等待已有任务完成后再试。",
+        )
+    settings = get_settings()
+    response.set_cookie(
+        key=_job_cookie_name(job.job_id),
+        value=job.access_token,
+        max_age=service.ttl_seconds,
+        httponly=True,
+        secure=settings.auth_cookie_secure or http_request.url.scheme == "https",
+        samesite="strict",
+        # Cookie path covers events + cancel under the same job id.
+        path=f"/api/trip/plan-jobs/{job.job_id}",
+    )
+    return {
+        "success": True,
+        "job_id": job.job_id,
+        "stream_url": f"/api/trip/plan-jobs/{job.job_id}/events",
+    }
+
+
+@router.get("/plan-jobs/{job_id}/events", summary="订阅旅行规划实时进度")
+def stream_trip_plan_job(
+    http_request: HttpRequest,
+    job_id: str = Path(..., pattern=r"^[a-f0-9]{32}$"),
+    after: int = Query(default=0, ge=0),
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+):
+    service = get_trip_generation_job_service()
+    cookie_token = http_request.cookies.get(_job_cookie_name(job_id), "")
+    job = service.get(
+        job_id,
+        _job_owner(current_user, http_request),
+        access_token=cookie_token,
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
+
+    header_id = http_request.headers.get("last-event-id", "")
+    try:
+        after_id = max(after, int(header_id or 0))
+    except ValueError:
+        after_id = after
+
+    def event_stream():
+        for event in service.events(job, after_id=after_id):
+            if event is None:
+                yield ": heartbeat" + "\n\n"
+                continue
+            payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            yield (
+                f"id: {event['id']}"
+                + "\n"
+                + f"event: {event['type']}"
+                + "\n"
+                + f"data: {payload}"
+                + "\n\n"
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.post("/plan-jobs/{job_id}/cancel", summary="取消旅行规划任务")
+def cancel_trip_plan_job(
+    http_request: HttpRequest,
+    job_id: str = Path(..., pattern=r"^[a-f0-9]{32}$"),
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+):
+    service = get_trip_generation_job_service()
+    cookie_token = http_request.cookies.get(_job_cookie_name(job_id), "")
+    job = service.get(
+        job_id,
+        _job_owner(current_user, http_request),
+        access_token=cookie_token,
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
+    cancelled = service.cancel(job, reason="client_cancelled")
+    return {
+        "success": True,
+        "job_id": job.job_id,
+        "cancelled": cancelled,
+        "status": job.status,
+    }
 
 
 @router.get(
