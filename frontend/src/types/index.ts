@@ -138,6 +138,7 @@ export interface TripPlan {
 export interface TripFormData {
   origin_city?: string | null
   city: string
+  destination_source?: 'manual' | 'recommendation'
   start_date: string
   end_date: string
   travel_days: number
@@ -150,6 +151,14 @@ export interface TripFormData {
   free_text_input: string
   email_on_completion?: boolean
   delivery_email?: string | null
+  /** Optional client snapshot; server rebuilds authoritative contract */
+  semantic_contract?: SemanticTripContract | null
+  /** Set true after frontend secondary confirm of pending/conflict risks */
+  semantic_risks_acknowledged?: boolean
+  date_pattern?: 'weekend' | 'explicit' | 'unknown' | null
+  weekend_style?: 'sat_sun' | 'fri_sun_optional' | null
+  early_arrival_hint?: string | null
+  departure_mode?: 'morning_first_day' | 'evening_before' | null
 }
 
 export interface EmailDeliveryResult {
@@ -178,6 +187,9 @@ export interface RecommendationContext {
   origin_city?: string | null
   budget?: number | null
   travel_days?: number | null
+  travelers?: number | null
+  start_date?: string | null
+  end_date?: string | null
   recommendation_count?: number
   preferences: string[]
   transportation?: string | null
@@ -191,24 +203,83 @@ export interface DestinationChatRequest {
 
 export interface RecommendationFormPatch {
   city: string
+  destination_source?: 'manual' | 'recommendation'
+  origin_city?: string | null
+  start_date?: string | null
+  end_date?: string | null
   travel_days?: number | null
+  travelers?: number | null
   budget?: number | null
   transportation?: string | null
   accommodation?: string | null
   preferences: string[]
   free_text_input: string
+  date_pattern?: 'weekend' | 'explicit' | 'unknown' | null
+  weekend_style?: 'sat_sun' | 'fri_sun_optional' | null
+  early_arrival_hint?: string | null
+  departure_mode?: 'morning_first_day' | 'evening_before' | null
+  schedule_option?: 'default_weekend' | 'friday_early' | null
 }
 
 export interface DestinationRecommendation {
   city: string
   reason: string
+  decision_label: string
+  tradeoff: string
   suggested_days: number
+  estimated_budget?: number | null
+  pace: string
   budget_fit: string
   origin_note?: string | null
   highlights: string[]
   weather_summary?: string | null
   suggested_preferences: string[]
   form_patch: RecommendationFormPatch
+  date_pattern?: 'weekend' | 'explicit' | 'unknown' | null
+  weekend_style?: 'sat_sun' | 'fri_sun_optional' | null
+  early_arrival_hint?: string | null
+  departure_mode?: 'morning_first_day' | 'evening_before' | null
+  schedule_option?: 'default_weekend' | 'friday_early' | null
+  schedule_summary?: string | null
+}
+
+
+export type FieldSource =
+  | 'user_explicit'
+  | 'rule_inferred'
+  | 'form_confirmed'
+  | 'system_default'
+  | 'unknown'
+
+export interface FieldBinding {
+  value?: unknown
+  source: FieldSource
+  confidence: 'high' | 'medium' | 'low'
+  pending_confirmation: boolean
+  evidence?: string
+  conflicts?: string[]
+}
+
+export interface SemanticTripContract {
+  raw_text?: string
+  origin_city?: FieldBinding
+  destination_city?: FieldBinding
+  start_date?: FieldBinding
+  end_date?: FieldBinding
+  travel_days?: FieldBinding
+  travelers?: FieldBinding
+  travel_party?: FieldBinding
+  budget?: FieldBinding
+  pace?: FieldBinding
+  preferences?: FieldBinding
+  transportation?: FieldBinding
+  accommodation?: FieldBinding
+  date_pattern?: FieldBinding
+  weekend_style?: FieldBinding
+  early_arrival_hint?: FieldBinding
+  departure_mode?: FieldBinding
+  conflicts?: string[]
+  pending_fields?: string[]
 }
 
 export interface DestinationChatResponse {
@@ -216,6 +287,9 @@ export interface DestinationChatResponse {
   message: string
   reply: string
   needs_more_info: boolean
+  /** Apply-safe flat fields plus optional semantic_contract */
+  interpreted_context?: Record<string, unknown>
+  semantic_contract?: SemanticTripContract | null
   recommendations: DestinationRecommendation[]
 }
 

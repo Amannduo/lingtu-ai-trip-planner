@@ -312,15 +312,36 @@
             </div>
           </div>
 
-          <div v-if="loading" class="loading-container">
+          <section v-if="loading" class="agent-workflow" role="status" aria-live="polite">
+            <div class="workflow-head">
+              <div>
+                <span class="workflow-kicker">生成进度</span>
+                <h3>{{ loadingStatus || '正在生成旅行计划' }}</h3>
+                <p>{{ loadingDetail || '正在创建任务并接收阶段事件…' }}</p>
+              </div>
+              <strong>{{ loadingProgress }}%</strong>
+            </div>
             <a-progress
               :percent="loadingProgress"
+              :show-info="false"
               status="active"
               :stroke-color="{ '0%': '#0f766e', '100%': '#2563eb' }"
-              :stroke-width="8"
+              :stroke-width="6"
             />
-            <p class="loading-status">{{ loadingStatus }}</p>
-          </div>
+            <div v-if="loadingEvents.length" class="workflow-trace">
+              <div
+                v-for="event in loadingEvents.slice(-4)"
+                :key="event.stage"
+                class="trace-item"
+              >
+                <CheckOutlined />
+                <span>
+                  <strong>{{ event.message }}</strong>
+                  <small v-if="event.detail">{{ event.detail }}</small>
+                </span>
+              </div>
+            </div>
+          </section>
           </a-form>
         </a-card>
 
@@ -389,17 +410,48 @@
             <span>获取推荐</span>
           </a-button>
 
-          <div v-if="recommendations.length" class="recommendation-list">
-            <div v-for="item in recommendations" :key="item.city" class="recommendation-card">
+          <div v-if="recommendations.length" class="recommendation-section">
+            <div class="recommendation-title-row">
+              <div>
+                <span class="step-kicker">AI 初选</span>
+                <h3>三个方向，各有取舍</h3>
+              </div>
+              <span>选择后仍可修改</span>
+            </div>
+            <div class="recommendation-list">
+            <div
+              v-for="(item, index) in recommendations"
+              :key="`${item.city}-${item.schedule_option || 'default'}-${index}`"
+              class="recommendation-card"
+              :class="{
+                selected: selectedCity === item.city && selectedScheduleOption === (item.schedule_option || 'default'),
+                'is-friday-early': item.schedule_option === 'friday_early'
+              }"
+            >
+              <span class="option-label">方案 {{ String.fromCharCode(65 + index) }} · {{ item.decision_label }}</span>
               <div class="recommendation-head">
-                <div>
-                  <span class="city-name">{{ item.city }}</span>
-                  <span class="budget-fit">{{ item.budget_fit }}</span>
-                </div>
-                <strong>{{ item.suggested_days }}天</strong>
+                <span class="city-name">{{ item.city }}</span>
+                <span class="budget-fit">{{ item.budget_fit }}</span>
               </div>
 
+              <div class="decision-metrics">
+                <span><b>{{ item.suggested_days }}</b> 天</span>
+                <span><b>{{ item.pace }}</b> 节奏</span>
+                <span v-if="item.estimated_budget"><b>¥{{ item.estimated_budget }}</b> 预计</span>
+              </div>
+
+              <p v-if="item.schedule_summary" class="schedule-summary">{{ item.schedule_summary }}</p>
+              <p
+                v-if="item.early_arrival_hint && item.schedule_option !== 'friday_early'"
+                class="early-arrival-hint"
+              >{{ item.early_arrival_hint }}</p>
+              <p
+                v-if="(item.date_pattern === 'weekend' || item.weekend_style === 'sat_sun') && item.schedule_option !== 'friday_early' && !item.form_patch.start_date"
+                class="date-pending-hint"
+              >日期待确认（默认周六—周日）</p>
+
               <p class="recommendation-reason">{{ item.reason }}</p>
+              <p v-if="item.tradeoff" class="tradeoff-note">取舍：{{ item.tradeoff }}</p>
               <p v-if="item.origin_note" class="origin-note">{{ item.origin_note }}</p>
 
               <div v-if="item.highlights.length" class="highlight-row">
@@ -408,10 +460,20 @@
 
               <p v-if="item.weather_summary" class="weather-note">{{ item.weather_summary }}</p>
 
-              <a-button class="use-recommendation" block @click="useRecommendation(item)">
+              <a-button
+                class="use-recommendation"
+                :type="selectedCity === item.city && selectedScheduleOption === (item.schedule_option || 'default') ? 'primary' : 'default'"
+                block
+                @click="useRecommendation(item)"
+              >
                 <CheckOutlined />
-                <span>选这个</span>
+                <span>{{
+                  selectedCity === item.city && selectedScheduleOption === (item.schedule_option || 'default')
+                    ? '已采用这个方案'
+                    : (item.schedule_option === 'friday_early' ? '采用周五出发方案' : '采用并继续')
+                }}</span>
               </a-button>
+            </div>
             </div>
           </div>
         </aside>
@@ -438,10 +500,12 @@ import {
   SettingOutlined
 } from '@ant-design/icons-vue'
 import {
+  ApiClientError,
   chatDestinationRecommendation,
   fetchTripHistory,
   fetchTripPlan,
-  generateTripPlan
+  generateTripPlanWithProgress,
+  type ApiIssue
 } from '@/services/api'
 import {
   getExistingPushSubscription,
@@ -454,8 +518,13 @@ import {
 } from '@/services/pushNotifications'
 import { getCurrentUser, type LocalUser } from '@/services/auth'
 import { saveTripCache, saveTripSession } from '@/services/tripCache'
-import type { ChatMessage, DestinationRecommendation, TripFormData } from '@/types'
-import type { Dayjs } from 'dayjs'
+import type {
+  ChatMessage,
+  DestinationRecommendation,
+  SemanticTripContract,
+  TripFormData
+} from '@/types'
+import dayjs, { type Dayjs } from 'dayjs'
 
 type PlannerFormData = Omit<TripFormData, 'start_date' | 'end_date'> & {
   start_date: Dayjs | null
@@ -655,6 +724,9 @@ const sendAssistantMessage = async (content?: string) => {
       content: response.reply || response.message || '我给你整理了几个方向。'
     })
     recommendations.value = response.recommendations || []
+    lastSemanticContract.value = response.semantic_contract || null
+    contractRiskAcknowledged.value = false
+    serverGateIssues.value = []
   } catch (error: any) {
     message.error(error.message || '获取推荐失败')
   } finally {
@@ -670,14 +742,89 @@ const askQuickPrompt = (prompt: string) => {
   sendAssistantMessage(`${prompt}, ${origin}, ${days}, ${budget}, 交通偏好${formData.transportation}`)
 }
 
+
+const scheduleMeta = reactive({
+  date_pattern: null as TripFormData['date_pattern'],
+  weekend_style: null as TripFormData['weekend_style'],
+  early_arrival_hint: null as string | null,
+  departure_mode: null as TripFormData['departure_mode']
+})
+const selectedScheduleOption = ref('default')
+const selectedDestinationSource = ref<'manual' | 'recommendation'>('manual')
+const selectedCity = ref('')
+const lastSemanticContract = ref<SemanticTripContract | null>(null)
+const contractRiskAcknowledged = ref(false)
+const serverGateIssues = ref<ApiIssue[]>([])
+const loadingDetail = ref('')
+const loadingEvents = ref<Array<{ stage: string; message: string; detail?: string }>>([])
+let generationRequestVersion = 0
+
+const clearFridayExpandedState = () => {
+  if (formData.start_date && formData.end_date) {
+    const span = formData.end_date.diff(formData.start_date, 'day') + 1
+    const startsFriday = formData.start_date.day() === 5
+    if (span === 3 && startsFriday) {
+      formData.start_date = null
+      formData.end_date = null
+    }
+  }
+  scheduleMeta.departure_mode = null
+  if (scheduleMeta.weekend_style === 'fri_sun_optional') {
+    scheduleMeta.weekend_style = 'sat_sun'
+  }
+  formData.travel_days = 2
+}
+
 const useRecommendation = (item: DestinationRecommendation) => {
   const patch = item.form_patch
+  const scheduleOption = patch.schedule_option || item.schedule_option || 'default_weekend'
+  const isFridayEarly = scheduleOption === 'friday_early'
+
+  if (isFridayEarly) {
+    if (patch.travel_days != null && patch.travel_days !== 3) {
+      message.error('周五出发方案天数异常，未回填。请重试或手动填写日期。')
+      return
+    }
+    if (patch.start_date && patch.end_date) {
+      const span = dayjs(patch.end_date).diff(dayjs(patch.start_date), 'day') + 1
+      if (span !== 3) {
+        message.error('周五出发方案日期跨度与 3 天不一致，未回填。')
+        return
+      }
+    }
+  } else if (
+    (item.date_pattern === 'weekend' || patch.date_pattern === 'weekend'
+      || item.weekend_style === 'sat_sun' || patch.weekend_style === 'sat_sun')
+  ) {
+    if (patch.travel_days != null && patch.travel_days !== 2) {
+      message.error('普通周末方案必须为 2 天，未回填异常天数。')
+      return
+    }
+    if (patch.start_date && patch.end_date) {
+      const span = dayjs(patch.end_date).diff(dayjs(patch.start_date), 'day') + 1
+      if (span !== 2 && (patch.travel_days === 2 || patch.weekend_style === 'sat_sun')) {
+        message.error('普通周末方案日期跨度与 2 天不一致，未回填。')
+        return
+      }
+    }
+  }
+
+  if (!isFridayEarly && selectedScheduleOption.value === 'friday_early') {
+    clearFridayExpandedState()
+  }
+
+  selectedCity.value = item.city
+  selectedScheduleOption.value = scheduleOption || 'default'
+  selectedDestinationSource.value = patch.destination_source || 'recommendation'
   formData.city = patch.city
+  if (patch.origin_city) {
+    formData.origin_city = patch.origin_city
+  }
+  if (patch.travelers) {
+    formData.travelers = patch.travelers
+  }
   if (patch.budget !== null && patch.budget !== undefined) {
     formData.budget = patch.budget
-  }
-  if (patch.travel_days) {
-    formData.travel_days = patch.travel_days
   }
   if (patch.transportation) {
     formData.transportation = patch.transportation
@@ -689,8 +836,52 @@ const useRecommendation = (item: DestinationRecommendation) => {
     formData.preferences = patch.preferences
   }
   formData.free_text_input = patch.free_text_input
-  message.success(`已选择${patch.city},并回填到旅行计划`)
+
+  scheduleMeta.date_pattern = patch.date_pattern ?? item.date_pattern ?? null
+  scheduleMeta.weekend_style = patch.weekend_style ?? item.weekend_style ?? null
+  scheduleMeta.early_arrival_hint = patch.early_arrival_hint ?? item.early_arrival_hint ?? null
+
+  if (isFridayEarly) {
+    if (patch.start_date) formData.start_date = dayjs(patch.start_date)
+    if (patch.end_date) formData.end_date = dayjs(patch.end_date)
+    scheduleMeta.departure_mode = 'evening_before'
+    scheduleMeta.weekend_style = 'fri_sun_optional'
+    if (formData.start_date && formData.end_date) {
+      formData.travel_days = formData.end_date.diff(formData.start_date, 'day') + 1
+    } else {
+      formData.travel_days = 3
+    }
+    message.success('已按周五下午出发安排')
+  } else {
+    if (patch.start_date && patch.end_date) {
+      formData.start_date = dayjs(patch.start_date)
+      formData.end_date = dayjs(patch.end_date)
+    } else if (
+      scheduleMeta.date_pattern === 'weekend'
+      || scheduleMeta.weekend_style === 'sat_sun'
+    ) {
+      formData.start_date = null
+      formData.end_date = null
+      formData.travel_days = 2
+    }
+    scheduleMeta.departure_mode = patch.departure_mode ?? item.departure_mode ?? null
+    if (scheduleMeta.weekend_style === 'sat_sun' || scheduleMeta.date_pattern === 'weekend') {
+      scheduleMeta.departure_mode = null
+      if (!formData.start_date || !formData.end_date) {
+        formData.travel_days = 2
+      }
+    }
+    message.success(
+      scheduleMeta.weekend_style === 'sat_sun' || scheduleMeta.date_pattern === 'weekend'
+        ? `已采用${patch.city}（默认周六—周日两日），请确认日期后生成`
+        : `已采用${patch.city}方案，确认日期后即可生成行程`
+    )
+  }
+  window.setTimeout(() => {
+    document.querySelector('.form-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, 120)
 }
+
 
 watch([() => formData.start_date, () => formData.end_date], ([start, end]) => {
   if (!start || !end) {
@@ -770,29 +961,33 @@ const handleSubmit = async () => {
     return
   }
 
+  const requestVersion = ++generationRequestVersion
+  const requestIsCurrent = () => generationRequestVersion === requestVersion
   loading.value = true
   loadingProgress.value = 0
   loadingStatus.value = '正在初始化'
-
-  const progressInterval = setInterval(() => {
-    if (loadingProgress.value >= 90) return
-
-    loadingProgress.value = Math.min(90, loadingProgress.value + 8)
-    if (loadingProgress.value <= 30) {
-      loadingStatus.value = '正在搜索景点'
-    } else if (loadingProgress.value <= 50) {
-      loadingStatus.value = '正在查询天气'
-    } else if (loadingProgress.value <= 70) {
-      loadingStatus.value = '正在推荐酒店'
-    } else {
-      loadingStatus.value = '正在生成行程计划'
-    }
-  }, 500)
+  loadingDetail.value = '正在创建旅行规划任务…'
+  loadingEvents.value = []
+  serverGateIssues.value = []
 
   try {
+    let freeText = formData.free_text_input.trim()
+    if (
+      contractRiskAcknowledged.value
+      && !freeText.includes('[用户已确认待核对约束]')
+    ) {
+      freeText = freeText
+        ? `${freeText} [用户已确认待核对约束]`
+        : '[用户已确认待核对约束]'
+    }
+
     const requestData: TripFormData = {
       origin_city: formData.origin_city?.trim() || assistantOriginCity.value.trim() || null,
       city: formData.city.trim(),
+      destination_source:
+        selectedCity.value && selectedCity.value === formData.city.trim()
+          ? selectedDestinationSource.value
+          : 'manual',
       start_date: formData.start_date.format('YYYY-MM-DD'),
       end_date: formData.end_date.format('YYYY-MM-DD'),
       travel_days: formData.travel_days,
@@ -802,12 +997,43 @@ const handleSubmit = async () => {
       intercity_transportation: formData.intercity_transportation || null,
       accommodation: formData.accommodation,
       preferences: formData.preferences,
-      free_text_input: formData.free_text_input.trim(),
+      free_text_input: freeText,
       email_on_completion: emailOnCompletion.value,
-      delivery_email: emailOnCompletion.value ? recipient : null
+      delivery_email: emailOnCompletion.value ? recipient : null,
+      semantic_contract: lastSemanticContract.value,
+      semantic_risks_acknowledged: contractRiskAcknowledged.value,
+      date_pattern: scheduleMeta.date_pattern,
+      weekend_style: scheduleMeta.weekend_style,
+      early_arrival_hint: scheduleMeta.early_arrival_hint,
+      departure_mode: scheduleMeta.departure_mode
     }
 
-    const response = await generateTripPlan(requestData)
+    const response = await generateTripPlanWithProgress(requestData, event => {
+      if (!requestIsCurrent()) return
+      if (typeof event.progress === 'number') {
+        loadingProgress.value = Math.max(loadingProgress.value, event.progress)
+      }
+      if (event.message) {
+        loadingStatus.value = event.message
+      }
+      if (event.detail) {
+        loadingDetail.value = event.detail
+      }
+      if (event.stage && event.message && event.stage !== 'initialized') {
+        const nextEvent = {
+          stage: event.stage,
+          message: event.message,
+          detail: event.detail
+        }
+        const existingIndex = loadingEvents.value.findIndex(item => item.stage === event.stage)
+        if (existingIndex >= 0) {
+          loadingEvents.value.splice(existingIndex, 1, nextEvent)
+        } else {
+          loadingEvents.value.push(nextEvent)
+        }
+      }
+    })
+    if (!requestIsCurrent()) return
     console.info('[home] trip plan response received', {
       success: response.success,
       hasData: Boolean(response.data),
@@ -839,13 +1065,39 @@ const handleSubmit = async () => {
       message.error(response.message || '生成失败')
     }
   } catch (error: any) {
-    message.error(error.message || '生成旅行计划失败,请稍后重试')
+    if (requestIsCurrent()) {
+      if (error instanceof ApiClientError) {
+        serverGateIssues.value = error.issues || []
+        const primary = error.message || '生成旅行计划失败'
+        const extra = (error.issues || [])
+          .map((item) => item.message)
+          .filter((text): text is string => Boolean(text))
+          .filter((text) => !primary.includes(text))
+          .slice(0, 2)
+        message.error(
+          extra.length ? `${primary}（${extra.join('；')}）` : primary,
+          6
+        )
+        if (
+          error.status === 422
+          && (error.issues || []).some((item) =>
+            String(item.code || '').startsWith('SEMANTIC_')
+          )
+        ) {
+          contractRiskAcknowledged.value = false
+        }
+      } else {
+        message.error(error.message || '生成旅行计划失败,请稍后重试')
+      }
+    }
   } finally {
-    clearInterval(progressInterval)
     setTimeout(() => {
+      if (!requestIsCurrent()) return
       loading.value = false
       loadingProgress.value = 0
       loadingStatus.value = ''
+      loadingDetail.value = ''
+      loadingEvents.value = []
     }, 900)
   }
 }
@@ -1559,4 +1811,127 @@ const handleSubmit = async () => {
     grid-template-columns: 1fr;
   }
 }
+
+.recommendation-section {
+  margin-top: 18px;
+}
+.recommendation-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.step-kicker {
+  display: block;
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+.option-label {
+  margin-bottom: 10px;
+  color: #98a2b3;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+}
+.decision-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 10px;
+  color: #475467;
+  font-size: 12px;
+}
+.schedule-summary {
+  margin: 0 0 8px;
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+.early-arrival-hint,
+.date-pending-hint {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.early-arrival-hint {
+  background: rgba(240, 253, 250, 0.9);
+  color: #0f766e;
+}
+.date-pending-hint {
+  background: rgba(255, 251, 235, 0.9);
+  color: #b45309;
+}
+.tradeoff-note {
+  margin: 0 0 8px;
+  color: #667085;
+  font-size: 12px;
+}
+.recommendation-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+.recommendation-card.is-friday-early {
+  grid-column: 1 / -1;
+  border-color: rgba(37, 99, 235, 0.28);
+  border-style: dashed;
+  background: linear-gradient(160deg, #ffffff, #eef5ff);
+}
+.recommendation-card.is-friday-early .option-label {
+  color: #2563eb;
+}
+.recommendation-card.is-friday-early .city-name::after {
+  content: ' · 日程方案';
+  color: #2563eb;
+  font-size: 12px;
+  font-weight: 700;
+}
+.agent-workflow {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-radius: 16px;
+  background: linear-gradient(160deg, #ffffff, #f0f9ff);
+  border: 1px solid rgba(37, 99, 235, 0.12);
+}
+.workflow-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.workflow-kicker {
+  display: block;
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+.workflow-trace {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+.trace-item {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  color: #344054;
+  font-size: 12px;
+}
+@media (max-width: 900px) {
+  .recommendation-list {
+    grid-template-columns: 1fr;
+  }
+  .recommendation-card.is-friday-early {
+    grid-column: auto;
+  }
+}
+
 </style>
