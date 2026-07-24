@@ -16,6 +16,30 @@ from ..models.schemas import (
 from .destination_feasibility_service import get_destination_feasibility_service
 
 
+BLOCKING_ISSUE_CODES = frozenset({
+    "CITY_MISMATCH",
+    "SHORT_TRIP_DESTINATION_UNREACHABLE",
+    "PLAN_DATE_RANGE_MISMATCH",
+    "INVALID_DATE_RANGE",
+    "PAST_TRIP_DATE",
+    "DAY_COUNT_MISMATCH",
+    "DAY_DATE_MISMATCH",
+    "EMPTY_DAY",
+    "DAY_SCHEDULE_IMPOSSIBLE",
+})
+
+
+def issue_disposition(issue: TripPlanQualityIssue | str) -> str:
+    """Classify an issue into 'blocking', 'advisory', or 'info'."""
+    code = getattr(issue, "code", issue)
+    severity = getattr(issue, "severity", "warning")
+    if code in BLOCKING_ISSUE_CODES or str(severity).strip().lower() == "error":
+        return "blocking"
+    if str(severity).strip().lower() == "info":
+        return "info"
+    return "advisory"
+
+
 class TripPlanQualityService:
     """Validate facts and cross-field constraints before a plan is persisted."""
 
@@ -1246,32 +1270,24 @@ class TripPlanQualityService:
             score = min(score, 70)
         elif plan.generation_mode == "repaired":
             score = min(score, 92)
-        status = "failed" if error_count else "warning" if warning_count else "passed"
-        blocking_codes = {
-            "CITY_MISMATCH",
-            "SHORT_TRIP_DESTINATION_UNREACHABLE",
-            "SHORT_TRIP_DESTINATION_RISK",
-            "PLAN_DATE_RANGE_MISMATCH",
-            "INVALID_DATE_RANGE",
-            "PAST_TRIP_DATE",
-            "DAY_COUNT_MISMATCH",
-            "DAY_DATE_MISMATCH",
-            "EMPTY_DAY",
-            "DAY_SCHEDULE_IMPOSSIBLE",
-            "BUDGET_MISSING",
-            "HOTEL_GAP",
-            "UNVERIFIED_HOTEL",
-            "HOTEL_REFERENCE_MISMATCH",
-            "HOTEL_PLAN_BUDGET_PRICE_MISMATCH",
-            "TRANSPORT_MODE_MISMATCH",
-            "TRANSPORT_REFERENCE_MISMATCH",
-        }
-        publishable = (
-            not error_count
-            and plan.generation_mode != "map_fallback"
-            and score >= 75
-            and not any(issue.code in blocking_codes for issue in issues)
+        has_blocking = (
+            plan.generation_mode == "map_fallback"
+            or len(plan.days) == 0
+            or any(issue_disposition(issue) == "blocking" for issue in issues)
         )
+        if has_blocking:
+            publishable = False
+            review_required = True
+            status = "failed"
+        elif issues or score < 100 or plan.generation_mode == "repaired":
+            publishable = True
+            review_required = True
+            status = "warning"
+        else:
+            publishable = True
+            review_required = False
+            status = "passed"
+
         return TripPlanQualityResult(
             status=status,
             score=score,
@@ -1280,6 +1296,7 @@ class TripPlanQualityService:
             evidence_score=evidence_score,
             readiness_score=readiness_score,
             publishable=publishable,
+            review_required=review_required,
             checked_items=list(self.CHECKED_ITEMS),
             issues=issues,
             verified_facts=verified_facts,
@@ -1796,13 +1813,8 @@ class TripPlanQualityService:
         )
 
         intercity_floor = 0
-        if request.origin_city:
-            feasibility = get_destination_feasibility_service()
-            if (
-                feasibility.normalize_city(request.origin_city)
-                != feasibility.normalize_city(request.city)
-            ):
-                intercity_floor = 200 * travelers
+        if request.origin_city and not is_same_city:
+            intercity_floor = 200 * travelers
 
         return (
             meal_floor

@@ -429,6 +429,10 @@ class TripPlanQualityResult(BaseModel):
         default=False,
         description="Whether automatic persistence and delivery are allowed",
     )
+    review_required: bool = Field(
+        default=False,
+        description="Whether human or advisory review is requested",
+    )
     checked_items: List[str] = Field(default_factory=list)
     issues: List[TripPlanQualityIssue] = Field(default_factory=list)
     verified_facts: int = Field(default=0)
