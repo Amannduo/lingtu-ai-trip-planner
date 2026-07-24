@@ -5,6 +5,9 @@ import sys
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
+from ..services.request_rate_limit_service import (
+    create_request_rate_limit_service,
+)
 from ..services.database_service import database_status
 from ..services.schema import init_db
 from .routes import auth, trip, poi, push, recommend, agent, map as map_routes
@@ -49,6 +52,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 # 注册路由
@@ -64,6 +68,8 @@ app.include_router(map_routes.router, prefix="/api")
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件"""
+    # Process-local limiter bound to this app instance.
+    app.state.request_rate_limiter = create_request_rate_limit_service()
     print("\n" + "="*60)
     print(f"🚀 {settings.app_name} v{settings.app_version}")
     print("="*60)
@@ -90,6 +96,10 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭事件"""
+    limiter = getattr(app.state, "request_rate_limiter", None)
+    if limiter is not None:
+        limiter.clear()
+    app.state.request_rate_limiter = None
     print("\n" + "="*60)
     print("👋 应用正在关闭...")
     print("="*60 + "\n")

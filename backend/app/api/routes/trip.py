@@ -32,6 +32,7 @@ from ...services.trip_generation_job_service import (
     get_trip_generation_job_service,
     run_with_generation_capacity,
 )
+from ...services.request_rate_limit_service import get_request_rate_limit_service
 from ..auth import get_current_user, get_optional_current_user
 
 
@@ -73,6 +74,51 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
         "issues": issues,
     }
 
+
+
+
+def _normalize_client_ip(host: str | None) -> str:
+    value = (host or "").strip().lower()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return (value or "unknown")[:64]
+
+
+def _trip_generation_rate_identity(
+    current_user: AuthenticatedUser | None,
+    http_request: HttpRequest,
+) -> str:
+    """Authenticated user first; anonymous falls back to normalized peer IP."""
+    if current_user is not None and str(current_user.user_id or "").strip():
+        return f"user:{str(current_user.user_id).strip()}"
+    peer = http_request.client.host if http_request.client else None
+    return f"ip:{_normalize_client_ip(peer)}"
+
+
+def _enforce_trip_generation_rate_limit(
+    http_request: HttpRequest,
+    current_user: AuthenticatedUser | None,
+) -> None:
+    """Count valid trip-generation creates after auth + body validation."""
+    settings = get_settings()
+    limit = max(1, int(getattr(settings, "trip_generation_rate_limit", 10) or 10))
+    window = max(
+        1,
+        int(getattr(settings, "trip_generation_rate_window_seconds", 60) or 60),
+    )
+    identity = _trip_generation_rate_identity(current_user, http_request)
+    retry_after = get_request_rate_limit_service(http_request).check(
+        "trip-generation",
+        identity,
+        limit=limit,
+        window_seconds=window,
+    )
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后重试。",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def _plan_is_publishable(plan: TripPlan) -> bool:
@@ -141,6 +187,8 @@ async def plan_trip(
         旅行计划响应
     """
     try:
+        _enforce_trip_generation_rate_limit(http_request, current_user)
+
         print(f"\n{'='*60}")
         print(f"📥 收到旅行规划请求:")
         print(f"   城市: {request.city}")
@@ -350,6 +398,7 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
+    _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)
 
     def worker(progress):

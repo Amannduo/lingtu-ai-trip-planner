@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     email_user_daily_limit: int = 10
     email_ip_hourly_limit: int = 30
 
+
+    # Process-local create rate for POST /api/trip/plan and /plan-jobs.
+    # Not cluster-wide; each worker process counts independently.
+    trip_generation_rate_limit: int = 10
+    trip_generation_rate_window_seconds: int = 60
+
     # 高德地图API配置
     amap_api_key: str = ""
     amap_route_timeout: int = 12
