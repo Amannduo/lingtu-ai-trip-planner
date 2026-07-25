@@ -201,6 +201,7 @@ def _email_response(state: AgentState) -> dict:
             "\n".join(lines),
             user_id=state.get("user_id"),
             client_ip=state.get("client_ip"),
+            email_type="agent_report",
         )
     return {
         "table": [{"邮件状态": email_result.get("message", ""), "收件人": email_result.get("to", recipient)}],
