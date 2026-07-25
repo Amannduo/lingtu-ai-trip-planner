@@ -272,11 +272,18 @@ class TripPlanQualityService:
             minimum_attractions = (
                 1 if relaxed_pace or is_edge_day else 2
             )
-            minimum_visit_minutes = (
-                120 if relaxed_pace and is_edge_day
-                else 180 if relaxed_pace or is_edge_day
-                else 240
-            )
+            # Edge days with cross-city travel have less available time.
+            # Reserve 240 min for intercity, 120 for meals/rest → ~360 min
+            # consumed before any sightseeing.  120 min of actual visiting
+            # is reasonable for a travel day.
+            if cross_city and is_edge_day:
+                minimum_visit_minutes = 90
+            elif relaxed_pace and is_edge_day:
+                minimum_visit_minutes = 120
+            elif relaxed_pace or is_edge_day:
+                minimum_visit_minutes = 180
+            else:
+                minimum_visit_minutes = 210
             if not attractions:
                 add(
                     "EMPTY_DAY",
@@ -538,16 +545,26 @@ class TripPlanQualityService:
                     "leisure": "休闲娱乐",
                     "other": "同类或未明确分类地点",
                 }
-                add(
-                    "ATTRACTION_TYPE_CONCENTRATION",
-                    "warning",
-                    "days",
-                    (
-                        f"景点类型过于集中：{labels.get(dominant_category, dominant_category)}"
-                        f"占{round(dominant_ratio * 100)}%。"
-                    ),
-                    "增加文博、自然、公园或地标类景点，避免连续多天重复相同体验。",
+                dominant_label = labels.get(dominant_category, dominant_category)
+                # When the user explicitly prefers the dominant category,
+                # concentration is intentional — don't penalise.
+                user_prefers_dominant = any(
+                    marker in " ".join(request.preferences or [])
+                    for marker in self._category_preference_markers(
+                        dominant_category
+                    )
                 )
+                if not user_prefers_dominant:
+                    add(
+                        "ATTRACTION_TYPE_CONCENTRATION",
+                        "warning",
+                        "days",
+                        (
+                            f"景点类型过于集中：{dominant_label}"
+                            f"占{round(dominant_ratio * 100)}%。"
+                        ),
+                        "增加文博、自然、公园或地标类景点，避免连续多天重复相同体验。",
+                    )
 
         museum_count = sum(
             any(
@@ -1250,7 +1267,6 @@ class TripPlanQualityService:
         blocking_codes = {
             "CITY_MISMATCH",
             "SHORT_TRIP_DESTINATION_UNREACHABLE",
-            "SHORT_TRIP_DESTINATION_RISK",
             "PLAN_DATE_RANGE_MISMATCH",
             "INVALID_DATE_RANGE",
             "PAST_TRIP_DATE",
@@ -1266,12 +1282,19 @@ class TripPlanQualityService:
             "TRANSPORT_MODE_MISMATCH",
             "TRANSPORT_REFERENCE_MISMATCH",
         }
-        publishable = (
-            not error_count
-            and plan.generation_mode != "map_fallback"
-            and score >= 75
-            and not any(issue.code in blocking_codes for issue in issues)
+        has_blocking = (
+            error_count > 0
+            or plan.generation_mode == "map_fallback"
+            or any(issue.code in blocking_codes for issue in issues)
         )
+        publishable = not has_blocking and score >= 75
+        # Unified quality_status: the single source of truth for gate decisions.
+        if has_blocking:
+            quality_status = "blocked"
+        elif score >= 75:
+            quality_status = "publishable"
+        else:
+            quality_status = "needs_review"
         return TripPlanQualityResult(
             status=status,
             score=score,
@@ -1280,6 +1303,7 @@ class TripPlanQualityService:
             evidence_score=evidence_score,
             readiness_score=readiness_score,
             publishable=publishable,
+            quality_status=quality_status,
             checked_items=list(self.CHECKED_ITEMS),
             issues=issues,
             verified_facts=verified_facts,
@@ -1296,18 +1320,27 @@ class TripPlanQualityService:
     ) -> bool:
         feasibility = get_destination_feasibility_service()
 
-        def aliases(value: str) -> set[str]:
-            return {
-                normalized
-                for normalized in (
-                    self._normalized_label(value),
-                    self._normalized_label(feasibility.normalize_city(value)),
-                )
-                if normalized
-            }
+        def location_aliases(value: str) -> set[str]:
+            """Return a set of normalized forms for a location name.
 
-        origin_aliases = aliases(request.origin_city or "")
-        destination_aliases = aliases(request.city or "")
+            Includes the raw normalized label, the feasibility-service
+            city normalization, and the shared location-name normalization
+            that strips province prefixes and station suffixes.  This
+            allows ``山西太原`` to match ``太原站`` and ``石家庄`` to
+            match ``石家庄站``.
+            """
+            candidates: set[str] = {
+                self._normalized_label(value),
+                self._normalized_label(feasibility.normalize_city(value)),
+                self._normalized_label(
+                    feasibility.normalize_location_for_matching(value)
+                ),
+            }
+            candidates.discard("")
+            return candidates
+
+        origin_aliases = location_aliases(request.origin_city or "")
+        destination_aliases = location_aliases(request.city or "")
         legs = [
             re.sub(r"\s+", "", item)
             for item in re.split(r"[;；]", reference or "")
@@ -1331,33 +1364,22 @@ class TripPlanQualityService:
             detail_parts = re.split(r"[:：]", leg, maxsplit=1)
             if not has_direction or expected_date not in leg or len(detail_parts) != 2:
                 return False
-            detail = self._normalized_label(detail_parts[1])
+            detail_norm = self._normalized_label(detail_parts[1])
             return (
                 expected_date in detail_parts[1]
-                and any(value in detail for value in starts)
-                and any(value in detail for value in ends)
+                and any(value in detail_norm for value in starts)
+                and any(value in detail_norm for value in ends)
             )
 
-        return (
-            any(
-                leg_matches(
-                    leg,
-                    origin_aliases,
-                    destination_aliases,
-                    request.start_date,
-                )
-                for leg in legs
-            )
-            and any(
-                leg_matches(
-                    leg,
-                    destination_aliases,
-                    origin_aliases,
-                    request.end_date,
-                )
-                for leg in legs
-            )
+        outbound_ok = any(
+            leg_matches(leg, origin_aliases, destination_aliases, request.start_date)
+            for leg in legs
         )
+        inbound_ok = any(
+            leg_matches(leg, destination_aliases, origin_aliases, request.end_date)
+            for leg in legs
+        )
+        return outbound_ok and inbound_ok
 
     def _dimension_score(
         self,
@@ -1656,6 +1678,21 @@ class TripPlanQualityService:
         ):
             return "leisure"
         return "other"
+
+    def _category_preference_markers(self, category: str) -> list[str]:
+        """Return user preference keywords that align with *category*.
+
+        When the user has stated a preference matching the dominant
+        attraction category, concentration is intentional and should
+        not be penalised.
+        """
+        mapping: dict[str, list[str]] = {
+            "culture": ["历史文化", "文化", "历史", "古迹", "博物馆", "古镇", "人文"],
+            "nature": ["自然风光", "自然", "山水", "户外", "风景"],
+            "leisure": ["休闲", "娱乐", "亲子", "度假"],
+            "street": ["逛街", "购物", "城市"],
+        }
+        return mapping.get(category, [])
 
     def _looks_like_non_tourism_poi(self, name: str, category: str) -> bool:
         text = f"{name or ''} {category or ''}"

@@ -184,19 +184,36 @@ class MultiAgentTripPlanner:
         *,
         allow_unpublishable: bool = False,
     ) -> TripPlan:
-        """Reject unpublishable plans at the public planner entry."""
+        """Read the unified quality_status from the quality service.
+
+        - ``blocked`` → raise TripPlanQualityRejectedError
+        - ``needs_review`` → return plan as-is (not an error)
+        - ``publishable`` → return plan as-is
+        """
         from ..services.trip_generation_errors import TripPlanQualityRejectedError
         from ..services.trip_plan_quality_service import get_trip_plan_quality_service
 
         if plan.quality is None:
-            # Normal graph paths always attach quality; if a path skipped the
-            # node, re-run the deterministic gate rather than fail open.
             plan.quality = get_trip_plan_quality_service().evaluate(request, plan)
 
         if allow_unpublishable:
             return plan
 
-        if not bool(getattr(plan.quality, "publishable", False)):
+        quality_status = getattr(plan.quality, "quality_status", None)
+        # Backward-compatible fallback: if quality_status is not set,
+        # compute it from publishable + score + issues.
+        if not quality_status:
+            if bool(getattr(plan.quality, "publishable", False)):
+                quality_status = "publishable"
+            elif plan.quality is not None:
+                has_error = any(
+                    str(getattr(i, "severity", "")).strip().lower() == "error"
+                    for i in (getattr(plan.quality, "issues", None) or [])
+                )
+                quality_status = "blocked" if has_error else "needs_review"
+            else:
+                quality_status = "blocked"
+        if quality_status == "blocked":
             raise TripPlanQualityRejectedError(quality=plan.quality, plan=plan)
         return plan
 
@@ -1650,7 +1667,10 @@ class MultiAgentTripPlanner:
                 f"transport={budget.total_transportation}"
             )
         except Exception as exc:
-            logger.info(f"[planner] budget estimate failed: {type(exc).__name__}")
+            logger.info(
+                "[planner] budget estimate failed: %s: %s",
+                type(exc).__name__, exc,
+            )
             # Let the graph record a partial-enrichment quality warning while
             # preserving the plan with budget=None.
             raise

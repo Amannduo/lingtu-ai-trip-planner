@@ -1,5 +1,10 @@
 """旅行规划API路由"""
 
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import date
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -16,24 +21,299 @@ from starlette.responses import StreamingResponse
 import json
 from ...config import get_settings
 from ...models.schemas import (
+    Attraction,
     TripRequest,
     TripPlan,
     TripPlanResponse,
     ErrorResponse
 )
 from ...agents.trip_planner_agent import get_trip_planner_agent
-from ...services.trip_generation_errors import TripPlanQualityRejectedError
+from ...services.trip_generation_errors import (
+    TripGenerationCancelledError,
+    TripPlanQualityRejectedError,
+)
 from ...services.auth_service import AuthenticatedUser
+from ...services.destination_feasibility_service import get_destination_feasibility_service
+from ...services.semantic_contract_service import collect_semantic_hard_block_issues
 from ...services.trip_email_service import deliver_trip_plan_email
 from ...services.travel_plan_data_service import get_travel_plan_data_service
+from ...services.trip_plan_quality_service import get_trip_plan_quality_service
 from ...services.web_push_service import notify_trip_plan_ready
 from ...services.trip_generation_job_service import (
+    TripGenerationCancellationToken,
     TripGenerationCapacityError,
     get_trip_generation_job_service,
     run_with_generation_capacity,
 )
 from ...services.request_rate_limit_service import get_request_rate_limit_service
 from ..auth import get_current_user, get_optional_current_user
+
+
+class UntrustedTripEditError(ValueError):
+    """Client attempted to forge server-owned plan facts or add unverified POIs."""
+
+
+def _validate_generation_request(request: TripRequest) -> None:
+    """Reject unusable generation inputs before agent work starts.
+
+    Covers civil past dates, unresolved semantic hard-blocks, and auto-
+    recommended destinations that violate short-trip feasibility.
+    """
+    try:
+        start = date.fromisoformat(str(request.start_date))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="出行开始日期格式无效。",
+        ) from exc
+    if start < date.today():
+        raise HTTPException(
+            status_code=422,
+            detail="出行开始日期不能早于今天。",
+        )
+
+    settings = get_settings()
+    if bool(getattr(settings, "semantic_contract_hard_block_enabled", True)):
+        issues = collect_semantic_hard_block_issues(request)
+        if issues:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "存在未确认的关键约束冲突，请先确认后再生成。",
+                    "issues": issues,
+                },
+            )
+
+    if str(getattr(request, "destination_source", "") or "") == "recommendation":
+        assessment = get_destination_feasibility_service().assess(
+            request.origin_city,
+            request.city,
+            request.travel_days,
+            explicit_destination=False,
+        )
+        if not assessment.allowed:
+            raise HTTPException(
+                status_code=422,
+                detail=assessment.reason or "推荐目的地不在当前天数的可信短途圈内。",
+            )
+
+
+def _attraction_key(attraction: Attraction) -> str:
+    return str(attraction.poi_id or "").strip() or str(attraction.name or "").strip()
+
+
+def _merge_trusted_attraction(edited: Attraction, trusted: Attraction) -> Attraction:
+    """Keep user-tunable presentation fields; restore identity and map facts."""
+    merged = trusted.model_copy(deep=True)
+    # User-editable presentation only.
+    merged.description = edited.description
+    merged.visit_duration = edited.visit_duration
+    return merged
+
+
+def _restore_verified_plan_facts(edited: TripPlan, existing: TripPlan) -> TripPlan:
+    """Overwrite client-controlled fields with server-owned verified facts.
+
+    Clients may tweak presentation fields such as attraction description or
+    visit duration, but must not forge weather, budget, generation mode,
+    narrative facts, meals, verified routes, hotels, POI identity, or
+    introduce attractions that were never present on the stored plan.
+    """
+    edited.generation_mode = existing.generation_mode
+    edited.overall_suggestions = existing.overall_suggestions
+    edited.weather_info = existing.weather_info
+    edited.budget = existing.budget
+    edited.agent_audit = existing.agent_audit
+    edited.web_references = existing.web_references
+    edited.web_guide = existing.web_guide
+    edited.map_context = existing.map_context
+
+    existing_by_key: dict[str, Attraction] = {}
+    for day in existing.days or []:
+        for attraction in day.attractions or []:
+            key = _attraction_key(attraction)
+            if key:
+                existing_by_key[key] = attraction
+
+    for day in edited.days or []:
+        for attraction in day.attractions or []:
+            key = _attraction_key(attraction)
+            if key not in existing_by_key:
+                raise UntrustedTripEditError(
+                    f"不能新增未经验证的景点：{attraction.name}"
+                )
+
+    existing_days = list(existing.days or [])
+    for index, day in enumerate(edited.days or []):
+        if index >= len(existing_days):
+            break
+        source = existing_days[index]
+        day.description = source.description
+        day.transportation = source.transportation
+        day.accommodation = source.accommodation
+        day.hotel = source.hotel
+        day.meals = source.meals
+        day.routes = source.routes
+        day.date = source.date
+        day.day_index = source.day_index
+        restored: list[Attraction] = []
+        for attraction in day.attractions or []:
+            trusted = existing_by_key[_attraction_key(attraction)]
+            restored.append(_merge_trusted_attraction(attraction, trusted))
+        day.attractions = restored
+
+    # Do not silently rebuild missing/extra days: day-count corruption must
+    # surface through the post-edit quality gate and block the save.
+    return edited
+
+
+def _reject_identity_mutation(edited: TripPlan, existing: TripPlan) -> None:
+    """City and travel window are immutable after generation."""
+    for field in ("city", "start_date", "end_date"):
+        if str(getattr(edited, field, "") or "") != str(getattr(existing, field, "") or ""):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "目的地和出行日期不能直接修改，请重新生成行程。",
+                    "issues": [
+                        {
+                            "code": "TRIP_IDENTITY_IMMUTABLE",
+                            "severity": "error",
+                            "path": field,
+                            "message": "目的地和出行日期不能直接修改，请重新生成行程。",
+                        }
+                    ],
+                },
+            )
+
+
+def _quality_blocks_edit_save(quality) -> bool:
+    if quality is None:
+        return True
+    status = str(getattr(quality, "status", "") or "").strip().lower()
+    if status == "failed":
+        return True
+    return any(
+        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
+        for issue in (getattr(quality, "issues", None) or [])
+    )
+
+
+class _SyncGenerationProgress:
+    """Callable progress callback for sync generation with cancellation token APIs."""
+
+    def __init__(self, token: TripGenerationCancellationToken) -> None:
+        self._token = token
+
+    def raise_if_cancelled(self) -> None:
+        self._token.raise_if_cancelled()
+
+    def begin_finalization(self) -> None:
+        self._token.begin_finalization()
+
+    def cancel(self, reason: str = "generation_cancelled") -> bool:
+        return self._token.cancel(reason)
+
+    def __call__(self, **_payload) -> None:
+        self.raise_if_cancelled()
+
+
+async def _generate_sync_with_deadline(request: TripRequest):
+    """Run synchronous planning under the shared wall-clock budget.
+
+    Returns ``(plan, progress)``. Callers must claim finalization via the
+    progress object before any persistence or delivery side effects.
+
+    Cancellation is cooperative: ``asyncio.wait_for`` cannot kill the
+    threadpool worker. On timeout we mark the token cancelled so the
+    planner stops at the next checkpoint and capacity is released when
+    the worker returns; the HTTP response does not wait for that join.
+    """
+    settings = get_settings()
+    max_runtime = max(
+        0.001,
+        float(getattr(settings, "trip_generation_max_runtime_seconds", 600.0) or 600.0),
+    )
+    progress = _SyncGenerationProgress(
+        TripGenerationCancellationToken(time.monotonic() + max_runtime)
+    )
+
+    def worker():
+        return run_with_generation_capacity(
+            lambda: get_trip_planner_agent().plan_trip(
+                request,
+                progress_callback=progress,
+            )
+        )
+
+    try:
+        plan = await asyncio.wait_for(run_in_threadpool(worker), timeout=max_runtime)
+    except asyncio.TimeoutError as exc:
+        # Signal cooperative cancel first; capacity remains held until worker exits.
+        progress.cancel("generation_timeout")
+        raise HTTPException(
+            status_code=504,
+            detail="行程生成超时，请稍后重试。",
+        ) from exc
+    except TripGenerationCancelledError as exc:
+        progress.cancel(getattr(exc, "reason", None) or "generation_timeout")
+        raise HTTPException(
+            status_code=504,
+            detail="行程生成超时，请稍后重试。",
+        ) from exc
+    return plan, progress
+
+
+def _normalize_client_ip(host: str | None) -> str:
+    value = (host or "").strip().lower()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return (value or "unknown")[:64]
+
+
+def _trip_generation_rate_identity(
+    current_user: AuthenticatedUser | None,
+    http_request: HttpRequest,
+) -> str:
+    """Build a process-local rate-limit identity for trip generation creates.
+
+    Priority: authenticated user_id → normalized client IP.
+    Does not trust client-supplied user ids or X-Forwarded-For.
+    """
+    if current_user is not None and str(current_user.user_id or "").strip():
+        return f"user:{str(current_user.user_id).strip()}"
+    peer = http_request.client.host if http_request.client else None
+    return f"ip:{_normalize_client_ip(peer)}"
+
+
+def _enforce_trip_generation_rate_limit(
+    http_request: HttpRequest,
+    current_user: AuthenticatedUser | None,
+) -> None:
+    """Consume one trip-generation token after auth/body validation succeeded.
+
+    Distinct from generation capacity (concurrent workers). A 429 here means
+    the identity created too many generation requests in the window.
+    """
+    settings = get_settings()
+    limit = max(1, int(getattr(settings, "trip_generation_rate_limit", 10) or 10))
+    window = max(
+        1,
+        int(getattr(settings, "trip_generation_rate_window_seconds", 60) or 60),
+    )
+    identity = _trip_generation_rate_identity(current_user, http_request)
+    retry_after = get_request_rate_limit_service(http_request).check(
+        "trip-generation",
+        identity,
+        limit=limit,
+        window_seconds=window,
+    )
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后重试。",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
@@ -76,65 +356,46 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
 
 
 
-
-def _normalize_client_ip(host: str | None) -> str:
-    value = (host or "").strip().lower()
-    if value.startswith("[") and value.endswith("]"):
-        value = value[1:-1]
-    return (value or "unknown")[:64]
-
-
-def _trip_generation_rate_identity(
-    current_user: AuthenticatedUser | None,
-    http_request: HttpRequest,
-) -> str:
-    """Authenticated user first; anonymous falls back to normalized peer IP."""
-    if current_user is not None and str(current_user.user_id or "").strip():
-        return f"user:{str(current_user.user_id).strip()}"
-    peer = http_request.client.host if http_request.client else None
-    return f"ip:{_normalize_client_ip(peer)}"
-
-
-def _enforce_trip_generation_rate_limit(
-    http_request: HttpRequest,
-    current_user: AuthenticatedUser | None,
-) -> None:
-    """Count valid trip-generation creates after auth + body validation."""
-    settings = get_settings()
-    limit = max(1, int(getattr(settings, "trip_generation_rate_limit", 10) or 10))
-    window = max(
-        1,
-        int(getattr(settings, "trip_generation_rate_window_seconds", 60) or 60),
-    )
-    identity = _trip_generation_rate_identity(current_user, http_request)
-    retry_after = get_request_rate_limit_service(http_request).check(
-        "trip-generation",
-        identity,
-        limit=limit,
-        window_seconds=window,
-    )
-    if retry_after:
-        raise HTTPException(
-            status_code=429,
-            detail="请求过于频繁，请稍后重试。",
-            headers={"Retry-After": str(retry_after)},
-        )
-
-
 def _plan_is_publishable(plan: TripPlan) -> bool:
-    quality = plan.quality
-    if quality is None:
-        return False
-    return bool(
-        quality.publishable
-        and quality.status in {"passed", "warning"}
-        and quality.score >= 75
-        and plan.generation_mode != "map_fallback"
-        and not any(
-            str(issue.severity).strip().lower() == "error"
-            for issue in quality.issues
-        )
+    """Legacy helper: true only when the unified gate says publishable."""
+    return _resolve_quality_status(plan) == "publishable"
+
+
+def _quality_has_error_issues(quality) -> bool:
+    return any(
+        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
+        for issue in (getattr(quality, "issues", None) or [])
     )
+
+
+def _resolve_quality_status(plan: TripPlan) -> str:
+    """Map plan.quality to blocked | needs_review | publishable.
+
+    Prefer the quality service's ``quality_status`` field. Real evaluate()
+    always sets a coherent triple; stubs may leave the default
+    ``quality_status="blocked"`` while setting ``publishable=True``.
+    """
+    quality = getattr(plan, "quality", None)
+    if quality is None:
+        return "blocked"
+
+    status = str(getattr(quality, "quality_status", "") or "").strip().lower()
+    if status in {"publishable", "needs_review", "blocked"}:
+        if (
+            status == "blocked"
+            and bool(getattr(quality, "publishable", False))
+            and plan.generation_mode != "map_fallback"
+            and not _quality_has_error_issues(quality)
+        ):
+            # Incomplete stub quality objects used by unit tests.
+            return "publishable"
+        return status
+
+    if bool(getattr(quality, "publishable", False)):
+        return "publishable"
+    if _quality_has_error_issues(quality) or plan.generation_mode == "map_fallback":
+        return "blocked"
+    return "needs_review"
 
 
 def _job_owner(current_user: AuthenticatedUser | None, http_request: HttpRequest) -> str:
@@ -187,6 +448,10 @@ async def plan_trip(
         旅行计划响应
     """
     try:
+        # Reject past dates / hard semantic conflicts before rate-limit spend
+        # or expensive agent initialization.
+        _validate_generation_request(request)
+        # After auth + TripRequest validation: count only real generation creates.
         _enforce_trip_generation_rate_limit(http_request, current_user)
 
         print(f"\n{'='*60}")
@@ -196,20 +461,33 @@ async def plan_trip(
         print(f"   天数: {request.travel_days}")
         print(f"{'='*60}\n")
 
-        # 获取Agent实例
-        print("🔄 获取多智能体系统实例...")
-        agent = get_trip_planner_agent()
-
-        # 生成旅行计划
         print("🚀 开始生成旅行计划...")
-        trip_plan = await run_in_threadpool(agent.plan_trip, request)
+        trip_plan, boundary = await _generate_sync_with_deadline(request)
+        try:
+            _begin_generation_finalization(boundary)
+        except TripGenerationCancelledError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="行程生成超时，请稍后重试。",
+            ) from exc
 
         print("✅ 旅行计划生成成功,准备返回响应\n")
+
+        quality_status = _resolve_quality_status(trip_plan)
+        needs_review = quality_status == "needs_review"
+        if quality_status == "blocked":
+            # Agent gate should already reject blocked plans; keep a hard stop.
+            raise TripPlanQualityRejectedError(
+                quality=getattr(trip_plan, "quality", None),
+                plan=trip_plan,
+            )
 
         plan_no = None
         try:
             if current_user is None:
                 print("[trip] anonymous request - generated plan will not be saved")
+            elif needs_review:
+                print("[trip] needs_review plan - not auto-persisted")
             else:
                 plan_no = get_travel_plan_data_service().save_trip_plan(
                     request,
@@ -231,7 +509,7 @@ async def plan_trip(
             )
 
         email_delivery = None
-        if request.email_on_completion:
+        if request.email_on_completion and not needs_review:
             recipient = str(request.delivery_email or "").strip()
             if current_user is None:
                 email_delivery = {
@@ -280,10 +558,16 @@ async def plan_trip(
 
         return TripPlanResponse(
             success=True,
-            message="旅行计划生成成功",
+            message=(
+                "行程已生成，以下事项需要你确认"
+                if needs_review
+                else "旅行计划生成成功"
+            ),
             data=trip_plan,
             plan_no=plan_no,
             email_delivery=email_delivery,
+            needs_review=needs_review,
+            quality_status=quality_status,
         )
 
     except TripPlanQualityRejectedError as exc:
@@ -366,11 +650,28 @@ async def trip_history(
 @router.get("/history/{plan_no}", response_model=TripPlanResponse, summary="读取历史旅行计划")
 async def trip_history_detail(
     plan_no: str,
+    response: Response,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ):
-    plan = get_travel_plan_data_service().get_trip_plan(plan_no, current_user.user_id)
+    service = get_travel_plan_data_service()
+    snapshot_fn = getattr(service, "get_trip_plan_snapshot", None)
+    if callable(snapshot_fn):
+        snapshot = snapshot_fn(plan_no, current_user.user_id)
+        if snapshot is not None:
+            plan, _raw, revision = snapshot
+            response.headers["ETag"] = f'"{revision}"'
+            return TripPlanResponse(
+                success=True,
+                message="旅行计划读取成功",
+                data=plan,
+                plan_no=plan_no,
+            )
+    plan = service.get_trip_plan(plan_no, current_user.user_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="未找到该旅行计划，或当前用户无权访问")
+    revision_fn = getattr(service, "revision_for_plan", None)
+    if callable(revision_fn):
+        response.headers["ETag"] = f'"{revision_fn(plan)}"'
     return TripPlanResponse(success=True, message="旅行计划读取成功", data=plan, plan_no=plan_no)
 
 
@@ -378,17 +679,103 @@ async def trip_history_detail(
 async def update_trip_history(
     plan_no: str,
     plan: TripPlan,
+    http_request: HttpRequest,
+    response: Response,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ):
-    updated = get_travel_plan_data_service().update_trip_plan(
-        plan_no,
-        current_user.user_id,
-        plan,
-    )
-    if not updated:
-        raise HTTPException(status_code=404, detail="未找到该旅行计划，或当前用户无权修改")
-    return TripPlanResponse(success=True, message="旅行计划修改已保存", data=plan, plan_no=plan_no)
+    service = get_travel_plan_data_service()
+    raw_json = None
+    revision = None
+    existing = None
 
+    snapshot_fn = getattr(service, "get_trip_plan_snapshot", None)
+    if callable(snapshot_fn):
+        try:
+            snapshot = snapshot_fn(plan_no, current_user.user_id)
+        except TypeError:
+            snapshot = None
+        if snapshot is not None:
+            existing, raw_json, revision = snapshot
+
+    if existing is None:
+        existing = service.get_trip_plan(plan_no, current_user.user_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="未找到该旅行计划，或当前用户无权修改")
+
+    if_match = http_request.headers.get("if-match")
+    if if_match is not None and revision is not None:
+        token = if_match.strip()
+        if token.startswith("W/"):
+            token = token[2:].strip()
+        if token.startswith('"') and token.endswith('"') and len(token) >= 2:
+            token = token[1:-1]
+        if token != revision:
+            raise HTTPException(
+                status_code=409,
+                detail="行程已被其他人修改，请刷新后再保存。",
+            )
+
+    _reject_identity_mutation(plan, existing)
+
+    try:
+        _restore_verified_plan_facts(plan, existing)
+    except UntrustedTripEditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    request_ctx = None
+    get_request = getattr(service, "get_trip_request", None)
+    if callable(get_request):
+        request_ctx = get_request(plan_no, current_user.user_id)
+    if request_ctx is not None:
+        plan.quality = get_trip_plan_quality_service().evaluate(request_ctx, plan)
+        if _quality_blocks_edit_save(plan.quality):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "修改后的行程存在关键问题，未保存。",
+                    "issues": [
+                        {
+                            "code": getattr(issue, "code", "TRIP_PLAN_QUALITY_REJECTED"),
+                            "severity": getattr(issue, "severity", "error"),
+                            "message": getattr(issue, "message", "质量检查未通过"),
+                        }
+                        for issue in (plan.quality.issues if plan.quality else [])
+                    ]
+                    or [
+                        {
+                            "code": "TRIP_PLAN_QUALITY_REJECTED",
+                            "severity": "error",
+                            "message": "修改后的行程存在关键问题，未保存。",
+                        }
+                    ],
+                },
+            )
+
+    update_kwargs = {}
+    if if_match is not None and raw_json is not None:
+        update_kwargs["expected_plan_json"] = raw_json
+    try:
+        updated = service.update_trip_plan(
+            plan_no,
+            current_user.user_id,
+            plan,
+            **update_kwargs,
+        )
+    except TypeError:
+        updated = service.update_trip_plan(plan_no, current_user.user_id, plan)
+    if not updated:
+        raise HTTPException(
+            status_code=409 if if_match is not None else 404,
+            detail=(
+                "行程已被其他人修改，请刷新后再保存。"
+                if if_match is not None
+                else "未找到该旅行计划，或当前用户无权修改"
+            ),
+        )
+    revision_fn = getattr(service, "revision_for_plan", None)
+    if callable(revision_fn):
+        response.headers["ETag"] = f'"{revision_fn(plan)}"'
+    return TripPlanResponse(success=True, message="旅行计划修改已保存", data=plan, plan_no=plan_no)
 
 
 @router.post("/plan-jobs", summary="创建带实时进度的旅行规划任务")
@@ -398,6 +785,8 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
+    _validate_generation_request(request)
+    # After auth + TripRequest validation: shared create quota with /plan.
     _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)
 
@@ -411,14 +800,18 @@ def create_trip_plan_job(
         )
         _raise_if_generation_cancelled(progress)
 
-        if not _plan_is_publishable(trip_plan):
+        quality_status = _resolve_quality_status(trip_plan)
+        if quality_status == "blocked":
             raise TripPlanQualityRejectedError(
                 quality=getattr(trip_plan, "quality", None),
                 plan=trip_plan,
             )
 
+        quality = getattr(trip_plan, "quality", None)
+        needs_review = quality_status == "needs_review"
+
         plan_no = None
-        if current_user is not None:
+        if current_user is not None and quality_status == "publishable":
             _begin_generation_finalization(progress)
             progress(
                 stage="finalizing",
@@ -435,6 +828,21 @@ def create_trip_plan_job(
                 user_role=current_user.role,
                 source="generated",
             )
+        elif current_user is not None and needs_review:
+            progress(
+                stage="finalizing",
+                progress=99,
+                message="行程已生成，需要确认以下事项",
+                detail=(
+                    f"方案评分 {getattr(quality, 'score', 0)}/100，"
+                    "部分信息需要你复核后再保存。"
+                ),
+                meta={
+                    "quality_score": getattr(quality, "score", 0),
+                    "needs_review": True,
+                },
+            )
+            _raise_if_generation_cancelled(progress)
         else:
             progress(
                 stage="finalizing",
@@ -448,10 +856,16 @@ def create_trip_plan_job(
         return jsonable_encoder(
             TripPlanResponse(
                 success=True,
-                message="旅行计划生成成功",
+                message=(
+                    "行程已生成，以下事项需要你确认"
+                    if needs_review
+                    else "旅行计划生成成功"
+                ),
                 data=trip_plan,
                 plan_no=plan_no,
                 email_delivery=None,
+                needs_review=needs_review,
+                quality_status=quality_status,
             )
         )
 
