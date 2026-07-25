@@ -79,6 +79,7 @@ def deliver_trip_plan_email(
         render_trip_plan_text(plan, plan_no),
         user_id=user_id,
         client_ip=client_ip,
+        email_type="trip_plan",
     )
     return {
         "requested": True,
