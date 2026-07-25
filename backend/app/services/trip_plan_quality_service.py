@@ -16,6 +16,34 @@ from ..models.schemas import (
 from .destination_feasibility_service import get_destination_feasibility_service
 
 
+# Structural hard blockers (shared with PR trust-hardening intent).
+# Budget/hotel/transport gaps remain severity-driven: advisory when warning,
+# blocking when severity=error (see issue_disposition). That preserves
+# reviewable delivery for soft budget issues while keeping real errors hard.
+BLOCKING_ISSUE_CODES = frozenset({
+    "CITY_MISMATCH",
+    "SHORT_TRIP_DESTINATION_UNREACHABLE",
+    "PLAN_DATE_RANGE_MISMATCH",
+    "INVALID_DATE_RANGE",
+    "PAST_TRIP_DATE",
+    "DAY_COUNT_MISMATCH",
+    "DAY_DATE_MISMATCH",
+    "EMPTY_DAY",
+    "DAY_SCHEDULE_IMPOSSIBLE",
+})
+
+
+def issue_disposition(issue: TripPlanQualityIssue | str) -> str:
+    """Classify an issue into 'blocking', 'advisory', or 'info'."""
+    code = getattr(issue, "code", issue)
+    severity = getattr(issue, "severity", "warning")
+    if code in BLOCKING_ISSUE_CODES or str(severity).strip().lower() == "error":
+        return "blocking"
+    if str(severity).strip().lower() == "info":
+        return "info"
+    return "advisory"
+
+
 class TripPlanQualityService:
     """Validate facts and cross-field constraints before a plan is persisted."""
 
@@ -137,7 +165,10 @@ class TripPlanQualityService:
                 "核心日期和服务端补全地点已复核，但建议再次确认个性化取舍是否符合预期。",
             )
 
-        if plan.city.strip() != request.city.strip():
+        feasibility_svc = get_destination_feasibility_service()
+        req_city_norm = feasibility_svc.normalize_city(request.city)
+        plan_city_norm = feasibility_svc.normalize_city(plan.city)
+        if req_city_norm and plan_city_norm and req_city_norm != plan_city_norm:
             add(
                 "CITY_MISMATCH",
                 "error",
@@ -272,18 +303,11 @@ class TripPlanQualityService:
             minimum_attractions = (
                 1 if relaxed_pace or is_edge_day else 2
             )
-            # Edge days with cross-city travel have less available time.
-            # Reserve 240 min for intercity, 120 for meals/rest → ~360 min
-            # consumed before any sightseeing.  120 min of actual visiting
-            # is reasonable for a travel day.
-            if cross_city and is_edge_day:
-                minimum_visit_minutes = 90
-            elif relaxed_pace and is_edge_day:
-                minimum_visit_minutes = 120
-            elif relaxed_pace or is_edge_day:
-                minimum_visit_minutes = 180
-            else:
-                minimum_visit_minutes = 210
+            minimum_visit_minutes = (
+                120 if relaxed_pace and is_edge_day
+                else 180 if relaxed_pace or is_edge_day
+                else 240
+            )
             if not attractions:
                 add(
                     "EMPTY_DAY",
@@ -545,26 +569,30 @@ class TripPlanQualityService:
                     "leisure": "休闲娱乐",
                     "other": "同类或未明确分类地点",
                 }
-                dominant_label = labels.get(dominant_category, dominant_category)
-                # When the user explicitly prefers the dominant category,
-                # concentration is intentional — don't penalise.
-                user_prefers_dominant = any(
-                    marker in " ".join(request.preferences or [])
-                    for marker in self._category_preference_markers(
-                        dominant_category
-                    )
+                add(
+                    "ATTRACTION_TYPE_CONCENTRATION",
+                    "warning",
+                    "days",
+                    (
+                        f"景点类型过于集中：{labels.get(dominant_category, dominant_category)}"
+                        f"占{round(dominant_ratio * 100)}%。"
+                    ),
+                    "增加文博、自然、公园或地标类景点，避免连续多天重复相同体验。",
                 )
-                if not user_prefers_dominant:
-                    add(
-                        "ATTRACTION_TYPE_CONCENTRATION",
-                        "warning",
-                        "days",
-                        (
-                            f"景点类型过于集中：{dominant_label}"
-                            f"占{round(dominant_ratio * 100)}%。"
-                        ),
-                        "增加文博、自然、公园或地标类景点，避免连续多天重复相同体验。",
-                    )
+
+        user_prefs = [p.casefold() for p in (request.preferences or [])]
+        free_text = (request.free_text_input or "").casefold()
+
+        has_museum_pref = any(
+            kw in p or kw in free_text
+            for p in user_prefs + [free_text]
+            for kw in ("历史", "文化", "博物馆", "研学", "展览", "艺术")
+        )
+        has_park_pref = any(
+            kw in p or kw in free_text
+            for p in user_prefs + [free_text]
+            for kw in ("自然", "风光", "公园", "绿道", "徒步", "户外", "休闲")
+        )
 
         museum_count = sum(
             any(
@@ -575,13 +603,14 @@ class TripPlanQualityService:
             )
             for attraction in all_attractions
         )
-        if museum_count > 3:
+        museum_limit = 6 if has_museum_pref else 3
+        if museum_count > museum_limit:
             add(
                 "TOO_MANY_MUSEUMS",
                 "warning",
                 "days",
                 f"行程安排了{museum_count}个博物馆或展馆，体验可能重复。",
-                "最多保留3个最匹配偏好的展馆，其余替换为地标、历史街区或自然景观。",
+                "在不同日期错开参观，或适当补充特色历史街区和自然景观。",
             )
 
         park_count = sum(
@@ -591,13 +620,14 @@ class TripPlanQualityService:
             )
             for attraction in all_attractions
         )
-        if park_count > 4:
+        park_limit = 7 if has_park_pref else 4
+        if park_count > park_limit:
             add(
                 "TOO_MANY_PARKS",
                 "warning",
                 "days",
                 f"行程安排了{park_count}个公园或绿道，连续体验可能相似。",
-                "最多保留4个差异明显的自然休闲点，并补充文化或城市地标。",
+                "保留差异明显的自然休闲点，并补充文化或城市地标。",
             )
 
         attraction_locations = [
@@ -982,6 +1012,10 @@ class TripPlanQualityService:
                 and feasibility.normalize_city(request.origin_city)
                 != feasibility.normalize_city(request.city)
             )
+            self_drive_or_local = any(
+                kw in (request.intercity_transportation or "")
+                for kw in ("自驾", "步行", "公共交通", "城市漫步", "无")
+            ) or request.travel_days <= 1
             fallback_transport = (
                 "城际交通兜底估算" in (budget.budget_source or "")
                 or "兜底估算" in transport_reference
@@ -989,6 +1023,7 @@ class TripPlanQualityService:
             )
             if (
                 different_city
+                and not self_drive_or_local
                 and transport_reference
                 and not fallback_transport
                 and not self._transport_reference_matches(
@@ -1130,10 +1165,10 @@ class TripPlanQualityService:
             if plan.agent_audit.status == "failed":
                 add(
                     "WEB_AUDIT_FAILED",
-                    "error",
+                    "warning",
                     "agent_audit",
-                    "联网审核未通过。",
-                    "查看下方“审核检查”中的具体问题，修复后再使用该行程。",
+                    "动态数据未实时联网复核。",
+                    "查看下方“审核检查”中的具体问题，出发前人工确认二次信息。",
                 )
             elif plan.agent_audit.status != "passed" or plan.agent_audit.issues:
                 issue_count = max(1, len(plan.agent_audit.issues))
@@ -1263,38 +1298,31 @@ class TripPlanQualityService:
             score = min(score, 70)
         elif plan.generation_mode == "repaired":
             score = min(score, 92)
-        status = "failed" if error_count else "warning" if warning_count else "passed"
-        blocking_codes = {
-            "CITY_MISMATCH",
-            "SHORT_TRIP_DESTINATION_UNREACHABLE",
-            "PLAN_DATE_RANGE_MISMATCH",
-            "INVALID_DATE_RANGE",
-            "PAST_TRIP_DATE",
-            "DAY_COUNT_MISMATCH",
-            "DAY_DATE_MISMATCH",
-            "EMPTY_DAY",
-            "DAY_SCHEDULE_IMPOSSIBLE",
-            "BUDGET_MISSING",
-            "HOTEL_GAP",
-            "UNVERIFIED_HOTEL",
-            "HOTEL_REFERENCE_MISMATCH",
-            "HOTEL_PLAN_BUDGET_PRICE_MISMATCH",
-            "TRANSPORT_MODE_MISMATCH",
-            "TRANSPORT_REFERENCE_MISMATCH",
-        }
         has_blocking = (
-            error_count > 0
-            or plan.generation_mode == "map_fallback"
-            or any(issue.code in blocking_codes for issue in issues)
+            len(plan.days) == 0
+            or any(issue_disposition(issue) == "blocking" for issue in issues)
         )
-        publishable = not has_blocking and score >= 75
-        # Unified quality_status: the single source of truth for gate decisions.
+        has_advisory = any(
+            issue_disposition(issue) == "advisory" for issue in issues
+        )
         if has_blocking:
-            quality_status = "blocked"
-        elif score >= 75:
-            quality_status = "publishable"
+            publishable = False
+            review_required = True
+            status = "failed"
+        elif (
+            has_advisory
+            or score < 100
+            or plan.generation_mode in {"repaired", "map_fallback"}
+        ):
+            # Info-only issues (e.g. SEMANTIC_PENDING_FIELDS) do not force review.
+            publishable = True
+            review_required = True
+            status = "warning"
         else:
-            quality_status = "needs_review"
+            publishable = True
+            review_required = False
+            status = "passed"
+
         return TripPlanQualityResult(
             status=status,
             score=score,
@@ -1303,7 +1331,7 @@ class TripPlanQualityService:
             evidence_score=evidence_score,
             readiness_score=readiness_score,
             publishable=publishable,
-            quality_status=quality_status,
+            review_required=review_required,
             checked_items=list(self.CHECKED_ITEMS),
             issues=issues,
             verified_facts=verified_facts,
@@ -1320,27 +1348,18 @@ class TripPlanQualityService:
     ) -> bool:
         feasibility = get_destination_feasibility_service()
 
-        def location_aliases(value: str) -> set[str]:
-            """Return a set of normalized forms for a location name.
-
-            Includes the raw normalized label, the feasibility-service
-            city normalization, and the shared location-name normalization
-            that strips province prefixes and station suffixes.  This
-            allows ``山西太原`` to match ``太原站`` and ``石家庄`` to
-            match ``石家庄站``.
-            """
-            candidates: set[str] = {
-                self._normalized_label(value),
-                self._normalized_label(feasibility.normalize_city(value)),
-                self._normalized_label(
-                    feasibility.normalize_location_for_matching(value)
-                ),
+        def aliases(value: str) -> set[str]:
+            return {
+                normalized
+                for normalized in (
+                    self._normalized_label(value),
+                    self._normalized_label(feasibility.normalize_city(value)),
+                )
+                if normalized
             }
-            candidates.discard("")
-            return candidates
 
-        origin_aliases = location_aliases(request.origin_city or "")
-        destination_aliases = location_aliases(request.city or "")
+        origin_aliases = aliases(request.origin_city or "")
+        destination_aliases = aliases(request.city or "")
         legs = [
             re.sub(r"\s+", "", item)
             for item in re.split(r"[;；]", reference or "")
@@ -1364,22 +1383,33 @@ class TripPlanQualityService:
             detail_parts = re.split(r"[:：]", leg, maxsplit=1)
             if not has_direction or expected_date not in leg or len(detail_parts) != 2:
                 return False
-            detail_norm = self._normalized_label(detail_parts[1])
+            detail = self._normalized_label(detail_parts[1])
             return (
                 expected_date in detail_parts[1]
-                and any(value in detail_norm for value in starts)
-                and any(value in detail_norm for value in ends)
+                and any(value in detail for value in starts)
+                and any(value in detail for value in ends)
             )
 
-        outbound_ok = any(
-            leg_matches(leg, origin_aliases, destination_aliases, request.start_date)
-            for leg in legs
+        return (
+            any(
+                leg_matches(
+                    leg,
+                    origin_aliases,
+                    destination_aliases,
+                    request.start_date,
+                )
+                for leg in legs
+            )
+            and any(
+                leg_matches(
+                    leg,
+                    destination_aliases,
+                    origin_aliases,
+                    request.end_date,
+                )
+                for leg in legs
+            )
         )
-        inbound_ok = any(
-            leg_matches(leg, destination_aliases, origin_aliases, request.end_date)
-            for leg in legs
-        )
-        return outbound_ok and inbound_ok
 
     def _dimension_score(
         self,
@@ -1679,21 +1709,6 @@ class TripPlanQualityService:
             return "leisure"
         return "other"
 
-    def _category_preference_markers(self, category: str) -> list[str]:
-        """Return user preference keywords that align with *category*.
-
-        When the user has stated a preference matching the dominant
-        attraction category, concentration is intentional and should
-        not be penalised.
-        """
-        mapping: dict[str, list[str]] = {
-            "culture": ["历史文化", "文化", "历史", "古迹", "博物馆", "古镇", "人文"],
-            "nature": ["自然风光", "自然", "山水", "户外", "风景"],
-            "leisure": ["休闲", "娱乐", "亲子", "度假"],
-            "street": ["逛街", "购物", "城市"],
-        }
-        return mapping.get(category, [])
-
     def _looks_like_non_tourism_poi(self, name: str, category: str) -> bool:
         text = f"{name or ''} {category or ''}"
         rejected = (
@@ -1816,6 +1831,21 @@ class TripPlanQualityService:
     def _minimum_reasonable_budget(self, request: TripRequest) -> int:
         travelers = max(1, request.travelers)
         days = max(1, request.travel_days)
+
+        feasibility = get_destination_feasibility_service()
+        is_same_city = bool(
+            request.origin_city
+            and feasibility.normalize_city(request.origin_city)
+            == feasibility.normalize_city(request.city)
+        )
+        free_text = (request.free_text_input or "").casefold()
+        is_free_trip = any(
+            kw in free_text
+            for kw in ("免费", "自带", "城市漫步", "漫步", "徒步", "校园", "公园", "短途")
+        )
+        if days <= 1 or is_same_city or is_free_trip:
+            return 0
+
         meal_floor = 90 * travelers * days
         local_transport_floor = 15 * travelers * days
 
@@ -1833,13 +1863,8 @@ class TripPlanQualityService:
         )
 
         intercity_floor = 0
-        if request.origin_city:
-            feasibility = get_destination_feasibility_service()
-            if (
-                feasibility.normalize_city(request.origin_city)
-                != feasibility.normalize_city(request.city)
-            ):
-                intercity_floor = 200 * travelers
+        if request.origin_city and not is_same_city:
+            intercity_floor = 200 * travelers
 
         return (
             meal_floor

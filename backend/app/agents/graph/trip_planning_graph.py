@@ -834,15 +834,24 @@ class TripPlanningAgentGraph:
                     plan.quality.readiness_score = max(
                         0, plan.quality.readiness_score - 6
                     )
-            plan.quality.publishable = (
-                plan.quality.publishable
-                and plan.quality.score >= 75
-                and not enrichment_errors
-                and not any(
-                    issue.severity == "error"
-                    for issue in plan.quality.issues
-                )
+            # Align with reviewable quality service: do not re-impose score>=75.
+            # Soft enrichment failures request review; only blocking issues unpublish.
+            from ...services.trip_plan_quality_service import issue_disposition
+
+            if enrichment_errors:
+                plan.quality.review_required = True
+            has_blocking = any(
+                issue_disposition(issue) == "blocking"
+                or str(getattr(issue, "severity", "")).strip().lower() == "error"
+                for issue in plan.quality.issues
             )
+            if has_blocking:
+                plan.quality.publishable = False
+                plan.quality.review_required = True
+                plan.quality.status = "failed"
+            elif not plan.quality.publishable:
+                # Keep service decision; ensure review flag for non-clean plans.
+                plan.quality.review_required = True
         except TripGenerationCancelledError:
             raise
         except Exception as exc:

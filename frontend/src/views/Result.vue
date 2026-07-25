@@ -105,6 +105,42 @@
 
       <!-- 主内容区 -->
       <div class="main-content">
+        <!-- 智能审查与提示卡片 -->
+        <a-card v-if="qualityIssuesList.length > 0" class="quality-advisory-card" :bordered="false">
+          <div class="quality-advisory-header">
+            <div class="quality-advisory-title">
+              <span class="advisory-icon">💡</span>
+              <span class="advisory-text-title">智能审查与提示</span>
+              <a-tag :color="advisoryTagColor" class="advisory-status-tag">
+                {{ advisoryStatusText }}
+              </a-tag>
+              <span class="advisory-count-badge">共 {{ qualityIssuesList.length }} 项需关注</span>
+            </div>
+            <a-button type="link" size="small" @click="toggleQualityExpand">
+              {{ isQualityExpanded ? '收起' : '展开' }} {{ qualityIssuesList.length > 3 ? `(全部 ${qualityIssuesList.length} 项)` : '' }}
+            </a-button>
+          </div>
+          <div class="quality-advisory-body">
+            <div
+              v-for="(item, idx) in visibleQualityIssues"
+              :key="idx"
+              class="quality-issue-item"
+              :class="item.severity || 'warning'"
+            >
+              <div class="issue-main">
+                <a-tag :color="item.severity === 'info' ? 'blue' : 'orange'" class="issue-badge">
+                  {{ item.severity === 'info' ? '提示' : '建议确认' }}
+                </a-tag>
+                <span class="issue-message">{{ item.message }}</span>
+                <span v-if="item.code" class="issue-code">({{ item.code }})</span>
+              </div>
+              <div v-if="item.suggestion" class="issue-suggestion">
+                💡 {{ item.suggestion }}
+              </div>
+            </div>
+          </div>
+        </a-card>
+
         <!-- 顶部信息区:左侧概览+预算,右侧地图 -->
         <div class="top-info-section">
           <!-- 左侧:行程概览 -->
@@ -484,6 +520,7 @@ const attractionPhotos = ref<Record<string, string>>({})
 const brokenAttractionImages = ref<Set<string>>(new Set())
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
+const isQualityExpanded = ref(false)
 let map: any = null
 
 const isMobileViewport = ref(false)
@@ -504,6 +541,53 @@ const mapSummaryAttractions = computed(() => {
     .slice(0, 8)
 })
 const normalizedWebReferences = computed(() => tripPlan.value?.web_references ?? [])
+const qualityIssuesList = computed(() => {
+  if (!tripPlan.value) return []
+  const items: Array<{ code?: string; severity?: string; message: string; suggestion?: string }> = []
+  if (tripPlan.value.quality && Array.isArray(tripPlan.value.quality.issues)) {
+    for (const issue of tripPlan.value.quality.issues) {
+      if (issue && issue.message) {
+        items.push({
+          code: issue.code || '',
+          severity: issue.severity || 'warning',
+          message: issue.message,
+          suggestion: issue.suggestion || ''
+        })
+      }
+    }
+  }
+  if (tripPlan.value.agent_audit && Array.isArray(tripPlan.value.agent_audit.issues)) {
+    for (const issueText of tripPlan.value.agent_audit.issues) {
+      if (typeof issueText === 'string' && issueText.trim()) {
+        if (!items.some(i => i.message === issueText.trim())) {
+          items.push({
+            code: 'WEB_AUDIT_ITEM',
+            severity: 'warning',
+            message: issueText.trim(),
+            suggestion: '出发前请参考官网或官方渠道确认'
+          })
+        }
+      }
+    }
+  }
+  return items
+})
+const visibleQualityIssues = computed(() => {
+  if (isQualityExpanded.value) return qualityIssuesList.value
+  return qualityIssuesList.value.slice(0, 3)
+})
+const advisoryStatusText = computed(() => {
+  if (tripPlan.value?.quality?.status === 'passed') return '已通过事实核对'
+  if (tripPlan.value?.agent_audit?.audit_level === 'offline_fallback') return '动态数据未复核'
+  return '建议确认'
+})
+const advisoryTagColor = computed(() => {
+  if (tripPlan.value?.quality?.status === 'passed') return 'green'
+  return 'orange'
+})
+function toggleQualityExpand() {
+  isQualityExpanded.value = !isQualityExpanded.value
+}
 const displayWebGuide = computed(() => {
   const text = tripPlan.value?.web_guide?.trim() ?? ''
   return text
@@ -2620,5 +2704,70 @@ const drawRoutes = (AMap: any) => {
   .weather-info-row {
     gap: 10px;
   }
+}
+.quality-advisory-card {
+  margin-bottom: 16px;
+  border-radius: 8px;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+}
+.quality-advisory-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.quality-advisory-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: #d46b08;
+}
+.advisory-status-tag {
+  font-weight: normal;
+}
+.advisory-count-badge {
+  font-size: 12px;
+  color: #8c8c8c;
+  font-weight: normal;
+}
+.quality-advisory-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.quality-issue-item {
+  padding: 10px 12px;
+  background: #ffffff;
+  border-radius: 6px;
+  border-left: 4px solid #fa8c16;
+}
+.quality-issue-item.info {
+  border-left-color: #1890ff;
+}
+.issue-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.issue-badge {
+  font-size: 12px;
+}
+.issue-message {
+  font-weight: 500;
+  color: #262626;
+}
+.issue-code {
+  font-size: 12px;
+  color: #8c8c8c;
+}
+.issue-suggestion {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #595959;
+  padding-left: 4px;
 }
 </style>

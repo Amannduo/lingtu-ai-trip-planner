@@ -51,7 +51,7 @@ def _ok_plan() -> TripPlan:
             status="passed",
             score=90,
             publishable=True,
-            quality_status="publishable",
+            review_required=False,
         ),
     )
 
@@ -139,17 +139,17 @@ def test_create_job_streams_progress_and_result(job_client, monkeypatch) -> None
     notify.assert_not_called()
 
 
-def test_needs_review_plan_streams_result_without_auto_save(
+def test_reviewable_warning_plan_streams_result_and_saves(
     job_client, monkeypatch
 ) -> None:
-    """Mid-score non-blocking plans must reach the client without persistence."""
+    """Reviewable warnings remain deliverable and may persist for logged-in users."""
     client, _service, save, email, notify = job_client
     plan = _ok_plan()
     plan.quality = TripPlanQualityResult(
         status="warning",
-        score=60,
-        publishable=False,
-        quality_status="needs_review",
+        score=88,
+        publishable=True,
+        review_required=True,
     )
 
     class FakePlanner:
@@ -168,8 +168,8 @@ def test_needs_review_plan_streams_result_without_auto_save(
     streamed = client.get(created.json()["stream_url"])
     assert "event: result" in streamed.text
     assert "event: error" not in streamed.text
-    assert '"needs_review":true' in streamed.text.replace(" ", "")
-    save.assert_not_called()
+    assert "需要你确认" in streamed.text or "保存行程" in streamed.text
+    save.assert_called_once()
     email.assert_not_called()
     notify.assert_not_called()
 

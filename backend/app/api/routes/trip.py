@@ -357,45 +357,34 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
 
 
 def _plan_is_publishable(plan: TripPlan) -> bool:
-    """Legacy helper: true only when the unified gate says publishable."""
-    return _resolve_quality_status(plan) == "publishable"
-
-
-def _quality_has_error_issues(quality) -> bool:
-    return any(
-        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
-        for issue in (getattr(quality, "issues", None) or [])
+    """True when quality allows delivery (including reviewable warnings)."""
+    quality = plan.quality
+    if quality is None:
+        return False
+    from ...services.trip_plan_quality_service import issue_disposition
+    return bool(
+        quality.publishable
+        and quality.status in {"passed", "warning", "review"}
+        and not any(
+            issue_disposition(issue) == "blocking"
+            for issue in (quality.issues or [])
+        )
     )
 
 
-def _resolve_quality_status(plan: TripPlan) -> str:
-    """Map plan.quality to blocked | needs_review | publishable.
+def _derived_quality_status(plan: TripPlan) -> str:
+    """Internal compatibility label only — not a second source of truth.
 
-    Prefer the quality service's ``quality_status`` field. Real evaluate()
-    always sets a coherent triple; stubs may leave the default
-    ``quality_status="blocked"`` while setting ``publishable=True``.
+    blocking → blocked
+    publishable + review_required → needs_review
+    publishable + not review_required → publishable
     """
     quality = getattr(plan, "quality", None)
-    if quality is None:
+    if quality is None or not _plan_is_publishable(plan):
         return "blocked"
-
-    status = str(getattr(quality, "quality_status", "") or "").strip().lower()
-    if status in {"publishable", "needs_review", "blocked"}:
-        if (
-            status == "blocked"
-            and bool(getattr(quality, "publishable", False))
-            and plan.generation_mode != "map_fallback"
-            and not _quality_has_error_issues(quality)
-        ):
-            # Incomplete stub quality objects used by unit tests.
-            return "publishable"
-        return status
-
-    if bool(getattr(quality, "publishable", False)):
-        return "publishable"
-    if _quality_has_error_issues(quality) or plan.generation_mode == "map_fallback":
-        return "blocked"
-    return "needs_review"
+    if bool(getattr(quality, "review_required", False)):
+        return "needs_review"
+    return "publishable"
 
 
 def _job_owner(current_user: AuthenticatedUser | None, http_request: HttpRequest) -> str:
@@ -473,22 +462,23 @@ async def plan_trip(
 
         print("✅ 旅行计划生成成功,准备返回响应\n")
 
-        quality_status = _resolve_quality_status(trip_plan)
-        needs_review = quality_status == "needs_review"
-        if quality_status == "blocked":
-            # Agent gate should already reject blocked plans; keep a hard stop.
+        # Reviewable model: reject only non-publishable/blocking plans.
+        if not _plan_is_publishable(trip_plan):
             raise TripPlanQualityRejectedError(
                 quality=getattr(trip_plan, "quality", None),
                 plan=trip_plan,
             )
+        quality = getattr(trip_plan, "quality", None)
+        review_required = (
+            bool(getattr(quality, "review_required", False)) if quality else False
+        )
 
         plan_no = None
         try:
             if current_user is None:
                 print("[trip] anonymous request - generated plan will not be saved")
-            elif needs_review:
-                print("[trip] needs_review plan - not auto-persisted")
             else:
+                # warning + clean both may persist; blocking already rejected
                 plan_no = get_travel_plan_data_service().save_trip_plan(
                     request,
                     trip_plan,
@@ -509,7 +499,7 @@ async def plan_trip(
             )
 
         email_delivery = None
-        if request.email_on_completion and not needs_review:
+        if request.email_on_completion:
             recipient = str(request.delivery_email or "").strip()
             if current_user is None:
                 email_delivery = {
@@ -560,14 +550,12 @@ async def plan_trip(
             success=True,
             message=(
                 "行程已生成，以下事项需要你确认"
-                if needs_review
+                if review_required
                 else "旅行计划生成成功"
             ),
             data=trip_plan,
             plan_no=plan_no,
             email_delivery=email_delivery,
-            needs_review=needs_review,
-            quality_status=quality_status,
         )
 
     except TripPlanQualityRejectedError as exc:
@@ -800,25 +788,41 @@ def create_trip_plan_job(
         )
         _raise_if_generation_cancelled(progress)
 
-        quality_status = _resolve_quality_status(trip_plan)
-        if quality_status == "blocked":
+        if not _plan_is_publishable(trip_plan):
             raise TripPlanQualityRejectedError(
                 quality=getattr(trip_plan, "quality", None),
                 plan=trip_plan,
             )
 
         quality = getattr(trip_plan, "quality", None)
-        needs_review = quality_status == "needs_review"
+        review_required = (
+            bool(getattr(quality, "review_required", False)) if quality else False
+        )
 
         plan_no = None
-        if current_user is not None and quality_status == "publishable":
+        if current_user is not None:
+            # Publishable includes reviewable warnings — still persist.
             _begin_generation_finalization(progress)
             progress(
                 stage="finalizing",
                 progress=99,
-                message="正在安全保存并准备结果",
-                detail="质量检查已完成，正在保存行程。",
-                meta={},
+                message=(
+                    "正在安全保存并准备结果"
+                    if not review_required
+                    else "质量提示已生成，正在保存行程"
+                ),
+                detail=(
+                    "质量检查已完成，正在保存行程。"
+                    if not review_required
+                    else (
+                        f"方案评分 {getattr(quality, 'score', 0)}/100，"
+                        "可交付但仍需复核。"
+                    )
+                ),
+                meta={
+                    "review_required": review_required,
+                    "quality_score": getattr(quality, "score", 0) if quality else 0,
+                },
             )
             _raise_if_generation_cancelled(progress)
             plan_no = get_travel_plan_data_service().save_trip_plan(
@@ -828,21 +832,6 @@ def create_trip_plan_job(
                 user_role=current_user.role,
                 source="generated",
             )
-        elif current_user is not None and needs_review:
-            progress(
-                stage="finalizing",
-                progress=99,
-                message="行程已生成，需要确认以下事项",
-                detail=(
-                    f"方案评分 {getattr(quality, 'score', 0)}/100，"
-                    "部分信息需要你复核后再保存。"
-                ),
-                meta={
-                    "quality_score": getattr(quality, "score", 0),
-                    "needs_review": True,
-                },
-            )
-            _raise_if_generation_cancelled(progress)
         else:
             progress(
                 stage="finalizing",
@@ -858,14 +847,12 @@ def create_trip_plan_job(
                 success=True,
                 message=(
                     "行程已生成，以下事项需要你确认"
-                    if needs_review
+                    if review_required
                     else "旅行计划生成成功"
                 ),
                 data=trip_plan,
                 plan_no=plan_no,
                 email_delivery=None,
-                needs_review=needs_review,
-                quality_status=quality_status,
             )
         )
 

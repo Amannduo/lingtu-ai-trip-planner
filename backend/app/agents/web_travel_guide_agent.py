@@ -363,14 +363,17 @@ class WebTravelGuideAgent:
         if issues:
             status = "warning"
         if len((guide or "").strip()) < 120:
-            status = "failed"
+            status = "warning"
+
+        audit_level = "format_only" if references else "offline_fallback"
 
         return AgentAuditResult(
             status=status,
             source=source,
             checked_items=checked_items,
             issues=issues,
-            suggestions=suggestions
+            suggestions=suggestions,
+            audit_level=audit_level,
         )
 
     def _reservation_items(self, city: str, attraction_names: List[str]) -> List[str]:
@@ -494,6 +497,26 @@ class WebTravelGuideAgent:
             return datetime.strptime(value, "%Y-%m-%d").month
         except ValueError:
             return datetime.now().month
+
+    def _safe_provider_error(self, exc: Exception) -> str:
+        if type(exc).__name__ == "ZhipuSearchError":
+            message = str(exc).lower()
+            if "1113" in message:
+                return "智谱账户余额不足或无可用搜索资源包（错误码1113）"
+            if "rate limit" in message:
+                return "智谱搜索请求过于频繁，请稍后重试"
+            if "authorization" in message or "permission" in message:
+                return "智谱搜索鉴权或接口权限校验失败"
+            if "not configured" in message:
+                return "智谱搜索尚未配置"
+            if "size limit" in message or "exceeded" in message:
+                return "智谱搜索响应超过安全大小限制"
+            if "invalid response" in message or "invalid json" in message:
+                return "智谱搜索返回格式异常"
+            if "api url is invalid" in message:
+                return "智谱搜索接口配置无效"
+            return "智谱搜索暂时不可用"
+        return f"智谱搜索暂时不可用（{type(exc).__name__}）"
 
 
 _web_travel_guide_agent: Optional[WebTravelGuideAgent] = None

@@ -97,6 +97,7 @@ export interface AgentAuditResult {
   checked_items: string[]
   issues: string[]
   suggestions: string[]
+  audit_level?: 'format_only' | 'semantic_verified' | 'offline_fallback' | string
 }
 
 export interface DayPlan {
@@ -121,6 +122,26 @@ export interface WeatherInfo {
   wind_power: string
 }
 
+export interface TripPlanQualityIssue {
+  code: string
+  severity: 'info' | 'warning' | 'error' | string
+  path?: string
+  message: string
+  suggestion?: string
+  auto_repaired?: boolean
+}
+
+export interface TripPlanQualityResult {
+  status: 'passed' | 'warning' | 'failed' | 'review' | string
+  score: number
+  publishable: boolean
+  review_required?: boolean
+  checked_items?: string[]
+  issues?: TripPlanQualityIssue[]
+  verified_facts?: number
+  generated_at?: string
+}
+
 export interface TripPlan {
   city: string
   start_date: string
@@ -132,6 +153,7 @@ export interface TripPlan {
   web_guide?: string | null
   web_references: WebReference[]
   agent_audit?: AgentAuditResult | null
+  quality?: TripPlanQualityResult | null
   map_context?: MapContextPOI[]
 }
 

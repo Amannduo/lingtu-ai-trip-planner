@@ -491,7 +491,7 @@ class AgentAuditResult(BaseModel):
     """联网智能体输出审核结果"""
     status: str = Field(default="warning", description="审核状态: passed/warning/failed")
     source: str = Field(default="", description="输出来源")
-    audit_level: Literal["format_only", "semantic_verified"] = Field(
+    audit_level: Literal["format_only", "semantic_verified", "offline_fallback"] = Field(
         default="format_only",
         description="Audit capability: format/citation checks or semantic verification",
     )
@@ -522,14 +522,15 @@ class TripPlanQualityResult(BaseModel):
         default=False,
         description="Whether automatic persistence and delivery are allowed",
     )
-    quality_status: str = Field(
-        default="blocked",
-        description="blocked | needs_review | publishable — unified gate decision",
+    review_required: bool = Field(
+        default=False,
+        description="Whether human or advisory review is requested",
     )
     checked_items: List[str] = Field(default_factory=list)
     issues: List[TripPlanQualityIssue] = Field(default_factory=list)
     verified_facts: int = Field(default=0)
     generated_at: str = Field(default="")
+
 
 
 class TripPlan(BaseModel):
@@ -570,14 +571,7 @@ class TripPlanResponse(BaseModel):
     data: Optional[TripPlan] = Field(default=None, description="旅行计划数据")
     plan_no: Optional[str] = Field(default=None, description="已保存的旅行计划编号")
     email_delivery: Optional[EmailDeliveryResult] = None
-    needs_review: bool = Field(
-        default=False,
-        description="质量门无阻断但分数不足，行程可展示但需人工复核",
-    )
-    quality_status: str = Field(
-        default="",
-        description="blocked | needs_review | publishable",
-    )
+
 
 
 class POIInfo(BaseModel):

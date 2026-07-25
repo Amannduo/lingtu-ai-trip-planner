@@ -7,9 +7,15 @@ from __future__ import annotations
 
 import os
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+MAX_EXTRACTED_CHARS = 200_000
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+MAX_ARCHIVE_FILES = 5_000
 
 
 def _read_text(path: str) -> str:
@@ -20,6 +26,23 @@ def _read_text(path: str) -> str:
         except (UnicodeDecodeError, UnicodeError):
             continue
     return ""
+
+
+def _validate_office_archive(path: str) -> None:
+    """Reject oversized or highly expanded Office ZIP containers."""
+    if not zipfile.is_zipfile(path):
+        raise ValueError("Office 文件不是有效的 ZIP 容器")
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        if len(members) > MAX_ARCHIVE_FILES:
+            raise ValueError("Office 文件包含过多条目")
+        total_size = sum(member.file_size for member in members)
+        if total_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise ValueError("Office 文件解压后过大")
+        for member in members:
+            compressed = max(1, member.compress_size)
+            if member.file_size > 5 * 1024 * 1024 and member.file_size / compressed > 200:
+                raise ValueError("Office 文件压缩比异常")
 
 
 # ── File parsers ────────────────────────────────────────────────────────
@@ -34,17 +57,23 @@ def parse_md(path: str) -> str:
 
 def parse_pdf(path: str) -> str:
     try:
-        from PyPDF2 import PdfReader
+        from pypdf import PdfReader
     except ImportError:
-        return "[PDF 解析需要安装 PyPDF2]"
+        return "[PDF 解析需要安装 pypdf]"
 
     reader = PdfReader(path)
+    if len(reader.pages) > 200:
+        raise ValueError("PDF 页数不能超过200页")
     pages: list[str] = []
+    extracted = 0
     for page in reader.pages:
         text = page.extract_text()
         if text:
             pages.append(text)
-    return "\n\n".join(pages)
+            extracted += len(text)
+            if extracted >= MAX_EXTRACTED_CHARS:
+                break
+    return "\n\n".join(pages)[:MAX_EXTRACTED_CHARS]
 
 
 def parse_docx(path: str) -> str:
@@ -53,6 +82,7 @@ def parse_docx(path: str) -> str:
     except ImportError:
         return "[DOCX 解析需要安装 python-docx]"
 
+    _validate_office_archive(path)
     doc = Document(path)
     paragraphs: list[str] = []
     for para in doc.paragraphs:
@@ -72,7 +102,7 @@ def parse_docx(path: str) -> str:
     result = "\n\n".join(paragraphs)
     if tables_text:
         result += "\n\n--- 表格数据 ---\n\n" + "\n\n".join(tables_text)
-    return result
+    return result[:MAX_EXTRACTED_CHARS]
 
 
 def parse_xlsx(path: str) -> str:
@@ -81,18 +111,27 @@ def parse_xlsx(path: str) -> str:
     except ImportError:
         return "[XLSX 解析需要安装 openpyxl]"
 
-    wb = load_workbook(path, data_only=True)
+    _validate_office_archive(path)
+    wb = load_workbook(path, data_only=True, read_only=True)
     output: list[str] = []
+    extracted = 0
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         output.append(f"## 工作表: {sheet_name}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(cell) if cell is not None else "" for cell in row]
-            non_empty = [c for c in cells if c]
-            if non_empty:  # skip fully empty rows
-                output.append(" | ".join(cells))
+        for row_index, row in enumerate(ws.iter_rows(values_only=True)):
+            if row_index >= 10_000 or extracted >= MAX_EXTRACTED_CHARS:
+                break
+            cells = [str(cell)[:2_000] if cell is not None else "" for cell in row[:200]]
+            non_empty = [cell for cell in cells if cell]
+            if non_empty:
+                line = " | ".join(cells)
+                output.append(line)
+                extracted += len(line)
         output.append("")
-    return "\n".join(output)
+        if extracted >= MAX_EXTRACTED_CHARS:
+            break
+    wb.close()
+    return "\n".join(output)[:MAX_EXTRACTED_CHARS]
 
 
 # ── Extension → parser mapping ──────────────────────────────────────────
@@ -114,7 +153,7 @@ def parse_uploaded_file(file_path: str) -> tuple[str, str]:
     if parser is None:
         return f"[不支持的文件类型: {suffix}]", f"未知类型 ({suffix})"
     content = parser(file_path)
-    return content, suffix.lstrip(".").upper()
+    return content[:MAX_EXTRACTED_CHARS], suffix.lstrip(".").upper()
 
 
 # ── LLM analysis ─────────────────────────────────────────────────────────
@@ -180,13 +219,22 @@ def _parse_analysis_response(response: str, original_content: str) -> dict[str, 
             break
     brace_start = text.find("{")
     brace_end = text.rfind("}")
-    if brace_start >= 0 and brace_end > brace_start:
+    if (
+        not text.lstrip().startswith("[")
+        and brace_start >= 0
+        and brace_end > brace_start
+    ):
         text = text[brace_start:brace_end + 1]
 
     try:
-        return _json.loads(text)
-    except (_json.JSONDecodeError, Exception):
+        parsed = _json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("analysis response must be a JSON object")
+        parsed["_analysis_degraded"] = False
+        return parsed
+    except (TypeError, ValueError, _json.JSONDecodeError):
         return {
+            "_analysis_degraded": True,
             "summary": f"文件解析完成，共 {len(original_content)} 个字符。LLM 返回格式异常，以下是原始内容摘要。",
             "suggestions": ["请检查文件格式是否正确", "尝试使用更简洁的内容重新上传"],
             "extracted_info": {"cities": [], "dates": [], "budget": "", "travelers": ""},
@@ -211,6 +259,6 @@ def process_uploaded_file(file_path: str, question: str | None = None) -> dict[s
         }
 
     analysis = analyze_travel_file(content, question)
-    analysis["success"] = True
+    analysis["success"] = not bool(analysis.pop("_analysis_degraded", False))
     analysis["file_type"] = file_type
     return analysis
