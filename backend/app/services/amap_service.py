@@ -57,9 +57,51 @@ def _safe_int(value: Any) -> int:
         return 0
     if isinstance(value, int):
         return value
+    if isinstance(value, float):
+        if value != value or value in {float("inf"), float("-inf")}:
+            return 0
+        return int(value)
     text = _to_text(value).replace("°C", "").replace("℃", "").replace("°", "").strip()
     match = re.search(r"-?\d+", text)
     return int(match.group(0)) if match else 0
+
+
+def _bounded_weather_temp(value: Any) -> Optional[int]:
+    """Parse a temperature that is safe to store on a trip plan.
+
+    Rejects missing values, NaN/Infinity, and physically implausible readings so
+    fallback data cannot invent a believable-looking default temperature.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            text = value.replace("°C", "").replace("℃", "").replace("°", "").strip()
+            if not text or text.lower() in {"nan", "inf", "-inf", "none", "null"}:
+                return None
+            number = float(text)
+        else:
+            number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in {float("inf"), float("-inf")}:
+        return None
+    if number < -60 or number > 60:
+        return None
+    return int(round(number))
+
+
+def _bounded_wind_speed_kmh(value: Any) -> Optional[float]:
+    """Open-Meteo wind_speed_10m_max is km/h; reject impossible values."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in {float("inf"), float("-inf")}:
+        return None
+    if number < 0 or number > 250:
+        return None
+    return number
 
 
 class AmapService:
@@ -280,29 +322,41 @@ class AmapService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> List[WeatherInfo]:
-        """查询天气。"""
-        cache_key = ("weather", (city or "").strip(), start_date or "", end_date or "")
+        """Query weather with AMap primary and Open-Meteo date completion.
+
+        Failures never raise to the planner: empty results become advisory
+        weather gaps, not structural plan failures.
+        """
+        city_key = (city or "").strip()
+        cache_key = ("weather", city_key, start_date or "", end_date or "")
         cached = self._cache_get(self._weather_cache, cache_key)
         if cached is not None:
-            return cached
+            return list(cached)
 
         weather_info: List[WeatherInfo] = []
         try:
-            weather_info = self._get_amap_weather(city)
+            weather_info = self._get_amap_weather(city_key)
         except httpx.TimeoutException:
-            print(f"AMap weather timeout: city={city}")
+            print("AMap weather timeout")
         except Exception as exc:
+            # Never log full exception text: request URLs may embed the AMap key.
             print(f"AMap weather failed: {type(exc).__name__}")
 
-        # Open-Meteo is an independent completion source. It must still run
-        # when the AMap weather endpoint is temporarily unavailable.
-        if start_date and end_date:
-            weather_info = self._complete_weather_with_open_meteo(
-                city=city,
-                weather_info=weather_info,
-                start_date=start_date,
-                end_date=end_date,
-            )
+        # Open-Meteo only completes missing in-range dates. It never overwrites
+        # AMap-confirmed days and never invents out-of-horizon forecasts.
+        if start_date and end_date and city_key:
+            try:
+                weather_info = self._complete_weather_with_open_meteo(
+                    city=city_key,
+                    weather_info=weather_info,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            except Exception as exc:
+                print(f"Open-Meteo weather completion failed: {type(exc).__name__}")
+        weather_info = self._filter_requested_weather(
+            weather_info, start_date, end_date
+        )
         self._cache_set(
             self._weather_cache,
             cache_key,
@@ -313,7 +367,7 @@ class AmapService:
                 else self._NEGATIVE_CACHE_TTL_SECONDS
             ),
         )
-        return weather_info
+        return list(weather_info)
 
     def _get_amap_weather(self, city: str) -> List[WeatherInfo]:
         data = self._get_json(
@@ -322,8 +376,11 @@ class AmapService:
         )
         print(f"AMap weather response: status={data.get('status')}")
 
-        if data.get("status") != "1":
-            print(f"AMap weather failed: infocode={data.get('infocode')}")
+        if not isinstance(data, dict) or data.get("status") != "1":
+            print(
+                "AMap weather failed: "
+                f"infocode={data.get('infocode') if isinstance(data, dict) else 'invalid'}"
+            )
             return []
 
         weather_info: List[WeatherInfo] = []
@@ -333,30 +390,44 @@ class AmapService:
             for cast in forecast.get("casts") or []:
                 if not isinstance(cast, dict):
                     continue
-                weather_info.append(WeatherInfo(
+                item = self._weather_item_from_fields(
                     date=_to_text(cast.get("date")),
-                    day_weather=_to_text(cast.get("dayweather") or cast.get("day_weather")),
-                    night_weather=_to_text(cast.get("nightweather") or cast.get("night_weather")),
-                    day_temp=_safe_int(cast.get("daytemp") or cast.get("day_temp")),
-                    night_temp=_safe_int(cast.get("nighttemp") or cast.get("night_temp")),
-                    wind_direction=_to_text(cast.get("daywind") or cast.get("wind_direction")),
-                    wind_power=_to_text(cast.get("daypower") or cast.get("wind_power")),
-                ))
+                    day_weather=_to_text(
+                        cast.get("dayweather") or cast.get("day_weather")
+                    ),
+                    night_weather=_to_text(
+                        cast.get("nightweather") or cast.get("night_weather")
+                    ),
+                    day_temp=cast.get("daytemp") or cast.get("day_temp"),
+                    night_temp=cast.get("nighttemp") or cast.get("night_temp"),
+                    wind_direction=_to_text(
+                        cast.get("daywind") or cast.get("wind_direction")
+                    ),
+                    wind_power=_to_text(
+                        cast.get("daypower") or cast.get("wind_power")
+                    ),
+                    provider="amap",
+                )
+                if item is not None:
+                    weather_info.append(item)
 
         for live in data.get("lives") or []:
             if not isinstance(live, dict):
                 continue
             report_time = _to_text(live.get("reporttime"))
             weather = _to_text(live.get("weather"))
-            weather_info.append(WeatherInfo(
+            item = self._weather_item_from_fields(
                 date=report_time.split(" ")[0] if report_time else "",
                 day_weather=weather,
                 night_weather=weather,
-                day_temp=_safe_int(live.get("temperature")),
-                night_temp=_safe_int(live.get("temperature")),
+                day_temp=live.get("temperature"),
+                night_temp=live.get("temperature"),
                 wind_direction=_to_text(live.get("winddirection")),
                 wind_power=_to_text(live.get("windpower")),
-            ))
+                provider="amap",
+            )
+            if item is not None:
+                weather_info.append(item)
 
         return weather_info
 
@@ -372,6 +443,7 @@ class AmapService:
             return weather_info
 
         today = calendar_date.today()
+        # Open-Meteo free forecast horizon is about 16 days inclusive of today.
         forecast_horizon = today + timedelta(days=15)
         supported_dates = [
             value
@@ -379,11 +451,12 @@ class AmapService:
             if today <= calendar_date.fromisoformat(value) <= forecast_horizon
         ]
 
-        weather_by_date = {
-            item.date[:10]: item
-            for item in weather_info
-            if item.date and len(item.date) >= 10
-        }
+        weather_by_date: Dict[str, WeatherInfo] = {}
+        for item in weather_info:
+            key = (item.date or "")[:10]
+            if len(key) == 10 and key not in weather_by_date:
+                weather_by_date[key] = item
+
         missing_dates = [
             value for value in supported_dates if value not in weather_by_date
         ]
@@ -396,8 +469,13 @@ class AmapService:
 
         parsed_location = self._resolve_weather_location(city)
         if parsed_location is None:
-            return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
+            return [
+                weather_by_date[date]
+                for date in requested_dates
+                if date in weather_by_date
+            ]
 
+        timeout = max(1.0, float(get_settings().amap_route_timeout or 12))
         try:
             response = self._client.get(
                 "https://api.open-meteo.com/v1/forecast",
@@ -408,20 +486,33 @@ class AmapService:
                         "weather_code,temperature_2m_max,temperature_2m_min,"
                         "wind_speed_10m_max,wind_direction_10m_dominant"
                     ),
+                    # Open-Meteo defaults to Celsius and km/h; keep them explicit.
+                    "temperature_unit": "celsius",
+                    "wind_speed_unit": "kmh",
                     "timezone": "Asia/Shanghai",
                     "start_date": supported_dates[0],
                     "end_date": supported_dates[-1],
                 },
-                timeout=get_settings().amap_route_timeout,
+                timeout=timeout,
             )
             response.raise_for_status()
             data = response.json()
             print("Open-Meteo weather response received")
             daily = data.get("daily") if isinstance(data, dict) else None
             if not isinstance(daily, dict):
-                return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
+                return [
+                    weather_by_date[date]
+                    for date in requested_dates
+                    if date in weather_by_date
+                ]
 
             times = daily.get("time") or []
+            if not isinstance(times, list):
+                return [
+                    weather_by_date[date]
+                    for date in requested_dates
+                    if date in weather_by_date
+                ]
             codes = daily.get("weather_code") or []
             max_temps = daily.get("temperature_2m_max") or []
             min_temps = daily.get("temperature_2m_min") or []
@@ -429,23 +520,104 @@ class AmapService:
             wind_dirs = daily.get("wind_direction_10m_dominant") or []
 
             for index, date in enumerate(times):
-                if date not in supported_dates:
+                if not isinstance(date, str) or date not in supported_dates:
                     continue
                 if date in weather_by_date:
+                    # Never overwrite AMap (or earlier) confirmed days.
                     continue
-                weather_by_date[date] = WeatherInfo(
+                day_temp = _bounded_weather_temp(self._list_value(max_temps, index))
+                night_temp = _bounded_weather_temp(self._list_value(min_temps, index))
+                if day_temp is None or night_temp is None:
+                    continue
+                wind_speed = _bounded_wind_speed_kmh(self._list_value(wind_speeds, index))
+                code_text = self._weather_code_text(self._list_value(codes, index))
+                if code_text == "未知" and day_temp is None:
+                    continue
+                item = self._weather_item_from_fields(
                     date=date,
-                    day_weather=self._weather_code_text(self._list_value(codes, index)),
-                    night_weather=self._weather_code_text(self._list_value(codes, index)),
-                    day_temp=_safe_int(self._list_value(max_temps, index)),
-                    night_temp=_safe_int(self._list_value(min_temps, index)),
-                    wind_direction=self._wind_direction_text(self._list_value(wind_dirs, index)),
-                    wind_power=self._wind_power_text(self._list_value(wind_speeds, index)),
+                    day_weather=code_text,
+                    night_weather=code_text,
+                    day_temp=day_temp,
+                    night_temp=night_temp,
+                    wind_direction=self._wind_direction_text(
+                        self._list_value(wind_dirs, index)
+                    ),
+                    wind_power=(
+                        self._wind_power_text(wind_speed)
+                        if wind_speed is not None
+                        else ""
+                    ),
+                    provider="open_meteo",
                 )
+                if item is not None:
+                    weather_by_date[date] = item
         except Exception as exc:
             print(f"Open-Meteo weather fallback failed: {type(exc).__name__}")
 
-        return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
+        return [
+            weather_by_date[date]
+            for date in requested_dates
+            if date in weather_by_date
+        ]
+
+    def _weather_item_from_fields(
+        self,
+        *,
+        date: str,
+        day_weather: str,
+        night_weather: str,
+        day_temp: Any,
+        night_temp: Any,
+        wind_direction: str,
+        wind_power: str,
+        provider: str,
+    ) -> Optional[WeatherInfo]:
+        normalized_date = (date or "")[:10]
+        try:
+            calendar_date.fromisoformat(normalized_date)
+        except ValueError:
+            return None
+        parsed_day = _bounded_weather_temp(day_temp)
+        parsed_night = _bounded_weather_temp(night_temp)
+        if parsed_day is None or parsed_night is None:
+            return None
+        day_text = (day_weather or "").strip()
+        night_text = (night_weather or "").strip()
+        invalid = {"", "未知", "暂无", "无", "--", "null", "none"}
+        if day_text.casefold() in invalid and night_text.casefold() in invalid:
+            return None
+        # Keep provider only in description tags is not available on schema;
+        # callers distinguish fallback via completion path and quality gaps.
+        _ = provider
+        return WeatherInfo(
+            date=normalized_date,
+            day_weather=day_text or night_text,
+            night_weather=night_text or day_text,
+            day_temp=parsed_day,
+            night_temp=parsed_night,
+            wind_direction=wind_direction or "",
+            wind_power=wind_power or "",
+        )
+
+    def _filter_requested_weather(
+        self,
+        weather_info: List[WeatherInfo],
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> List[WeatherInfo]:
+        if not start_date or not end_date:
+            return weather_info
+        requested = set(self._date_range(start_date, end_date))
+        if not requested:
+            return weather_info
+        filtered: List[WeatherInfo] = []
+        seen: set[str] = set()
+        for item in weather_info:
+            key = (item.date or "")[:10]
+            if key in requested and key not in seen:
+                filtered.append(item)
+                seen.add(key)
+        return filtered
 
     def _resolve_weather_location(self, city: str) -> Optional[Location]:
         """Resolve a forecast coordinate without making Open-Meteo depend on AMap."""
