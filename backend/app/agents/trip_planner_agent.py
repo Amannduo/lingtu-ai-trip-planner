@@ -831,6 +831,14 @@ class MultiAgentTripPlanner:
         # visit duration and generated descriptions.
         attraction.category = categories[-1] if categories else (attraction.category or "景点")
         attraction.coordinate_source = "amap_poi"
+        # Provider-supplied admin data for destination verification.
+        from ..models.schemas import VerificationMeta
+        attraction.verification = VerificationMeta(
+            cityname=poi.cityname,
+            citycode=poi.citycode,
+            adname=poi.district,   # district column IS the AMap adname
+            adcode=poi.adcode,
+        )
         # Model-written descriptions, duration and ticket prices are not facts
         # supplied by the POI provider. Recompute neutral content downstream.
         attraction.description = ""

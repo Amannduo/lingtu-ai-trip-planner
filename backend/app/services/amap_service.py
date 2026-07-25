@@ -3,6 +3,7 @@
 import json
 import re
 import threading
+from datetime import date as calendar_date, timedelta
 import time
 from typing import Any, Dict, List, Optional
 
@@ -21,15 +22,6 @@ def _to_text(value: Any) -> str:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
-
-
-def _preview(value: Any, length: int = 200) -> str:
-    if isinstance(value, str):
-        return value[:length]
-    try:
-        return json.dumps(value, ensure_ascii=False, default=str)[:length]
-    except Exception:
-        return str(value)[:length]
 
 
 def _parse_location(value: Any) -> Optional[Location]:
@@ -75,30 +67,53 @@ class AmapService:
 
     _MIN_INTERVAL_SECONDS = 0.45
     _CACHE_TTL_SECONDS = 600
+    _NEGATIVE_CACHE_TTL_SECONDS = 30
+    _CACHE_MAX_ENTRIES = 512
 
     def __init__(self):
         self.settings = get_settings()
         if not self.settings.amap_api_key:
             raise ValueError("AMAP_API_KEY 未配置，请在 .env 文件中设置 AMAP_API_KEY")
-        self._request_lock = threading.Lock()
+        self._rate_lock = threading.Lock()
+        self._cache_lock = threading.RLock()
         self._last_request_at = 0.0
+        self._client = httpx.Client()
         self._poi_cache: Dict[Any, Any] = {}
         self._weather_cache: Dict[Any, Any] = {}
         self._geo_cache: Dict[Any, Any] = {}
         self._detail_cache: Dict[Any, Any] = {}
 
     def _cache_get(self, cache: Dict[Any, Any], key: Any) -> Any:
-        item = cache.get(key)
-        if not item:
-            return None
-        expires_at, value = item
-        if expires_at < time.monotonic():
-            cache.pop(key, None)
-            return None
-        return value
+        with self._cache_lock:
+            item = cache.get(key)
+            if not item:
+                return None
+            expires_at, value = item
+            if expires_at < time.monotonic():
+                cache.pop(key, None)
+                return None
+            return value
 
-    def _cache_set(self, cache: Dict[Any, Any], key: Any, value: Any) -> None:
-        cache[key] = (time.monotonic() + self._CACHE_TTL_SECONDS, value)
+    def _cache_set(
+        self,
+        cache: Dict[Any, Any],
+        key: Any,
+        value: Any,
+        ttl_seconds: Optional[float] = None,
+    ) -> None:
+        with self._cache_lock:
+            now = time.monotonic()
+            expired = [item_key for item_key, item in cache.items() if item[0] < now]
+            for item_key in expired:
+                cache.pop(item_key, None)
+            while len(cache) >= self._CACHE_MAX_ENTRIES:
+                oldest_key = min(cache, key=lambda item_key: cache[item_key][0])
+                cache.pop(oldest_key, None)
+            ttl = self._CACHE_TTL_SECONDS if ttl_seconds is None else max(0, ttl_seconds)
+            cache[key] = (now + ttl, value)
+
+    def close(self) -> None:
+        self._client.close()
 
     def _get_json(
         self,
@@ -112,17 +127,19 @@ class AmapService:
         request_params["output"] = "JSON"
 
         for attempt in range(retries + 1):
-            with self._request_lock:
+            # Only serialize request starts. Holding this lock during network
+            # I/O allowed one slow provider call to block every user.
+            with self._rate_lock:
                 elapsed = time.monotonic() - self._last_request_at
                 if elapsed < self._MIN_INTERVAL_SECONDS:
                     time.sleep(self._MIN_INTERVAL_SECONDS - elapsed)
-                response = httpx.get(
-                    url,
-                    params=request_params,
-                    timeout=timeout or get_settings().amap_route_timeout,
-                )
                 self._last_request_at = time.monotonic()
 
+            response = self._client.get(
+                url,
+                params=request_params,
+                timeout=timeout or get_settings().amap_route_timeout,
+            )
             response.raise_for_status()
             data = response.json()
             if data.get("infocode") == "10021" and attempt < retries:
@@ -155,6 +172,9 @@ class AmapService:
             rating=_safe_float(biz_ext.get("rating")),
             photos=photos[:3],
             district=_to_text(item.get("adname")),
+            cityname=_to_text(item.get("cityname")),
+            citycode=_to_text(item.get("citycode")),
+            adcode=_to_text(item.get("adcode")),
         )
 
     def search_poi(self, keywords: str, city: str, citylimit: bool = True) -> List[POIInfo]:
@@ -184,10 +204,13 @@ class AmapService:
                         "extensions": "all",
                     },
                 )
-                print(f"AMap POI result: {_preview(data)}...")
+                print(
+                    "AMap POI response: "
+                    f"status={data.get('status')}, count={len(data.get('pois') or [])}"
+                )
 
                 if data.get("status") != "1":
-                    print(f"AMap POI failed: info={data.get('info')}, infocode={data.get('infocode')}")
+                    print(f"AMap POI failed: infocode={data.get('infocode')}")
                     continue
 
                 pois: List[POIInfo] = []
@@ -206,10 +229,10 @@ class AmapService:
             return []
 
         except httpx.TimeoutException:
-            print(f"AMap POI timeout: keywords={keywords}, city={city}")
+            print("AMap POI timeout")
             return []
         except Exception as e:
-            print(f"AMap POI failed: {str(e)}")
+            print(f"AMap POI failed: {type(e).__name__}")
             return []
 
     def search_poi_around(
@@ -251,7 +274,7 @@ class AmapService:
             self._cache_set(self._poi_cache, cache_key, pois)
             return pois
         except Exception as exc:
-            print(f"AMap around POI failed: {exc}")
+            print(f"AMap around POI failed: {type(exc).__name__}")
             return []
 
     def get_weather(
@@ -266,34 +289,44 @@ class AmapService:
         if cached is not None:
             return cached
 
+        weather_info: List[WeatherInfo] = []
         try:
             weather_info = self._get_amap_weather(city)
-            if start_date and end_date:
-                weather_info = self._complete_weather_with_open_meteo(
-                    city=city,
-                    weather_info=weather_info,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-            self._cache_set(self._weather_cache, cache_key, weather_info)
-            return weather_info
-
         except httpx.TimeoutException:
             print(f"AMap weather timeout: city={city}")
-            return []
-        except Exception as e:
-            print(f"AMap weather failed: {str(e)}")
-            return []
+        except Exception as exc:
+            print(f"AMap weather failed: {type(exc).__name__}")
+
+        # Open-Meteo is an independent completion source. It must still run
+        # when the AMap weather endpoint is temporarily unavailable.
+        if start_date and end_date:
+            weather_info = self._complete_weather_with_open_meteo(
+                city=city,
+                weather_info=weather_info,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        self._cache_set(
+            self._weather_cache,
+            cache_key,
+            weather_info,
+            ttl_seconds=(
+                self._CACHE_TTL_SECONDS
+                if weather_info
+                else self._NEGATIVE_CACHE_TTL_SECONDS
+            ),
+        )
+        return weather_info
 
     def _get_amap_weather(self, city: str) -> List[WeatherInfo]:
         data = self._get_json(
             "https://restapi.amap.com/v3/weather/weatherInfo",
             {"city": city, "extensions": "all"},
         )
-        print(f"AMap weather result: {_preview(data)}...")
+        print(f"AMap weather response: status={data.get('status')}")
 
         if data.get("status") != "1":
-            print(f"AMap weather failed: info={data.get('info')}, infocode={data.get('infocode')}")
+            print(f"AMap weather failed: infocode={data.get('infocode')}")
             return []
 
         weather_info: List[WeatherInfo] = []
@@ -341,25 +374,35 @@ class AmapService:
         if not requested_dates:
             return weather_info
 
+        today = calendar_date.today()
+        forecast_horizon = today + timedelta(days=15)
+        supported_dates = [
+            value
+            for value in requested_dates
+            if today <= calendar_date.fromisoformat(value) <= forecast_horizon
+        ]
+
         weather_by_date = {
             item.date[:10]: item
             for item in weather_info
             if item.date and len(item.date) >= 10
         }
-        missing_dates = [date for date in requested_dates if date not in weather_by_date]
+        missing_dates = [
+            value for value in supported_dates if value not in weather_by_date
+        ]
         if not missing_dates:
-            return [weather_by_date[date] for date in requested_dates]
+            return [
+                weather_by_date[value]
+                for value in requested_dates
+                if value in weather_by_date
+            ]
 
-        location = self._geocode_location(city, city)
-        if not location:
-            return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
-
-        parsed_location = _parse_location(location)
+        parsed_location = self._resolve_weather_location(city)
         if parsed_location is None:
             return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
 
         try:
-            response = httpx.get(
+            response = self._client.get(
                 "https://api.open-meteo.com/v1/forecast",
                 params={
                     "latitude": parsed_location.latitude,
@@ -369,14 +412,14 @@ class AmapService:
                         "wind_speed_10m_max,wind_direction_10m_dominant"
                     ),
                     "timezone": "Asia/Shanghai",
-                    "start_date": start_date,
-                    "end_date": end_date,
+                    "start_date": supported_dates[0],
+                    "end_date": supported_dates[-1],
                 },
                 timeout=get_settings().amap_route_timeout,
             )
             response.raise_for_status()
             data = response.json()
-            print(f"Open-Meteo weather result: {_preview(data)}...")
+            print("Open-Meteo weather response received")
             daily = data.get("daily") if isinstance(data, dict) else None
             if not isinstance(daily, dict):
                 return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
@@ -389,6 +432,8 @@ class AmapService:
             wind_dirs = daily.get("wind_direction_10m_dominant") or []
 
             for index, date in enumerate(times):
+                if date not in supported_dates:
+                    continue
                 if date in weather_by_date:
                     continue
                 weather_by_date[date] = WeatherInfo(
@@ -400,10 +445,52 @@ class AmapService:
                     wind_direction=self._wind_direction_text(self._list_value(wind_dirs, index)),
                     wind_power=self._wind_power_text(self._list_value(wind_speeds, index)),
                 )
-        except Exception as e:
-            print(f"Open-Meteo weather fallback failed: {str(e)}")
+        except Exception as exc:
+            print(f"Open-Meteo weather fallback failed: {type(exc).__name__}")
 
         return [weather_by_date[date] for date in requested_dates if date in weather_by_date]
+
+    def _resolve_weather_location(self, city: str) -> Optional[Location]:
+        """Resolve a forecast coordinate without making Open-Meteo depend on AMap."""
+        try:
+            amap_location = _parse_location(self._geocode_location(city, city))
+            if amap_location is not None:
+                return amap_location
+        except Exception as exc:
+            # httpx exceptions may include a request URL containing the AMap
+            # key, so only the exception class is safe to log.
+            print(f"AMap weather geocode failed: {type(exc).__name__}")
+
+        try:
+            response = self._client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={
+                    "name": city,
+                    "count": 5,
+                    "language": "zh",
+                    "format": "json",
+                    "countryCode": "CN",
+                },
+                timeout=get_settings().amap_route_timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(results, list):
+                return None
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    longitude = float(item.get("longitude"))
+                    latitude = float(item.get("latitude"))
+                except (TypeError, ValueError):
+                    continue
+                if 73.0 <= longitude <= 136.0 and 3.0 <= latitude <= 54.0:
+                    return Location(longitude=longitude, latitude=latitude)
+        except Exception as exc:
+            print(f"Open-Meteo geocode failed: {type(exc).__name__}")
+        return None
 
     def _date_range(self, start_date: str, end_date: str) -> List[str]:
         from datetime import datetime, timedelta
@@ -493,7 +580,7 @@ class AmapService:
                 else self._geocode_location(destination_address, destination_city, timeout)
             )
             if not origin or not destination:
-                print(f"AMap route failed: geocode failed {origin_address} -> {destination_address}")
+                print("AMap route failed: geocode unavailable")
                 return {}
 
             data = self._request_direction(
@@ -504,14 +591,14 @@ class AmapService:
                 destination_city=destination_city,
                 timeout=timeout
             )
-            print(f"AMap route result: {_preview(data)}...")
+            print(f"AMap route response: status={data.get('status')}")
             return data
 
         except httpx.TimeoutException:
-            print(f"AMap route timeout: {origin_address} -> {destination_address} ({timeout}s)")
+            print("AMap route timeout")
             return {}
-        except Exception as e:
-            print(f"AMap route failed: {str(e)}")
+        except Exception as exc:
+            print(f"AMap route failed: {type(exc).__name__}")
             return {}
 
     def _geocode_location(
@@ -536,7 +623,7 @@ class AmapService:
             timeout=timeout,
         )
         if data.get("status") != "1":
-            print(f"AMap geocode failed: {address}, info={data.get('info')}")
+            print(f"AMap geocode failed: infocode={data.get('infocode')}")
             return None
 
         geocodes = data.get("geocodes") or []
@@ -571,7 +658,7 @@ class AmapService:
 
         data = self._get_json(endpoint_map[normalized_type], params, timeout=timeout)
         if data.get("status") != "1":
-            print(f"AMap route API failed: info={data.get('info')}, infocode={data.get('infocode')}")
+            print(f"AMap route API failed: infocode={data.get('infocode')}")
             return {}
         return data
 
@@ -580,8 +667,8 @@ class AmapService:
         try:
             location = self._geocode_location(address, city)
             return _parse_location(location)
-        except Exception as e:
-            print(f"AMap geocode failed: {str(e)}")
+        except Exception as exc:
+            print(f"AMap geocode failed: {type(exc).__name__}")
             return None
 
     def get_poi_detail(self, poi_id: str) -> Dict[str, Any]:
@@ -596,10 +683,10 @@ class AmapService:
                 "https://restapi.amap.com/v3/place/detail",
                 {"id": poi_id, "extensions": "all"},
             )
-            print(f"AMap POI detail result: {_preview(data)}...")
+            print(f"AMap POI detail response: status={data.get('status')}")
 
             if data.get("status") != "1":
-                print(f"AMap POI detail failed: info={data.get('info')}, infocode={data.get('infocode')}")
+                print(f"AMap POI detail failed: infocode={data.get('infocode')}")
                 return {}
 
             pois = data.get("pois") or []
@@ -608,21 +695,32 @@ class AmapService:
             return result if isinstance(result, dict) else {"raw": result}
 
         except httpx.TimeoutException:
-            print(f"AMap POI detail timeout: {poi_id}")
+            print("AMap POI detail timeout")
             return {}
-        except Exception as e:
-            print(f"AMap POI detail failed: {str(e)}")
+        except Exception as exc:
+            print(f"AMap POI detail failed: {type(exc).__name__}")
             return {}
 
 
-_amap_service = None
+_amap_service: AmapService | None = None
+_amap_service_lock = threading.Lock()
 
 
 def get_amap_service() -> AmapService:
-    """获取高德地图服务实例。"""
+    """获取线程安全初始化的高德地图服务实例。"""
     global _amap_service
-
     if _amap_service is None:
-        _amap_service = AmapService()
-
+        with _amap_service_lock:
+            if _amap_service is None:
+                _amap_service = AmapService()
     return _amap_service
+
+
+def shutdown_amap_service() -> None:
+    """Release pooled HTTP connections during application shutdown."""
+    global _amap_service
+    with _amap_service_lock:
+        service = _amap_service
+        _amap_service = None
+    if service is not None:
+        service.close()

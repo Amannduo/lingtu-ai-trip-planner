@@ -13,9 +13,10 @@ from ..models.schemas import (
     TripPlanQualityResult,
     TripRequest,
 )
-from .destination_feasibility_service import get_destination_feasibility_service
-
-
+from .destination_feasibility_service import (
+    get_destination_feasibility_service,
+    poi_destination_status,
+)
 class TripPlanQualityService:
     """Validate facts and cross-field constraints before a plan is persisted."""
 
@@ -40,6 +41,8 @@ class TripPlanQualityService:
         "DAY_DATE_MISMATCH": 25,
         "EMPTY_DAY": 25,
         "INVALID_COORDINATE": 20,
+        "POI_DESTINATION_MISMATCH": 35,
+        "POI_DESTINATION_UNVERIFIED": 6,
         "NON_TOURISM_POI": 15,
         "UNVERIFIED_POI": 8,
         "UNVERIFIED_MEAL": 8,
@@ -331,6 +334,34 @@ class TripPlanQualityService:
                     and bool((attraction.poi_id or "").strip())
                 ):
                     verified_facts += 1
+                    dest_status = self._attraction_matches_destination(
+                        request, attraction,
+                    )
+                    if dest_status == "mismatched":
+                        add(
+                            "POI_DESTINATION_MISMATCH",
+                            "error",
+                            path,
+                            (
+                                f"景点「{attraction.name}」位于"
+                                f"「{attraction.address or '未知'}」"
+                                f"，与目的地「{request.city}」不一致。"
+                            ),
+                            "仅使用目的地城市的高德POI替换。",
+                        )
+                    elif dest_status == "unknown":
+                        add(
+                            "POI_DESTINATION_UNVERIFIED",
+                            "warning",
+                            path,
+                            (
+                                f"景点「{attraction.name}」的地址"
+                                f"「{attraction.address or '无'}」未包含"
+                                f"「{request.city}」的行政区信息，"
+                                "无法确认是否属于目的地。"
+                            ),
+                            "出发前通过地图确认实际位置。",
+                        )
                 else:
                     add(
                         "UNVERIFIED_POI",
@@ -1200,6 +1231,7 @@ class TripPlanQualityService:
                 "DAY_DATE_MISMATCH",
                 "EMPTY_DAY",
                 "INVALID_COORDINATE",
+                "POI_DESTINATION_MISMATCH",
                 "BUDGET_NEGATIVE_COMPONENT",
                 "BUDGET_SUM_MISMATCH",
             },
@@ -1281,6 +1313,8 @@ class TripPlanQualityService:
             "HOTEL_PLAN_BUDGET_PRICE_MISMATCH",
             "TRANSPORT_MODE_MISMATCH",
             "TRANSPORT_REFERENCE_MISMATCH",
+            "POI_DESTINATION_MISMATCH",
+            "INVALID_COORDINATE",
         }
         has_blocking = (
             error_count > 0
@@ -1679,6 +1713,31 @@ class TripPlanQualityService:
             return "leisure"
         return "other"
 
+    def _attraction_matches_destination(
+        self, request: TripRequest, attraction,
+    ) -> str:
+        """Return ``"matched"``, ``"mismatched"``, or ``"unknown"``.
+
+        Reads structured verification metadata from the Attraction,
+        falling back to address text parsing when no structured fields
+        are available.
+        """
+        verification = getattr(attraction, "verification", None)
+        cityname = getattr(verification, "cityname", "") or ""
+        citycode = getattr(verification, "citycode", "") or ""
+        adname = getattr(verification, "adname", "") or ""
+        adcode = getattr(verification, "adcode", "") or ""
+        return poi_destination_status(
+            destination_city=request.city,
+            cityname=cityname,
+            citycode=citycode,
+            adname=adname,
+            adcode=adcode,
+            address=getattr(attraction, "address", "") or "",
+            name=getattr(attraction, "name", "") or "",
+        )
+
+    @staticmethod
     def _category_preference_markers(self, category: str) -> list[str]:
         """Return user preference keywords that align with *category*.
 

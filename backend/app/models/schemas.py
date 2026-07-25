@@ -346,6 +346,19 @@ class MapContextPOI(BaseModel):
     source: str = Field(default="amap_poi", description="数据来源")
 
 
+class VerificationMeta(BaseModel):
+    """Provider-supplied administrative data for POI destination verification.
+
+    Not part of the public user-facing plan display.  Backward-compatible:
+    default values ensure that historical plans without this field parse
+    without errors.
+    """
+    cityname: str = Field(default="", description="高德 cityname")
+    citycode: str = Field(default="", description="高德 citycode")
+    adname: str = Field(default="", description="高德 adname")
+    adcode: str = Field(default="", description="高德 adcode")
+
+
 class Attraction(BaseModel):
     """景点信息"""
     name: str = Field(..., min_length=1, max_length=200, description="景点名称")
@@ -360,6 +373,10 @@ class Attraction(BaseModel):
     image_url: Optional[str] = Field(default=None, description="图片URL")
     coordinate_source: str = Field(default="", description="坐标来源")
     ticket_price: int = Field(default=0, ge=0, le=1_000_000, description="单人门票参考价(元)")
+    verification: Optional[VerificationMeta] = Field(
+        default=None,
+        description="POI提供商返回的行政区数据，用于目的地校验，不参与前端展示",
+    )
 
     @field_validator("photos", mode="before")
     @classmethod
@@ -590,7 +607,10 @@ class POIInfo(BaseModel):
     tel: Optional[str] = Field(default=None, description="电话")
     rating: Optional[float] = Field(default=None, description="高德评分")
     photos: List[str] = Field(default_factory=list, description="高德 POI 图片")
-    district: str = Field(default="", description="所在区县")
+    district: str = Field(default="", description="所在区县 (adname)")
+    cityname: str = Field(default="", description="高德 cityname")
+    citycode: str = Field(default="", description="高德 citycode")
+    adcode: str = Field(default="", description="高德 adcode")
 
 
 class POISearchResponse(BaseModel):
