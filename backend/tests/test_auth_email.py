@@ -42,7 +42,15 @@ def test_email_registration_login_and_update() -> None:
             assert user["email"] == email
             assert client.get("/api/auth/me").status_code == 200
 
+            cookie_name = get_settings().auth_cookie_name
+            old_token = client.cookies.get(cookie_name)
+            assert old_token
             assert client.post("/api/auth/logout").status_code == 200
+            # Logout revokes every access token for this user (all sessions).
+            client.cookies.set(cookie_name, old_token)
+            assert client.get("/api/auth/me").status_code == 401
+            client.cookies.delete(cookie_name)
+
             logged_in = client.post(
                 "/api/auth/login",
                 json={"username": email, "password": "Passw0rd123"},

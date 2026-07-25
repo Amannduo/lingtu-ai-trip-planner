@@ -36,6 +36,15 @@ def _run_compatibility_migrations() -> None:
                 connection.execute(
                     text("ALTER TABLE users ADD COLUMN email VARCHAR(254)")
                 )
+            if "token_version" not in columns:
+                # SQLite + PostgreSQL: additive column with server default 0 so
+                # existing rows keep sessions until the next security event.
+                connection.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN token_version "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
             # Both supported databases understand lower() expression indexes.
             connection.execute(
                 text(

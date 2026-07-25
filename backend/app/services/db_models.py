@@ -36,6 +36,7 @@ users = Table(
     Column("password_hash", Text, nullable=False),
     Column("role", String(16), nullable=False, server_default=text("'user'")),
     Column("is_active", Integer, nullable=False, server_default=text("1")),
+    Column("token_version", Integer, nullable=False, server_default=text("0")),
     Column("created_at", String(32), nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     Column("updated_at", String(32), nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     Column("last_login_at", String(32)),

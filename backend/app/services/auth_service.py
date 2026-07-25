@@ -32,6 +32,16 @@ class InvalidTokenError(AuthError):
     """JWT is missing, expired, or otherwise invalid."""
 
 
+def _can_claim_legacy_plans(user_count: int, role: str) -> bool:
+    """Only the bootstrap admin may claim pre-auth ``u_current`` plans.
+
+    First registered user who is an admin (via invite) is the sole bootstrap
+    principal trusted to absorb legacy anonymous data. Ordinary users and any
+    later accounts must never claim unowned history.
+    """
+    return int(user_count or 0) == 0 and str(role or "").strip().lower() == "admin"
+
+
 @dataclass(frozen=True)
 class AuthenticatedUser:
     user_id: str
@@ -39,8 +49,10 @@ class AuthenticatedUser:
     email: str | None
     role: str
     is_active: bool = True
+    token_version: int = 0
 
     def as_dict(self) -> dict[str, str | bool | None]:
+        # token_version is intentionally omitted from public API payloads.
         return {
             "user_id": self.user_id,
             "username": self.username,
@@ -59,6 +71,7 @@ def _row_to_user(row: Mapping[str, Any] | None) -> AuthenticatedUser | None:
         email=str(row["email"]) if row.get("email") else None,
         role=str(row["role"]),
         is_active=bool(row["is_active"]),
+        token_version=int(row["token_version"] if row.get("token_version") is not None else 0),
     )
 
 
@@ -165,7 +178,7 @@ def register_user(
 
             # Upgrade path for installations that previously stored personal
             # plans under the legacy u_current identity.
-            if user_count == 0:
+            if _can_claim_legacy_plans(user_count, normalized_role):
                 legacy_count = connection.execute(
                     text(
                         "SELECT COUNT(*) FROM travel_plans "
@@ -202,6 +215,7 @@ def register_user(
         username=normalized_username,
         email=normalized_email,
         role=normalized_role,
+        token_version=0,
     )
 
 
@@ -211,7 +225,8 @@ def authenticate_user(username: str, password: str) -> AuthenticatedUser:
     with get_db_connection() as connection:
         row = connection.execute(
             text(
-                """SELECT user_id, username, email, password_hash, role, is_active
+                """SELECT user_id, username, email, password_hash, role, is_active,
+                          token_version
                    FROM users
                    WHERE lower(username) = lower(:identifier)
                       OR lower(email) = lower(:identifier)"""
@@ -219,6 +234,7 @@ def authenticate_user(username: str, password: str) -> AuthenticatedUser:
             {"identifier": identifier},
         ).mappings().first()
         if not row or not bool(row["is_active"]):
+            # Uniform message: do not enumerate username/email existence.
             raise AuthError("用户名或密码不正确")
 
         try:
@@ -241,7 +257,7 @@ def authenticate_user(username: str, password: str) -> AuthenticatedUser:
 def get_user_by_id(user_id: str) -> AuthenticatedUser | None:
     init_db()
     row = fetch_one(
-        """SELECT user_id, username, email, role, is_active
+        """SELECT user_id, username, email, role, is_active, token_version
            FROM users WHERE user_id = :user_id""",
         {"user_id": user_id},
     )
@@ -295,6 +311,7 @@ def create_access_token(user: AuthenticatedUser) -> str:
         "iat": now,
         "exp": expires_at,
         "jti": uuid.uuid4().hex,
+        "ver": int(user.token_version),
     }
     return jwt.encode(payload, settings.auth_secret_key, algorithm="HS256")
 
@@ -309,7 +326,7 @@ def user_from_access_token(token: str) -> AuthenticatedUser:
             token,
             settings.auth_secret_key,
             algorithms=["HS256"],
-            options={"require": ["sub", "type", "iat", "exp", "jti"]},
+            options={"require": ["sub", "type", "iat", "exp", "jti", "ver"]},
         )
     except jwt.ExpiredSignatureError as exc:
         raise InvalidTokenError("登录状态已过期，请重新登录") from exc
@@ -317,9 +334,35 @@ def user_from_access_token(token: str) -> AuthenticatedUser:
         raise InvalidTokenError("登录状态无效，请重新登录") from exc
 
     if payload.get("type") != "access":
-        raise InvalidTokenError("令牌类型无效")
+        raise InvalidTokenError("登录状态无效，请重新登录")
     user_id = str(payload.get("sub") or "")
     user = get_user_by_id(user_id)
     if not user:
-        raise InvalidTokenError("用户不存在或已停用")
+        raise InvalidTokenError("登录状态无效，请重新登录")
+    try:
+        token_version = int(payload.get("ver"))
+    except (TypeError, ValueError) as exc:
+        raise InvalidTokenError("登录状态无效，请重新登录") from exc
+    if token_version != user.token_version:
+        # Revoked or superseded session (logout / password change / etc.).
+        raise InvalidTokenError("登录状态无效，请重新登录")
     return user
+
+
+def revoke_user_tokens(user_id: str) -> None:
+    """Invalidate every access token issued with the current token version.
+
+    This is a user-level revocation: all devices sharing the same account
+    must re-authenticate after logout or other security events.
+    """
+    init_db()
+    with get_db_connection() as connection:
+        result = connection.execute(
+            text(
+                "UPDATE users SET token_version = token_version + 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE user_id = :user_id"
+            ),
+            {"user_id": user_id},
+        )
+        if result.rowcount != 1:
+            raise AuthError("用户不存在或已停用")
