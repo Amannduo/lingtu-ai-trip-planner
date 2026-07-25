@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +12,9 @@ from typing import Any
 from ..models.schemas import TripPlan, TripRequest
 from .database_service import execute, fetch_all, fetch_one
 from .schema import init_db
+
+
+logger = logging.getLogger(__name__)
 
 
 class TravelPlanDataService:
@@ -59,41 +64,94 @@ class TravelPlanDataService:
                 "preferences": json.dumps(request.preferences, ensure_ascii=False),
                 "free_text": request.free_text_input or "",
                 "summary": summary,
-                "plan_json": json.dumps(trip_plan.model_dump(mode="json"), ensure_ascii=False),
+                "plan_json": _serialize_plan(trip_plan),
                 "status": "completed",
                 "source": source,
             },
         )
-        self._refresh_profile(user_id)
+        self._refresh_profile_safely(user_id)
         return plan_no
 
-    def get_trip_plan(self, plan_no: str, user_id: str) -> TripPlan | None:
+    def get_trip_plan_snapshot(
+        self,
+        plan_no: str,
+        user_id: str,
+    ) -> tuple[TripPlan, str, str] | None:
+        """Return a validated plan plus the exact stored JSON and stable revision."""
         init_db()
         row = fetch_one(
             "SELECT plan_json FROM travel_plans WHERE plan_no = :plan_no AND user_id = :user_id",
             {"plan_no": plan_no, "user_id": user_id},
         )
-        if not row or not row.get("plan_json"):
+        raw_plan_json = row.get("plan_json") if row else None
+        if not isinstance(raw_plan_json, str) or not raw_plan_json:
             return None
         try:
-            return TripPlan.model_validate(json.loads(row["plan_json"]))
+            plan = TripPlan.model_validate(json.loads(raw_plan_json))
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
+        return plan, raw_plan_json, _plan_revision(raw_plan_json)
 
-    def update_trip_plan(self, plan_no: str, user_id: str, trip_plan: TripPlan) -> bool:
+    def get_trip_plan(self, plan_no: str, user_id: str) -> TripPlan | None:
+        snapshot = self.get_trip_plan_snapshot(plan_no, user_id)
+        return snapshot[0] if snapshot is not None else None
+
+    @staticmethod
+    def revision_for_plan(trip_plan: TripPlan) -> str:
+        return _plan_revision(_serialize_plan(trip_plan))
+
+    def get_trip_request(self, plan_no: str, user_id: str) -> TripRequest | None:
+        """Rebuild the non-sensitive request context used by the quality gate."""
         init_db()
-        existing = fetch_one(
-            "SELECT plan_no FROM travel_plans WHERE plan_no = :plan_no AND user_id = :user_id",
+        row = fetch_one(
+            """SELECT origin_city, destination, start_date, end_date, travel_days,
+                      travelers, transportation, accommodation, preferences, free_text
+               FROM travel_plans
+               WHERE plan_no = :plan_no AND user_id = :user_id""",
             {"plan_no": plan_no, "user_id": user_id},
         )
-        if not existing:
-            return False
-        execute(
+        if not row:
+            return None
+        try:
+            preferences = json.loads(row.get("preferences") or "[]")
+            if not isinstance(preferences, list):
+                preferences = []
+        except (json.JSONDecodeError, TypeError):
+            preferences = []
+        try:
+            return TripRequest(
+                origin_city=row.get("origin_city") or None,
+                city=row["destination"],
+                start_date=row["start_date"],
+                end_date=row["end_date"],
+                travel_days=int(row.get("travel_days") or 1),
+                travelers=int(row.get("travelers") or 1),
+                budget=None,
+                transportation=row.get("transportation") or "公共交通",
+                accommodation=row.get("accommodation") or "舒适型酒店",
+                preferences=[str(value) for value in preferences],
+                free_text_input=row.get("free_text") or "",
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def update_trip_plan(
+        self,
+        plan_no: str,
+        user_id: str,
+        trip_plan: TripPlan,
+        *,
+        expected_plan_json: str | None = None,
+    ) -> bool:
+        """Atomically update a plan, rejecting a stale concurrent snapshot."""
+        init_db()
+        updated_rows = execute(
             """UPDATE travel_plans
                SET destination = :destination, start_date = :start_date, end_date = :end_date,
                    travel_days = :travel_days, budget = :budget, summary = :summary,
                    plan_json = :plan_json
-               WHERE plan_no = :plan_no AND user_id = :user_id""",
+               WHERE plan_no = :plan_no AND user_id = :user_id
+                 AND (:expected_plan_json IS NULL OR plan_json = :expected_plan_json)""",
             {
                 "destination": trip_plan.city,
                 "start_date": trip_plan.start_date,
@@ -101,13 +159,26 @@ class TravelPlanDataService:
                 "travel_days": len(trip_plan.days),
                 "budget": trip_plan.budget.total if trip_plan.budget else None,
                 "summary": _summary_from_plan(trip_plan),
-                "plan_json": json.dumps(trip_plan.model_dump(mode="json"), ensure_ascii=False),
+                "plan_json": _serialize_plan(trip_plan),
                 "plan_no": plan_no,
                 "user_id": user_id,
+                "expected_plan_json": expected_plan_json,
             },
         )
-        self._refresh_profile(user_id)
+        if updated_rows <= 0:
+            return False
+        self._refresh_profile_safely(user_id)
         return True
+
+    def _refresh_profile_safely(self, user_id: str) -> None:
+        """Keep derived-profile failures from changing the committed plan result."""
+        try:
+            self._refresh_profile(user_id)
+        except Exception as exc:
+            logger.warning(
+                "user profile refresh skipped after plan write: %s",
+                type(exc).__name__,
+            )
 
     def _refresh_profile(self, user_id: str) -> None:
         rows = fetch_all(
@@ -187,6 +258,18 @@ class TravelPlanDataService:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+def _serialize_plan(plan: TripPlan) -> str:
+    return json.dumps(
+        plan.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _plan_revision(raw_plan_json: str) -> str:
+    return hashlib.sha256(raw_plan_json.encode("utf-8")).hexdigest()
+
 
 def _summary_from_plan(plan: TripPlan) -> str:
     names: list[str] = []

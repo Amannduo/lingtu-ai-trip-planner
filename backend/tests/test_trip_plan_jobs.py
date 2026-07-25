@@ -48,7 +48,10 @@ def _ok_plan() -> TripPlan:
             )
         ],
         quality=TripPlanQualityResult(
-            status="passed", score=90, publishable=True
+            status="passed",
+            score=90,
+            publishable=True,
+            review_required=False,
         ),
     )
 
@@ -131,6 +134,41 @@ def test_create_job_streams_progress_and_result(job_client, monkeypatch) -> None
     assert "event: stage" in streamed.text
     assert "event: result" in streamed.text
     assert "正在核验景点信息" in streamed.text
+    save.assert_called_once()
+    email.assert_not_called()
+    notify.assert_not_called()
+
+
+def test_reviewable_warning_plan_streams_result_and_saves(
+    job_client, monkeypatch
+) -> None:
+    """Reviewable warnings remain deliverable and may persist for logged-in users."""
+    client, _service, save, email, notify = job_client
+    plan = _ok_plan()
+    plan.quality = TripPlanQualityResult(
+        status="warning",
+        score=88,
+        publishable=True,
+        review_required=True,
+    )
+
+    class FakePlanner:
+        @staticmethod
+        def plan_trip(_request, progress_callback=None, **_kwargs):
+            if progress_callback:
+                progress_callback(stage="ground", progress=50, message="ground")
+            return plan
+
+    monkeypatch.setattr(
+        "app.api.routes.trip.get_trip_planner_agent",
+        lambda: FakePlanner(),
+    )
+    created = client.post("/api/trip/plan-jobs", json=_payload())
+    assert created.status_code == 200
+    streamed = client.get(created.json()["stream_url"])
+    assert "event: result" in streamed.text
+    assert "event: error" not in streamed.text
+    assert "需要你确认" in streamed.text or "保存行程" in streamed.text
     save.assert_called_once()
     email.assert_not_called()
     notify.assert_not_called()

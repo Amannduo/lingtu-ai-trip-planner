@@ -16,6 +16,10 @@ from ..models.schemas import (
 from .destination_feasibility_service import get_destination_feasibility_service
 
 
+# Structural hard blockers (shared with PR trust-hardening intent).
+# Budget/hotel/transport gaps remain severity-driven: advisory when warning,
+# blocking when severity=error (see issue_disposition). That preserves
+# reviewable delivery for soft budget issues while keeping real errors hard.
 BLOCKING_ISSUE_CODES = frozenset({
     "CITY_MISMATCH",
     "SHORT_TRIP_DESTINATION_UNREACHABLE",
@@ -1298,11 +1302,19 @@ class TripPlanQualityService:
             len(plan.days) == 0
             or any(issue_disposition(issue) == "blocking" for issue in issues)
         )
+        has_advisory = any(
+            issue_disposition(issue) == "advisory" for issue in issues
+        )
         if has_blocking:
             publishable = False
             review_required = True
             status = "failed"
-        elif issues or score < 100 or plan.generation_mode in {"repaired", "map_fallback"}:
+        elif (
+            has_advisory
+            or score < 100
+            or plan.generation_mode in {"repaired", "map_fallback"}
+        ):
+            # Info-only issues (e.g. SEMANTIC_PENDING_FIELDS) do not force review.
             publishable = True
             review_required = True
             status = "warning"

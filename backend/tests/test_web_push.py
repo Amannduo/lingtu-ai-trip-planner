@@ -57,7 +57,12 @@ def _configure_vapid(monkeypatch) -> None:
     monkeypatch.setattr(settings, "web_push_dns_timeout_seconds", 3.0)
     monkeypatch.setattr(settings, "web_push_max_subscriptions_per_user", 20)
     monkeypatch.setattr(settings, "web_push_delivery_budget_seconds", 30.0)
-    monkeypatch.setattr(settings, "web_push_allowed_host_suffixes", "")
+    monkeypatch.setattr(
+        settings,
+        "web_push_allowed_host_suffixes",
+        "fcm.googleapis.com,push.services.mozilla.com,"
+        "updates.push.services.mozilla.com,notify.windows.com,web.push.apple.com",
+    )
     monkeypatch.setattr(
         "app.services.web_push_service._resolve_global_addresses",
         lambda _hostname, _port, _timeout=None: {"8.8.8.8"},
@@ -85,7 +90,7 @@ def test_push_subscription_routes_are_authenticated_and_idempotent(
 ) -> None:
     _configure_vapid(monkeypatch)
     suffix = uuid.uuid4().hex[:10]
-    endpoint = f"https://push.example.test/subscriptions/{suffix}"
+    endpoint = f"https://fcm.googleapis.com/fcm/send/{suffix}"
     user_id = ""
 
     try:
@@ -172,9 +177,9 @@ def test_delivery_retries_and_removes_invalid_subscriptions(monkeypatch) -> None
     _configure_vapid(monkeypatch)
     suffix = uuid.uuid4().hex[:10]
     user_id = ""
-    gone_endpoint = f"https://push.example.test/gone/{suffix}"
-    retry_endpoint = f"https://push.example.test/retry/{suffix}"
-    fail_endpoint = f"https://push.example.test/fail/{suffix}"
+    gone_endpoint = f"https://fcm.googleapis.com/gone/{suffix}"
+    retry_endpoint = f"https://fcm.googleapis.com/retry/{suffix}"
+    fail_endpoint = f"https://fcm.googleapis.com/fail/{suffix}"
 
     class FakePushError(RuntimeError):
         def __init__(self, status_code: int):
@@ -335,11 +340,11 @@ def test_delivery_attempts_and_backoff_stay_within_budget(monkeypatch) -> None:
 
         save_push_subscription(
             user_id,
-            _subscription(f"https://push.example.test/first/{suffix}"),
+            _subscription(f"https://fcm.googleapis.com/first/{suffix}"),
         )
         save_push_subscription(
             user_id,
-            _subscription(f"https://push.example.test/second/{suffix}"),
+            _subscription(f"https://fcm.googleapis.com/second/{suffix}"),
         )
 
         dns_tracking["enabled"] = True

@@ -3,7 +3,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, List, Optional
+
+# Province-level names that may prefix a city name in user input or FlyAI
+# responses.  Direct-administered municipalities (北京/天津/上海/重庆) are
+# NOT included — they ARE the core city name, not a prefix.
+_PROVINCE_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("黑龙江省", "黑龙江"), ("内蒙古自治区", "内蒙古"),
+    ("广西壮族自治区", "广西"), ("西藏自治区", "西藏"),
+    ("宁夏回族自治区", "宁夏"), ("新疆维吾尔自治区", "新疆"),
+    ("香港特别行政区", "香港"), ("澳门特别行政区", "澳门"),
+    ("河北省", "河北"), ("山西省", "山西"), ("辽宁省", "辽宁"),
+    ("吉林省", "吉林"), ("江苏省", "江苏"), ("浙江省", "浙江"),
+    ("安徽省", "安徽"), ("福建省", "福建"), ("江西省", "江西"),
+    ("山东省", "山东"), ("河南省", "河南"), ("湖北省", "湖北"),
+    ("湖南省", "湖南"), ("广东省", "广东"), ("海南省", "海南"),
+    ("四川省", "四川"), ("贵州省", "贵州"), ("云南省", "云南"),
+    ("陕西省", "陕西"), ("甘肃省", "甘肃"), ("青海省", "青海"),
+    ("台湾省", "台湾"),
+)
+_CITY_SUFFIXES: tuple[str, ...] = (
+    "特别行政区", "自治区", "自治州", "地区", "市", "县", "区",
+)
+# Order matters: directional compounds first so "南站" is stripped before
+# a bare "站" suffix.
+_STATION_SUFFIXES: tuple[str, ...] = (
+    "南站", "北站", "东站", "西站", "站",
+)
 
 
 # This graph is deliberately conservative: for a one- or two-day trip we only
@@ -70,6 +97,8 @@ class DestinationFeasibility:
 class DestinationFeasibilityService:
     """Assess whether a destination is suitable for the available trip window."""
 
+    _NORM_CACHE: dict[str, str] = {}
+
     def normalize_city(self, city: Optional[str]) -> str:
         value = " ".join(str(city or "").split())
         compact = value.replace(" ", "")
@@ -80,6 +109,72 @@ class DestinationFeasibilityService:
                 value = value[: -len(suffix)]
                 break
         return ORIGIN_CITY_ALIASES.get(value, value)
+
+    def normalize_location_for_matching(self, raw: Optional[str]) -> str:
+        """Return a stripped-down core name for matching city ↔ station.
+
+        Examples
+        --------
+        * ``山西太原``     → ``太原``
+        * ``山西省太原市`` → ``太原``
+        * ``太原站``       → ``太原``
+        * ``太原南站``     → ``太原``
+        * ``北京西站``     → ``北京``  (直辖市 not stripped)
+        * ``吉林站``       → ``吉林``  (同名省市 not stripped)
+        """
+        value = " ".join(str(raw or "").split())
+        if not value:
+            return ""
+
+        cache_key = value.casefold()
+        cached = self._NORM_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        original = value
+
+        # 1. Strip province prefix.
+        province_stripped = False
+        for long_form, short_form in _PROVINCE_PREFIXES:
+            if value.startswith(long_form):
+                value = value[len(long_form):]
+                province_stripped = True
+                break
+            if value.startswith(short_form):
+                value = value[len(short_form):]
+                province_stripped = True
+                break
+
+        if province_stripped and self._is_station_only(value):
+            value = original  # province name WAS the city name
+
+        # 2. Strip city suffix from the end.
+        for suffix in _CITY_SUFFIXES:
+            if value.endswith(suffix) and len(value) > len(suffix):
+                value = value[: -len(suffix)]
+                break
+
+        # 3. Strip station suffix (directional compounds first).
+        for suffix in _STATION_SUFFIXES:
+            if value.endswith(suffix) and len(value) > len(suffix):
+                value = value[: -len(suffix)]
+                break
+
+        # 4. Fall through to existing city normalization for alias support.
+        canonical = self.normalize_city(value)
+
+        normalized = canonical.strip()
+        self._NORM_CACHE[cache_key] = normalized
+        return normalized
+
+    def _is_station_only(self, value: str) -> bool:
+        """Return True when *value* is empty or only a station suffix."""
+        if not value:
+            return True
+        for suffix in _STATION_SUFFIXES:
+            if value == suffix:
+                return True
+        return False
 
     def nearby_destinations(self, origin_city: Optional[str]) -> List[str]:
         precise = self._precise_origin_key(origin_city)
@@ -99,8 +194,16 @@ class DestinationFeasibilityService:
         precise = self._precise_origin_key(origin_city)
         if not precise:
             return False
-        destination = self.normalize_city(destination_city)
-        return destination in PRECISE_SHORT_TRIP_CITY_GRAPH[precise]
+        destination = self.normalize_location_for_matching(destination_city)
+        nearby = PRECISE_SHORT_TRIP_CITY_GRAPH[precise]
+        nearby_normalized = {
+            self.normalize_location_for_matching(item) for item in nearby
+        }
+        return (
+            destination in nearby
+            or destination in nearby_normalized
+            or self.normalize_city(destination_city) in nearby
+        )
 
     def assess(
         self,
@@ -110,9 +213,9 @@ class DestinationFeasibilityService:
         *,
         explicit_destination: bool = False,
     ) -> DestinationFeasibility:
-        origin = self.normalize_city(origin_city)
+        origin = self.normalize_location_for_matching(origin_city)
         origin_label = "".join(str(origin_city or "").split()) or origin
-        destination = self.normalize_city(destination_city)
+        destination = self.normalize_location_for_matching(destination_city)
         days = max(1, int(travel_days)) if travel_days is not None else None
 
         if not origin or not destination:
@@ -140,7 +243,20 @@ class DestinationFeasibilityService:
             if precise_origin
             else SHORT_TRIP_CITY_GRAPH.get(origin)
         )
-        if nearby and destination in nearby:
+        # Graph entries may keep admin suffixes (e.g. 麟游县) while the assess
+        # path normalizes destinations (麟游). Match on both raw and normalized
+        # forms so county-level short-trip circles remain usable.
+        nearby_match = False
+        if nearby:
+            nearby_normalized = {
+                self.normalize_location_for_matching(item) for item in nearby
+            }
+            nearby_match = (
+                destination in nearby
+                or destination in nearby_normalized
+                or self.normalize_location_for_matching(destination) in nearby_normalized
+            )
+        if nearby and nearby_match:
             return DestinationFeasibility(
                 allowed=True,
                 severity="info",

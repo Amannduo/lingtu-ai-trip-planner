@@ -1650,7 +1650,10 @@ class MultiAgentTripPlanner:
                 f"transport={budget.total_transportation}"
             )
         except Exception as exc:
-            logger.info(f"[planner] budget estimate failed: {type(exc).__name__}")
+            logger.info(
+                "[planner] budget estimate failed: %s: %s",
+                type(exc).__name__, exc,
+            )
             # Let the graph record a partial-enrichment quality warning while
             # preserving the plan with budget=None.
             raise

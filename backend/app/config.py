@@ -3,7 +3,8 @@
 import os
 from pathlib import Path
 from typing import List
-from pydantic_settings import BaseSettings
+from urllib.parse import urlsplit
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -57,21 +58,32 @@ class Settings(BaseSettings):
     web_push_dns_timeout_seconds: float = 3.0
     web_push_max_subscriptions_per_user: int = 20
     web_push_delivery_budget_seconds: float = 30.0
-    web_push_allowed_host_suffixes: str = ""
+    web_push_allowed_host_suffixes: str = (
+        "fcm.googleapis.com,push.services.mozilla.com,"
+        "updates.push.services.mozilla.com,notify.windows.com,web.push.apple.com"
+    )
 
-    # Civil-date timezone for weekend / relative-date semantics.
+    # Shared total wall-clock budget for synchronous and progressive planning.
+    trip_generation_max_runtime_seconds: float = 600.0
+
+    # Process-local create rate for POST /api/trip/plan and /api/trip/plan-jobs.
+    # Not a cluster-wide quota; each worker process counts independently.
+    trip_generation_rate_limit: int = 10
+    trip_generation_rate_window_seconds: int = 60
+
+    # Semantic contract gate: block generation when free-text still has unresolved
+    # critical pending/conflict items and the client did not acknowledge them.
+    # Frontend stamps free_text with [用户已确认待核对约束] after secondary confirm.
+    semantic_contract_hard_block_enabled: bool = True
+
+    # Civil-date timezone for weekend / relative-date semantics (not server UTC).
+    # Request-level user timezone can still override when callers pass it in.
     business_timezone: str = "Asia/Shanghai"
 
     # Real SMTP attempts are limited per authenticated user and peer IP.
     email_quota_enabled: bool = True
     email_user_daily_limit: int = 10
     email_ip_hourly_limit: int = 30
-
-
-    # Process-local create rate for POST /api/trip/plan and /plan-jobs.
-    # Not cluster-wide; each worker process counts independently.
-    trip_generation_rate_limit: int = 10
-    trip_generation_rate_window_seconds: int = 60
 
     # 高德地图API配置
     amap_api_key: str = ""
@@ -85,7 +97,7 @@ class Settings(BaseSettings):
     # FlyAI/Fliggy CLI budget data source.
     flyai_enabled: bool = True
     flyai_api_key: str = ""
-    flyai_cli_command: str = "npx --yes @fly-ai/flyai-cli"
+    flyai_cli_command: str = "npx --yes @fly-ai/flyai-cli@1.0.16"
     flyai_timeout: int = 25
 
     # Volcengine Web QA Agent configuration.
@@ -97,6 +109,18 @@ class Settings(BaseSettings):
     volcengine_agent_force_web: bool = True
     volcengine_agent_model: str = ""
 
+    # Web search provider. Zhipu search_pro supplies grounded public sources;
+    # the existing LLM turns those sources into the final travel guide.
+    web_search_provider: str = "zhipu"
+    zhipu_search_enabled: bool = False
+    zhipu_search_api_key: str = ""
+    zhipu_search_api_url: str = "https://open.bigmodel.cn/api/paas/v4/web_search"
+    zhipu_search_engine: str = "search_pro"
+    zhipu_search_timeout: float = 15.0
+    zhipu_search_max_results: int = 8
+    zhipu_search_max_retries: int = 1
+    zhipu_search_max_response_bytes: int = 2_000_000
+
     # LLM配置 (从环境变量读取,由HelloAgents管理)
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
@@ -105,10 +129,11 @@ class Settings(BaseSettings):
     # 日志配置
     log_level: str = "INFO"
 
-    class Config:
-        env_file = str(BACKEND_ENV)
-        case_sensitive = False
-        extra = "ignore"  # 忽略额外的环境变量
+    model_config = SettingsConfigDict(
+        env_file=str(BACKEND_ENV),
+        case_sensitive=False,
+        extra="ignore",
+    )
 
     def get_cors_origins_list(self) -> List[str]:
         """获取CORS origins列表"""
@@ -141,10 +166,18 @@ def validate_config():
     if not llm_api_key:
         warnings.append("LLM_API_KEY或OPENAI_API_KEY未配置,LLM功能可能无法使用")
 
-    if settings.volcengine_agent_enabled and (
-        not settings.volcengine_agent_api_key or not settings.volcengine_agent_bot_id
-    ):
-        warnings.append("VOLCENGINE_AGENT_API_KEY或VOLCENGINE_AGENT_BOT_ID未配置,联网攻略Agent将使用本地降级生成")
+    if settings.web_search_provider.strip().lower() != "zhipu":
+        warnings.append("WEB_SEARCH_PROVIDER不是zhipu,联网攻略将使用本地降级生成")
+    elif settings.zhipu_search_enabled and not settings.zhipu_search_api_key:
+        warnings.append("ZHIPU_SEARCH_API_KEY未配置,联网攻略Agent将使用本地降级生成")
+
+    vapid_configured = any((
+        settings.web_push_vapid_public_key.strip(),
+        settings.web_push_vapid_private_key.strip(),
+        settings.web_push_vapid_subject.strip(),
+    ))
+    if vapid_configured and not settings.web_push_allowed_host_suffixes.strip():
+        errors.append("Web Push requires WEB_PUSH_ALLOWED_HOST_SUFFIXES")
 
     if errors:
         error_msg = "配置错误:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -156,6 +189,18 @@ def validate_config():
             print(f"  - {w}")
 
     return True
+
+
+def _safe_base_url_label(raw_url: str) -> str:
+    # Log only the origin; userinfo, path, query and fragment may contain secrets.
+    try:
+        parsed = urlsplit(raw_url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "custom endpoint configured" if raw_url.strip() else "not configured"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{parsed.hostname}{port}"
+    except (TypeError, ValueError):
+        return "custom endpoint configured" if str(raw_url or "").strip() else "not configured"
 
 
 # 打印配置信息(用于调试)
@@ -173,10 +218,12 @@ def print_config():
     llm_model = os.getenv("LLM_MODEL_ID") or settings.openai_model
 
     print(f"LLM API Key: {'已配置' if llm_api_key else '未配置'}")
-    print(f"LLM Base URL: {llm_base_url}")
+    print(f"LLM Base URL: {_safe_base_url_label(llm_base_url)}")
     print(f"LLM Model: {llm_model}")
     print(
         "联网攻略Agent: "
-        f"{'已配置' if settings.volcengine_agent_api_key and settings.volcengine_agent_bot_id else '未配置'}"
+        f"{'已配置' if settings.web_search_provider.strip().lower() == 'zhipu' and settings.zhipu_search_enabled and settings.zhipu_search_api_key else '未配置'}"
     )
+    print(f"联网搜索供应商: {settings.web_search_provider.strip().lower() or '未设置'}")
+    print(f"智谱搜索引擎: {settings.zhipu_search_engine}")
     print(f"日志级别: {settings.log_level}")
