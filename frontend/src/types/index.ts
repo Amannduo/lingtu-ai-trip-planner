@@ -200,6 +200,10 @@ export interface TripPlanResponse {
   data?: TripPlan
   plan_no?: string | null
   email_delivery?: EmailDeliveryResult | null
+  /** Unified gate decision — authoritative over inferring from quality */
+  quality_status?: 'blocked' | 'needs_review' | 'publishable' | ''
+  /** No blocking issues but score below threshold; not auto-persisted */
+  needs_review?: boolean
 }
 
 export interface ChatMessage {

@@ -1576,16 +1576,11 @@ const handleSubmit = async () => {
   loadingEvents.value = []
 
   try {
-    // Stamp acknowledgment into free_text for server-side audit trail.
-    let freeText = formData.free_text_input.trim()
-    if (
-      contractRiskAcknowledged.value
-      && !freeText.includes('[用户已确认待核对约束]')
-    ) {
-      freeText = freeText
-        ? `${freeText} [用户已确认待核对约束]`
-        : '[用户已确认待核对约束]'
-    }
+    // Acknowledgment travels only as the structured boolean
+    // (semantic_risks_acknowledged); the legacy free-text marker is no
+    // longer written — the backend keeps read compatibility for old
+    // clients, so nothing breaks during the transition.
+    const freeText = formData.free_text_input.trim()
 
     const requestData: TripFormData = {
       origin_city: formData.origin_city?.trim() || null,
@@ -1653,8 +1648,14 @@ const handleSubmit = async () => {
       saveTripCache(response.data, response.plan_no)
       saveTripSession(response.data)
       refreshHistory()
-      if (response.data.quality?.status === 'failed') {
-        message.warning(response.message || '方案存在关键问题，已阻止自动保存')
+      // The unified gate field is authoritative; the quality.status
+      // inference stays only as a fallback for older responses.
+      if (
+        response.needs_review
+        || response.quality_status === 'needs_review'
+        || response.data.quality?.status === 'failed'
+      ) {
+        message.warning(response.message || '行程已生成，部分事项需要你复核')
       } else {
         message.success(response.message || '旅行计划生成成功')
       }
