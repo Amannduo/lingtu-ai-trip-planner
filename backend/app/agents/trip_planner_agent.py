@@ -159,11 +159,15 @@ class MultiAgentTripPlanner:
         normal success by default.
         """
         try:
-            from ..services.semantic_contract_service import (
-                attach_contract_to_trip_request,
-            )
+            # The HTTP entry already attached the server-built contract;
+            # this fallback covers direct/internal callers only, keeping
+            # the at-most-one-extraction invariant per request.
+            if getattr(request, "semantic_contract", None) is None:
+                from ..services.semantic_contract_service import (
+                    attach_contract_to_trip_request,
+                )
 
-            request = attach_contract_to_trip_request(request)
+                request = attach_contract_to_trip_request(request)
         except Exception:
             # Contract attachment must never block trip generation.
             pass

@@ -34,7 +34,11 @@ from ...services.trip_generation_errors import (
 )
 from ...services.auth_service import AuthenticatedUser
 from ...services.destination_feasibility_service import get_destination_feasibility_service
-from ...services.semantic_contract_service import collect_semantic_hard_block_issues
+from ...services.semantic_contract_service import (
+    build_generation_contract,
+    collect_hard_block_issues_for_contract,
+    user_acknowledged_contract_risks,
+)
 from ...services.trip_email_service import deliver_trip_plan_email
 from ...services.travel_plan_data_service import get_travel_plan_data_service
 from ...services.trip_plan_quality_service import (
@@ -57,11 +61,15 @@ class UntrustedTripEditError(ValueError):
     """Client attempted to forge server-owned plan facts or add unverified POIs."""
 
 
-def _validate_generation_request(request: TripRequest) -> None:
+def _validate_generation_request(request: TripRequest) -> TripRequest:
     """Reject unusable generation inputs before agent work starts.
 
     Covers civil past dates, unresolved semantic hard-blocks, and auto-
     recommended destinations that violate short-trip feasibility.
+
+    Returns the request with the server-built semantic contract attached —
+    the single construction point for the whole request lifecycle; every
+    downstream reader (planner, quality gate) reuses this contract.
     """
     try:
         start = date.fromisoformat(str(request.start_date))
@@ -76,17 +84,22 @@ def _validate_generation_request(request: TripRequest) -> None:
             detail="出行开始日期不能早于今天。",
         )
 
+    request, message_contract = build_generation_contract(request)
+
     settings = get_settings()
     if bool(getattr(settings, "semantic_contract_hard_block_enabled", True)):
-        issues = collect_semantic_hard_block_issues(request)
-        if issues:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "存在未确认的关键约束冲突，请先确认后再生成。",
-                    "issues": issues,
-                },
+        if not user_acknowledged_contract_risks(request):
+            issues = collect_hard_block_issues_for_contract(
+                request, message_contract
             )
+            if issues:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "存在未确认的关键约束冲突，请先确认后再生成。",
+                        "issues": issues,
+                    },
+                )
 
     if str(getattr(request, "destination_source", "") or "") == "recommendation":
         assessment = get_destination_feasibility_service().assess(
@@ -100,6 +113,7 @@ def _validate_generation_request(request: TripRequest) -> None:
                 status_code=422,
                 detail=assessment.reason or "推荐目的地不在当前天数的可信短途圈内。",
             )
+    return request
 
 
 def _attraction_key(attraction: Attraction) -> str:
@@ -487,8 +501,9 @@ async def plan_trip(
     """
     try:
         # Reject past dates / hard semantic conflicts before rate-limit spend
-        # or expensive agent initialization.
-        _validate_generation_request(request)
+        # or expensive agent initialization; the returned request carries the
+        # server-built semantic contract for all downstream readers.
+        request = _validate_generation_request(request)
         # After auth + TripRequest validation: count only real generation creates.
         _enforce_trip_generation_rate_limit(http_request, current_user)
 
@@ -796,7 +811,7 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
-    _validate_generation_request(request)
+    request = _validate_generation_request(request)
     # After auth + TripRequest validation: shared create quota with /plan.
     _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)

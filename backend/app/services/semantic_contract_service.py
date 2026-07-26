@@ -1509,8 +1509,39 @@ def user_intent_text(text: str | None) -> str:
     return extract_user_utterance(strip_contract_ack_marker(text))
 
 
+def build_generation_contract(
+    request: TripRequest,
+) -> tuple[TripRequest, SemanticTripContract | None]:
+    """Server-entry contract build: at most one NL extraction per request.
+
+    Returns ``(attached_request, message_contract)``.  The attached request
+    carries the merged server-owned contract for every downstream reader;
+    ``message_contract`` is the free-text-only extraction the divergence
+    gate needs, or ``None`` when the request has no user-authored text —
+    in which case zero extractions run and the contract is form-only.
+    """
+    service = get_semantic_contract_service()
+    intent_text = user_intent_text(request.free_text_input)
+    message_contract = (
+        service.extract_from_text(intent_text) if intent_text.strip() else None
+    )
+    return _attach_contract(request, message_contract), message_contract
+
+
 def attach_contract_to_trip_request(request: TripRequest) -> TripRequest:
     """Rebuild a server-owned contract from form fields + free text.
+
+    Compatibility wrapper over :func:`build_generation_contract` for callers
+    that only need the attached request (direct/internal invocations).
+    """
+    return build_generation_contract(request)[0]
+
+
+def _attach_contract(
+    request: TripRequest,
+    message_contract: SemanticTripContract | None,
+) -> TripRequest:
+    """Merge form + pre-extracted free-text contract onto the request.
 
     Client-supplied contracts are ignored for authority: form values become
     form_confirmed, free-text extraction is merged with provenance rules.
@@ -1537,10 +1568,13 @@ def attach_contract_to_trip_request(request: TripRequest) -> TripRequest:
         "high",
         evidence="trip_request.city",
     )
-    message_contract = service.extract_from_text(
-        user_intent_text(request.free_text_input)
-    )
-    merged = service.merge(form_contract, message_contract)
+    if message_contract is not None:
+        merged = service.merge(form_contract, message_contract)
+    else:
+        # Form-only path: re-refresh because destination_city was rebound
+        # after contract_from_form's own refresh (merge would have done it).
+        form_contract.refresh_pending_fields()
+        merged = form_contract
     updates: Dict[str, Any] = {"semantic_contract": merged}
     # Surface weekend semantics onto TripRequest for planner consumption.
     if request.date_pattern is None and merged.date_pattern.is_known():
@@ -1793,23 +1827,36 @@ def collect_semantic_hard_block_issues(
 ) -> list[dict[str, Any]]:
     """Return structured 422 issues for unresolved critical contract risks.
 
-    Empty list means generation may proceed. Acknowledgment (boolean flag or
-    free_text marker) skips the hard block after frontend secondary confirm.
+    Compatibility wrapper: builds the contract once, then delegates to
+    :func:`collect_hard_block_issues_for_contract`.  Callers that already
+    ran :func:`build_generation_contract` should call the core directly.
     """
     if user_acknowledged_contract_risks(request):
         return []
+    attached, message_contract = build_generation_contract(request)
+    return collect_hard_block_issues_for_contract(attached, message_contract)
 
-    service = get_semantic_contract_service()
-    message_contract = service.extract_from_text(
-        user_intent_text(request.free_text_input)
-    )
-    attached = attach_contract_to_trip_request(request)
-    contract = attached.semantic_contract
+
+def collect_hard_block_issues_for_contract(
+    request: TripRequest,
+    message_contract: SemanticTripContract | None,
+) -> list[dict[str, Any]]:
+    """Hard-block gate core: reads the attached contract, never extracts.
+
+    ``request`` must carry the server-built ``semantic_contract``;
+    ``message_contract`` is the free-text-only extraction from
+    :func:`build_generation_contract` (``None`` when there was no
+    user-authored text, which skips the divergence check by construction).
+    """
+    contract = request.semantic_contract
     if contract is None:
         return []
 
     issues: list[dict[str, Any]] = []
-    issues.extend(collect_free_text_form_divergences(request, message_contract))
+    if message_contract is not None:
+        issues.extend(
+            collect_free_text_form_divergences(request, message_contract)
+        )
 
     pending: list[str] = []
     for name in CRITICAL_HARD_BLOCK_FIELDS:
