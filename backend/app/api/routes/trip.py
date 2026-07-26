@@ -27,7 +27,10 @@ from ...models.schemas import (
     TripPlanResponse,
     ErrorResponse
 )
-from ...agents.trip_planner_agent import get_trip_planner_agent
+from ...agents.trip_planner_agent import (
+    get_trip_planner_agent,
+    planner_is_initialized,
+)
 from ...services.trip_generation_errors import (
     TripGenerationCancelledError,
     TripPlanQualityRejectedError,
@@ -1017,21 +1020,39 @@ def cancel_trip_plan_job(
     summary="健康检查",
     description="检查旅行规划服务是否正常"
 )
-async def health_check():
-    """健康检查：报告当前规划管线的真实结构，不触发事件循环内的重初始化。"""
+async def health_check(http_request: HttpRequest):
+    """Liveness only: minimal, cheap, and rate limited.
+
+    The endpoint is public, so it deliberately reveals nothing about the search
+    provider, the pipeline shape or live capacity, and it never constructs the
+    planner — a cold-start flood would otherwise pin every threadpool worker on
+    ``_multi_agent_planner_lock`` and starve real generation requests.
+    Detailed diagnostics belong on an authenticated internal endpoint.
+    """
+    settings = get_settings()
+    retry_after = get_request_rate_limit_service(http_request).check(
+        "service-health",
+        f"ip:{_normalize_client_ip(http_request.client.host if http_request.client else None)}",
+        limit=max(1, int(getattr(settings, "health_rate_limit", 30) or 30)),
+        window_seconds=max(
+            1, int(getattr(settings, "health_rate_window_seconds", 60) or 60)
+        ),
+    )
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后重试。",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     try:
-        agent = await run_in_threadpool(get_trip_planner_agent)
-        graph = getattr(agent, "trip_graph", None)
+        # Read the singleton without building it: this reports readiness, not
+        # the health of a planner we would have to pay to construct.
         return {
             "status": "healthy",
             "service": "trip-planner",
-            "pipeline": {
-                "graph_available": bool(
-                    getattr(graph, "graph_available", False)
-                ),
-                "web_guide": agent.web_guide_agent.status(),
-                "generation_capacity": generation_capacity_snapshot(),
-            },
+            "version": str(getattr(settings, "app_version", "") or ""),
+            "planner_initialized": planner_is_initialized(),
         }
     except Exception as e:
         # Never leak provider/internal details through a public endpoint.

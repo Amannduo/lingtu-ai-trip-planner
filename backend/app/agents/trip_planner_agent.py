@@ -2000,6 +2000,14 @@ def get_trip_planner_agent() -> MultiAgentTripPlanner:
     return _multi_agent_planner
 
 
+def planner_is_initialized() -> bool:
+    """Whether the planner singleton already exists, without constructing it.
+
+    Lets a public readiness probe report state without paying — or triggering —
+    the expensive first-call initialisation.
+    """
+    return _multi_agent_planner is not None
+
 
 def shutdown_trip_planner_agent() -> None:
     """Drop service references that are closed during application shutdown."""

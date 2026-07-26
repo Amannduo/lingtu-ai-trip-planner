@@ -19,6 +19,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.main import app
+from app.config import get_settings
+from app.services.request_rate_limit_service import (
+    reset_request_rate_limit_service_for_tests,
+)
 from app.models.schemas import (
     DayPlan,
     FieldBinding,
@@ -33,53 +37,74 @@ from app.services.semantic_contract_service import (
 from app.services.trip_plan_quality_service import TripPlanQualityService
 
 
-def _planner_stub() -> SimpleNamespace:
-    """Faithful attribute surface of the real MultiAgentTripPlanner."""
-    return SimpleNamespace(
-        trip_graph=SimpleNamespace(graph_available=True),
-        web_guide_agent=SimpleNamespace(
-            status=lambda: {"provider": "zhipu", "llm_ready": True}
-        ),
-    )
-
-
-def test_trip_health_reports_pipeline_with_current_agent_surface(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "app.api.routes.trip.get_trip_planner_agent",
-        lambda: _planner_stub(),
-    )
+def test_trip_health_returns_a_minimal_liveness_body() -> None:
+    """Public health is liveness only — no provider, no live capacity."""
+    reset_request_rate_limit_service_for_tests()
     with TestClient(app) as client:
         response = client.get("/api/trip/health")
 
     assert response.status_code == 200
     body = response.json()
+    assert set(body) == {"status", "service", "version", "planner_initialized"}
     assert body["status"] == "healthy"
     assert body["service"] == "trip-planner"
-    assert body["pipeline"]["graph_available"] is True
-    assert body["pipeline"]["web_guide"]["provider"] == "zhipu"
-    capacity = body["pipeline"]["generation_capacity"]
-    assert set(capacity) == {"initial", "held", "available"}
+    assert isinstance(body["planner_initialized"], bool)
+    reset_request_rate_limit_service_for_tests()
 
 
-def test_trip_health_failure_returns_503_without_internal_detail(
-    monkeypatch,
-) -> None:
-    def broken_agent():
-        raise RuntimeError("secret provider path C:/keys/llm.txt")
+def test_trip_health_discloses_no_internal_detail() -> None:
+    reset_request_rate_limit_service_for_tests()
+    with TestClient(app) as client:
+        serialized = client.get("/api/trip/health").text
+
+    # Search provider, pipeline shape and live slot counts must stay private.
+    for secret in (
+        "zhipu",
+        "provider",
+        "graph_available",
+        "web_guide",
+        "generation_capacity",
+        "available",
+        "held",
+    ):
+        assert secret not in serialized, f"health body leaked {secret!r}"
+    reset_request_rate_limit_service_for_tests()
+
+
+def test_trip_health_never_constructs_the_planner(monkeypatch) -> None:
+    """A public probe must not trigger the expensive first-call init."""
+    calls: list[str] = []
+
+    def exploding_agent():
+        calls.append("constructed")
+        raise AssertionError("health must not construct the planner")
 
     monkeypatch.setattr(
-        "app.api.routes.trip.get_trip_planner_agent",
-        broken_agent,
+        "app.api.routes.trip.get_trip_planner_agent", exploding_agent
     )
+    reset_request_rate_limit_service_for_tests()
     with TestClient(app) as client:
         response = client.get("/api/trip/health")
 
-    assert response.status_code == 503
-    detail = response.json()["detail"]
-    assert detail == "服务不可用"
-    assert "secret" not in detail
+    assert response.status_code == 200
+    assert calls == []
+    reset_request_rate_limit_service_for_tests()
+
+
+def test_trip_health_is_rate_limited() -> None:
+    """Anonymous floods get 429 + Retry-After instead of unbounded work."""
+    reset_request_rate_limit_service_for_tests()
+    limit = max(1, int(getattr(get_settings(), "health_rate_limit", 30) or 30))
+    with TestClient(app) as client:
+        codes = [
+            client.get("/api/trip/health").status_code for _ in range(limit)
+        ]
+        throttled = client.get("/api/trip/health")
+
+    assert codes == [200] * limit
+    assert throttled.status_code == 429
+    assert int(throttled.headers["Retry-After"]) >= 1
+    reset_request_rate_limit_service_for_tests()
 
 
 def _request_with_pending_origin(**overrides) -> TripRequest:
