@@ -14,6 +14,7 @@ from ..models.schemas import (
     TripRequest,
 )
 from .destination_feasibility_service import get_destination_feasibility_service
+from .trip_pacing_contract import prefers_gentle_pacing
 
 
 # Structural hard blockers (shared with PR trust-hardening intent).
@@ -107,6 +108,7 @@ class TripPlanQualityService:
         "SEMANTIC_TRAVELERS_MISMATCH": 12,
         "SEMANTIC_BUDGET_MISMATCH": 10,
         "SEMANTIC_PACE_MISMATCH": 10,
+        "RELAXED_PACE_OVERLOAD": 10,
         "SEMANTIC_PARTY_UNCONFIRMED": 4,
         "SEMANTIC_CONTRACT_CONFLICT": 6,
         "SEMANTIC_PENDING_FIELDS": 4,
@@ -315,6 +317,19 @@ class TripPlanQualityService:
                     f"days[{day_index}].attractions",
                     f"第{day_index + 1}天没有可执行景点。",
                     "至少安排一个经过地图校验的景点。",
+                )
+            elif relaxed_pace and len(attractions) > 2:
+                # Explicit gentle/family/elder request: density breach is advisory
+                # only — never force every trip to ≤2 attractions as blocking.
+                add(
+                    "RELAXED_PACE_OVERLOAD",
+                    "warning",
+                    f"days[{day_index}].attractions",
+                    (
+                        f"第{day_index + 1}天安排了{len(attractions)}个主景点，"
+                        "与明确的缓节奏/亲子/老人同行偏好不一致。"
+                    ),
+                    "将当日主景点控制在2个以内，并预留休息与灵活调整时间。",
                 )
             elif len(attractions) > 4:
                 add(
@@ -1244,6 +1259,7 @@ class TripPlanQualityService:
             {
                 "DAY_UNDERFILLED",
                 "DAY_OVERLOADED",
+                "RELAXED_PACE_OVERLOAD",
                 "DAY_SCHEDULE_OVERLOAD",
                 "DAY_SCHEDULE_IMPOSSIBLE",
                 "VISIT_TIME_OVERLOAD",
@@ -1627,27 +1643,8 @@ class TripPlanQualityService:
             and str(contract.pace.value) in {"轻松", "舒缓"}
         ):
             return True
-        text = " ".join(
-            [
-                request.free_text_input or "",
-                " ".join(request.preferences or []),
-            ]
-        )
-        markers = (
-            "父母",
-            "爸妈",
-            "老人",
-            "长辈",
-            "不想太累",
-            "轻松",
-            "松弛",
-            "休闲",
-            "慢一点",
-            "慢节奏",
-            "避暑",
-            "亲子",
-        )
-        return any(marker in text for marker in markers)
+        # Shared free-text / preference markers with planner finalize.
+        return prefers_gentle_pacing(request)
 
     def _date_range(self, start: str, end: str) -> list[str]:
         try:
