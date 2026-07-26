@@ -160,3 +160,37 @@ def test_meal_fallback_is_explicit_when_amap_has_no_reliable_restaurant() -> Non
         "暂未取得可靠的具体商家数据" in (meal.description or "")
         for meal in result.days[0].meals
     )
+
+def test_parent_trip_prompt_and_finalizer_preserve_people_origin_and_gentle_pacing() -> None:
+    planner = MultiAgentTripPlanner.__new__(MultiAgentTripPlanner)
+    planner.amap_service = _AmapStub()
+    request = _request().model_copy(
+        update={
+            "origin_city": "宝鸡扶风",
+            "travelers": 3,
+            "intercity_transportation": "自驾",
+            "free_text_input": "跟父母去避暑，不想太累",
+        }
+    )
+    plan = _plan()
+    plan.days[0].attractions.append(
+        Attraction(
+            name="景山公园",
+            address="北京市西城区景山西街44号",
+            location=Location(longitude=116.39, latitude=39.92),
+            visit_duration=90,
+            description="城市公园",
+            category="公园",
+        )
+    )
+
+    prompt = planner._build_planner_query(request, "高德景点", "天气待复核")
+    result = planner._finalize_generated_content(request, plan)
+
+    assert "- 出发地: 宝鸡扶风" in prompt
+    assert "- 人数: 3人" in prompt
+    assert "- 城际交通: 自驾" in prompt
+    assert "首日和末日必须为城际往返预留时间" in prompt
+    assert "每天最多安排2个主景点" in prompt
+    assert len(result.days[0].attractions) == 2
+    assert "每天最多保留2个主景点" in result.overall_suggestions

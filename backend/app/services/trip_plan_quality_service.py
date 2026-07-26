@@ -1802,7 +1802,7 @@ class TripPlanQualityService:
         )
 
     @staticmethod
-    def _category_preference_markers(self, category: str) -> list[str]:
+    def _category_preference_markers(category: str) -> list[str]:
         """Return user preference keywords that align with *category*.
 
         When the user has stated a preference matching the dominant

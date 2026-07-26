@@ -148,6 +148,17 @@ def make_plan(city: str = "北京") -> TripPlan:
     )
 
 
+def relocate_plan_pois(plan: TripPlan, address: str, attraction_name: str) -> TripPlan:
+    """Rewrite the fixture's Beijing POIs so they belong to another city."""
+    for day in plan.days:
+        for attraction in day.attractions:
+            attraction.name = attraction_name
+            attraction.address = address
+        for meal in day.meals:
+            meal.address = f"{address}{meal.type}街1号"
+    return plan
+
+
 def test_quality_gate_passes_consistent_plan() -> None:
     result = TripPlanQualityService().evaluate(make_request(), make_plan())
     assert result.status == "passed"
@@ -1133,10 +1144,15 @@ def test_quality_gate_warns_but_preserves_explicit_far_destination() -> None:
         preferences=[],
     )
 
-    result = TripPlanQualityService().evaluate(request, make_plan("昆明"))
+    # The plan itself must be internally consistent with 昆明, otherwise the
+    # POI mismatch error masks the short-trip risk this test is about.
+    plan = relocate_plan_pois(make_plan("昆明"), "昆明市五华区", "翠湖公园")
+
+    result = TripPlanQualityService().evaluate(request, plan)
 
     assert result.status == "warning"
     assert any(issue.code == "SHORT_TRIP_DESTINATION_RISK" for issue in result.issues)
+    assert not any(issue.severity == "error" for issue in result.issues)
 
 
 def test_quality_gate_rejects_plan_level_date_range_mismatch() -> None:
