@@ -29,6 +29,15 @@ def _run_compatibility_migrations() -> None:
                         "ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'"
                     )
                 )
+            if "user_budget" not in columns:
+                # Nullable, no backfill: the user's constraint cannot be
+                # recovered from the stored estimate.
+                connection.execute(
+                    text(
+                        "ALTER TABLE travel_plans "
+                        "ADD COLUMN user_budget NUMERIC(14, 2)"
+                    )
+                )
 
         if "users" in tables:
             columns = _column_names("users")

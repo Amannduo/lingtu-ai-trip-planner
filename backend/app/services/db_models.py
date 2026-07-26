@@ -105,6 +105,9 @@ travel_plans = Table(
     Column("travel_days", Integer, nullable=False),
     Column("travelers", Integer, nullable=False, server_default=text("1")),
     Column("budget", Numeric(14, 2)),
+    # The user's stated budget constraint; ``budget`` stores the system
+    # estimate total (analytics read it) and must never overwrite this.
+    Column("user_budget", Numeric(14, 2)),
     Column("actual_cost", Numeric(14, 2)),
     Column("transportation", String(100)),
     Column("accommodation", String(100)),

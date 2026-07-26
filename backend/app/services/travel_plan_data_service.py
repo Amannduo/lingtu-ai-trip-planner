@@ -17,6 +17,17 @@ from .schema import init_db
 logger = logging.getLogger(__name__)
 
 
+def _as_optional_budget(value: Any) -> int | None:
+    """Coerce a stored NUMERIC user budget back to the request's int form."""
+    if value is None:
+        return None
+    try:
+        amount = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return amount if amount >= 0 else None
+
+
 class TravelPlanDataService:
     """Persist trip plans and maintain user profile summaries."""
 
@@ -40,12 +51,12 @@ class TravelPlanDataService:
             """INSERT INTO travel_plans
                (plan_no, user_id, user_role, origin_city, destination,
                 start_date, end_date, travel_days, travelers,
-                budget, actual_cost, transportation, accommodation,
+                budget, user_budget, actual_cost, transportation, accommodation,
                 preferences, free_text, summary, plan_json, status, source)
                VALUES
                (:plan_no, :user_id, :user_role, :origin_city, :destination,
                 :start_date, :end_date, :travel_days, :travelers,
-                :budget, :actual_cost, :transportation, :accommodation,
+                :budget, :user_budget, :actual_cost, :transportation, :accommodation,
                 :preferences, :free_text, :summary, :plan_json, :status, :source)""",
             {
                 "plan_no": plan_no,
@@ -57,7 +68,11 @@ class TravelPlanDataService:
                 "end_date": request.end_date,
                 "travel_days": request.travel_days,
                 "travelers": request.travelers,
+                # ``budget`` keeps the estimate total for analytics;
+                # ``user_budget`` preserves the user's own constraint so the
+                # edit-path quality gate re-checks against real intent.
                 "budget": budget.total if budget else request.budget,
+                "user_budget": request.budget,
                 "actual_cost": None,
                 "transportation": request.transportation,
                 "accommodation": request.accommodation,
@@ -105,7 +120,8 @@ class TravelPlanDataService:
         init_db()
         row = fetch_one(
             """SELECT origin_city, destination, start_date, end_date, travel_days,
-                      travelers, transportation, accommodation, preferences, free_text
+                      travelers, user_budget, transportation, accommodation,
+                      preferences, free_text
                FROM travel_plans
                WHERE plan_no = :plan_no AND user_id = :user_id""",
             {"plan_no": plan_no, "user_id": user_id},
@@ -126,7 +142,7 @@ class TravelPlanDataService:
                 end_date=row["end_date"],
                 travel_days=int(row.get("travel_days") or 1),
                 travelers=int(row.get("travelers") or 1),
-                budget=None,
+                budget=_as_optional_budget(row.get("user_budget")),
                 transportation=row.get("transportation") or "公共交通",
                 accommodation=row.get("accommodation") or "舒适型酒店",
                 preferences=[str(value) for value in preferences],
