@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Callable, List, Optional
 from hello_agents import SimpleAgent
 from ..services.llm_service import get_llm
+from ..services.semantic_contract_service import decided_constraint_text
 from ..services.transport_budget_service import get_transport_budget_service
 from ..services.amap_service import get_amap_service
 from ..models.schemas import (
@@ -949,7 +950,9 @@ class MultiAgentTripPlanner:
     def _is_evening_before_departure(self, request: TripRequest) -> bool:
         if request.departure_mode == "evening_before":
             return True
-        text = request.free_text_input or ""
+        # Never the advisory 【抵达建议】 line: on a default weekend card it says
+        # "建议周五下午或傍晚出发" while the user chose the Saturday start.
+        text = decided_constraint_text(request.free_text_input)
         if "evening_before" in text or "周五—周日" in text or "周五提前" in text:
             return True
         if re.search(r"周五.{0,6}(?:下午|傍晚|晚上)", text):
@@ -958,7 +961,7 @@ class MultiAgentTripPlanner:
 
     def _needs_gentle_pacing(self, request: TripRequest) -> bool:
         text = (
-            f"{request.free_text_input or ''} "
+            f"{decided_constraint_text(request.free_text_input)} "
             f"{' '.join(request.preferences)}"
         )
         return any(

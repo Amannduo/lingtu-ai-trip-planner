@@ -58,6 +58,13 @@ SHORT_TRIP_CITY_GRAPH: Dict[str, List[str]] = {
     "青岛": ["济南", "烟台", "威海"],
     "济南": ["青岛", "天津", "北京"],
     "郑州": ["洛阳", "西安", "开封"],
+    # Northern circles: without these a Taiyuan/Shijiazhuang weekend request
+    # falls through to the generic list and proposes 杭州/南京/成都.
+    "太原": ["晋中", "忻州", "大同", "石家庄"],
+    "石家庄": ["太原", "北京", "保定"],
+    "大同": ["太原", "忻州", "呼和浩特"],
+    "沈阳": ["大连", "长春", "鞍山"],
+    "哈尔滨": ["长春", "牡丹江", "齐齐哈尔"],
 }
 
 # County/district-level origins inherit their prefecture-level transport circle.
@@ -164,6 +171,11 @@ class DestinationFeasibilityService:
         canonical = self.normalize_city(value)
 
         normalized = canonical.strip()
+        if not normalized:
+            # "吉林市" strips to the empty string (province prefix + bare 市).
+            # Returning "" would silently disable every identity check that
+            # guards on truthiness, so keep the plain city normalization.
+            normalized = self.normalize_city(original).strip()
         self._NORM_CACHE[cache_key] = normalized
         return normalized
 
@@ -180,7 +192,13 @@ class DestinationFeasibilityService:
         precise = self._precise_origin_key(origin_city)
         if precise:
             return list(PRECISE_SHORT_TRIP_CITY_GRAPH[precise])
-        return list(SHORT_TRIP_CITY_GRAPH.get(self.normalize_city(origin_city), []))
+        # Must match assess(): a province-prefixed origin such as "山西太原"
+        # has to resolve to the same graph key as "太原".
+        return list(
+            SHORT_TRIP_CITY_GRAPH.get(
+                self.normalize_location_for_matching(origin_city), []
+            )
+        )
 
     def _precise_origin_key(self, origin_city: Optional[str]) -> str:
         compact = "".join(str(origin_city or "").split())

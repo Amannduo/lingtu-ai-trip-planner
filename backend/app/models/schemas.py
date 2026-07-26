@@ -275,6 +275,20 @@ class SemanticTripContract(BaseModel):
     preferences: FieldBinding = Field(default_factory=FieldBinding)
     transportation: FieldBinding = Field(default_factory=FieldBinding)
     accommodation: FieldBinding = Field(default_factory=FieldBinding)
+    # Range and exclusion semantics: "附近城市" / "不想去昆明" / "不要海边" must
+    # survive from utterance to recommendation, not be dropped as unmodelled text.
+    destination_scope: FieldBinding = Field(
+        default_factory=FieldBinding,
+        description="nearby | far —— 用户对目的地距离范围的要求",
+    )
+    excluded_destinations: FieldBinding = Field(
+        default_factory=FieldBinding,
+        description="用户明确排除的目的地城市列表",
+    )
+    excluded_themes: FieldBinding = Field(
+        default_factory=FieldBinding,
+        description="用户明确排除的主题/场景，如「海边」「爬山」",
+    )
     # Weekend / early-arrival semantics (optional FieldBindings for provenance).
     date_pattern: FieldBinding = Field(
         default_factory=FieldBinding,
@@ -305,6 +319,9 @@ class SemanticTripContract(BaseModel):
             "transportation",
             "accommodation",
             "early_arrival_hint",
+            "destination_scope",
+            "excluded_destinations",
+            "excluded_themes",
         ]
         for name in tracked:
             binding = getattr(self, name)

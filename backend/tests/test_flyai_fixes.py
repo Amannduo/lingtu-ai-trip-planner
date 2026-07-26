@@ -1042,7 +1042,8 @@ class TestShortTripRiskNotBlocking:
         # severity is "warning", not "error".
         from app.services.destination_feasibility_service import get_destination_feasibility_service
         feasibility = get_destination_feasibility_service()
-        r = feasibility.assess("山西太原", "大同", 2, explicit_destination=True)
+        # 临汾 has no short-haul circle of its own → unknown-radius path.
+        r = feasibility.assess("山西临汾", "大同", 2, explicit_destination=True)
         # Must be allowed (user explicitly chose it).
         assert r.allowed is True
         # Must be "warning" not "error" for explicit destinations.
@@ -1068,12 +1069,24 @@ class TestShortTripRiskNotBlocking:
         assert r.allowed is True
 
     def test_explicit_far_destination_allowed(self):
-        """太原→大同 is allowed when explicit (user chose it)."""
+        """太原→三亚 on a weekend is allowed when explicit (user chose it)."""
         from app.services.destination_feasibility_service import get_destination_feasibility_service
         feasibility = get_destination_feasibility_service()
-        r = feasibility.assess("山西太原", "大同", 2, explicit_destination=True)
+        r = feasibility.assess("山西太原", "三亚", 2, explicit_destination=True)
         assert r.allowed is True
         assert r.severity == "warning"
+
+    def test_province_prefixed_origin_resolves_to_its_short_trip_circle(self):
+        """"山西太原" must hit the same graph key as "太原"."""
+        from app.services.destination_feasibility_service import get_destination_feasibility_service
+        feasibility = get_destination_feasibility_service()
+        assert feasibility.nearby_destinations("山西太原") == (
+            feasibility.nearby_destinations("太原")
+        )
+        assert feasibility.nearby_destinations("太原")
+        r = feasibility.assess("山西太原", "大同", 2, explicit_destination=False)
+        assert r.allowed is True
+        assert r.severity == "info"
 
     def test_transport_ref_mismatch_still_blocks(self):
         """TRANSPORT_REFERENCE_MISMATCH must remain a blocking code."""

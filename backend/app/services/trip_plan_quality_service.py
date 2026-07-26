@@ -1501,8 +1501,13 @@ class TripPlanQualityService:
                 and not contract.origin_city.pending_confirmation
                 and request.origin_city
             ):
-                left = feasibility.normalize_city(str(contract.origin_city.value))
-                right = feasibility.normalize_city(request.origin_city)
+                # "山西太原" (utterance) and "太原" (form) are the same origin.
+                left = feasibility.normalize_location_for_matching(
+                    str(contract.origin_city.value)
+                )
+                right = feasibility.normalize_location_for_matching(
+                    request.origin_city
+                )
                 if left and right and left != right:
                     add(
                         "SEMANTIC_ORIGIN_MISMATCH",
@@ -1521,9 +1526,11 @@ class TripPlanQualityService:
                 in {"user_explicit", "form_confirmed"}
                 and not contract.destination_city.pending_confirmation
             ):
-                left = feasibility.normalize_city(str(contract.destination_city.value))
-                right = feasibility.normalize_city(request.city)
-                plan_city = feasibility.normalize_city(plan.city)
+                left = feasibility.normalize_location_for_matching(
+                    str(contract.destination_city.value)
+                )
+                right = feasibility.normalize_location_for_matching(request.city)
+                plan_city = feasibility.normalize_location_for_matching(plan.city)
                 if left and right and left != right:
                     add(
                         "SEMANTIC_DESTINATION_MISMATCH",
@@ -1623,6 +1630,61 @@ class TripPlanQualityService:
                 "确认同行关系与人数后可提高行程匹配度。",
             )
 
+        self._evaluate_exclusions(contract, plan, feasibility, add, risks_acked)
+
+    def _evaluate_exclusions(
+        self, contract, plan, feasibility, add, risks_acked: bool
+    ) -> None:
+        """What the user ruled out must not come back in the generated plan.
+
+        After an explicit secondary confirmation the user owns the decision, so
+        the destination check degrades to a warning instead of blocking.
+        """
+        excluded_cities = (
+            [str(item) for item in contract.excluded_destinations.value]
+            if contract.excluded_destinations.is_known()
+            and isinstance(contract.excluded_destinations.value, list)
+            else []
+        )
+        destination = feasibility.normalize_location_for_matching(plan.city)
+        if excluded_cities and destination:
+            for city in excluded_cities:
+                if feasibility.normalize_location_for_matching(city) == destination:
+                    add(
+                        "SEMANTIC_EXCLUDED_DESTINATION",
+                        "warning" if risks_acked else "error",
+                        "city",
+                        f"用户明确排除了“{city}”，但行程目的地仍是该城市。",
+                        "改用其他目的地重新生成，或请用户确认取消该排除。",
+                    )
+
+        excluded_themes = (
+            [str(item) for item in contract.excluded_themes.value]
+            if contract.excluded_themes.is_known()
+            and isinstance(contract.excluded_themes.value, list)
+            else []
+        )
+        if not excluded_themes:
+            return
+        for theme in excluded_themes:
+            hits = [
+                attraction.name
+                for day in plan.days
+                for attraction in (day.attractions or [])
+                if theme in f"{attraction.name} {attraction.category or ''}"
+            ]
+            if hits:
+                add(
+                    "SEMANTIC_EXCLUDED_THEME",
+                    "warning",
+                    "days[].attractions",
+                    (
+                        f"用户明确排除了“{theme}”，但行程仍包含 "
+                        f"{'、'.join(hits[:3])}。"
+                    ),
+                    "移除或替换这些安排后再确认行程。",
+                )
+
     def _prefers_relaxed_pace(self, request: TripRequest) -> bool:
         contract = request.semantic_contract
         if (
@@ -1631,9 +1693,11 @@ class TripPlanQualityService:
             and str(contract.pace.value) in {"轻松", "舒缓"}
         ):
             return True
+        from .semantic_contract_service import decided_constraint_text
+
         text = " ".join(
             [
-                request.free_text_input or "",
+                decided_constraint_text(request.free_text_input),
                 " ".join(request.preferences or []),
             ]
         )
