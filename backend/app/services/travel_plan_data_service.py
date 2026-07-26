@@ -17,6 +17,71 @@ from .schema import init_db
 logger = logging.getLogger(__name__)
 
 
+REQUEST_SNAPSHOT_SCHEMA_VERSION = 1
+CONTRACT_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def _serialize_request_snapshot(request: TripRequest) -> str:
+    """Versioned generation-time request snapshot (contract stored aside)."""
+    payload = {
+        "schema_version": REQUEST_SNAPSHOT_SCHEMA_VERSION,
+        "request": request.model_dump(mode="json", exclude={"semantic_contract"}),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _serialize_contract_snapshot(request: TripRequest) -> str | None:
+    contract = getattr(request, "semantic_contract", None)
+    if contract is None:
+        return None
+    payload = {
+        "schema_version": CONTRACT_SNAPSHOT_SCHEMA_VERSION,
+        "contract": contract.model_dump(mode="json"),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _request_from_snapshot(
+    request_json: Any,
+    contract_json: Any,
+) -> TripRequest | None:
+    """Restore the generation-time request; None on any defect (fail soft).
+
+    Unknown future schema_versions are treated as unreadable rather than
+    partially parsed, so a downgraded deployment never misreads newer rows.
+    """
+    if not isinstance(request_json, str) or not request_json.strip():
+        return None
+    try:
+        wrapper = json.loads(request_json)
+        if int(wrapper.get("schema_version", -1)) != REQUEST_SNAPSHOT_SCHEMA_VERSION:
+            return None
+        request = TripRequest.model_validate(wrapper["request"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+    if isinstance(contract_json, str) and contract_json.strip():
+        try:
+            from ..models.schemas import SemanticTripContract
+
+            contract_wrapper = json.loads(contract_json)
+            if (
+                int(contract_wrapper.get("schema_version", -1))
+                == CONTRACT_SNAPSHOT_SCHEMA_VERSION
+            ):
+                contract = SemanticTripContract.model_validate(
+                    contract_wrapper["contract"]
+                )
+                request = request.model_copy(
+                    update={"semantic_contract": contract}
+                )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            # A broken contract snapshot degrades to contract-less full
+            # request; the quality gate's single-rebuild fallback covers it.
+            pass
+    return request
+
+
 def _as_optional_budget(value: Any) -> int | None:
     """Coerce a stored NUMERIC user budget back to the request's int form."""
     if value is None:
@@ -52,12 +117,14 @@ class TravelPlanDataService:
                (plan_no, user_id, user_role, origin_city, destination,
                 start_date, end_date, travel_days, travelers,
                 budget, user_budget, actual_cost, transportation, accommodation,
-                preferences, free_text, summary, plan_json, status, source)
+                preferences, free_text, summary, plan_json,
+                request_json, contract_json, status, source)
                VALUES
                (:plan_no, :user_id, :user_role, :origin_city, :destination,
                 :start_date, :end_date, :travel_days, :travelers,
                 :budget, :user_budget, :actual_cost, :transportation, :accommodation,
-                :preferences, :free_text, :summary, :plan_json, :status, :source)""",
+                :preferences, :free_text, :summary, :plan_json,
+                :request_json, :contract_json, :status, :source)""",
             {
                 "plan_no": plan_no,
                 "user_id": user_id,
@@ -80,6 +147,8 @@ class TravelPlanDataService:
                 "free_text": request.free_text_input or "",
                 "summary": summary,
                 "plan_json": _serialize_plan(trip_plan),
+                "request_json": _serialize_request_snapshot(request),
+                "contract_json": _serialize_contract_snapshot(request),
                 "status": "completed",
                 "source": source,
             },
@@ -114,6 +183,31 @@ class TravelPlanDataService:
     @staticmethod
     def revision_for_plan(trip_plan: TripPlan) -> str:
         return _plan_revision(_serialize_plan(trip_plan))
+
+    def get_trip_request_with_context(
+        self, plan_no: str, user_id: str
+    ) -> tuple[TripRequest | None, str]:
+        """Return ``(request, validation_mode)`` for the edit-path gate.
+
+        ``full``: the generation-time request snapshot (and semantic
+        contract) was restored — the quality gate runs at the same
+        strength as generation time.  ``legacy_weak``: only denormalized
+        columns are available (pre-snapshot rows or corrupt snapshots);
+        callers must never auto-upgrade such results to publishable.
+        """
+        init_db()
+        row = fetch_one(
+            """SELECT request_json, contract_json FROM travel_plans
+               WHERE plan_no = :plan_no AND user_id = :user_id""",
+            {"plan_no": plan_no, "user_id": user_id},
+        )
+        if row:
+            request = _request_from_snapshot(
+                row.get("request_json"), row.get("contract_json")
+            )
+            if request is not None:
+                return request, "full"
+        return self.get_trip_request(plan_no, user_id), "legacy_weak"
 
     def get_trip_request(self, plan_no: str, user_id: str) -> TripRequest | None:
         """Rebuild the non-sensitive request context used by the quality gate."""

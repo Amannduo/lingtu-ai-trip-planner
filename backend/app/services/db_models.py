@@ -115,6 +115,11 @@ travel_plans = Table(
     Column("free_text", Text),
     Column("summary", Text),
     Column("plan_json", Text, nullable=False, server_default=text("'{}'")),
+    # Versioned generation-time snapshots; NULL on legacy rows → the edit
+    # path falls back to weak column reconstruction (validation_mode
+    # legacy_weak, never auto-upgraded to publishable).
+    Column("request_json", Text),
+    Column("contract_json", Text),
     Column("status", String(32), nullable=False, server_default=text("'completed'")),
     Column("source", String(64), nullable=False, server_default=text("'generated'")),
     Column("created_at", String(32), nullable=False, server_default=text("CURRENT_TIMESTAMP")),

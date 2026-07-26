@@ -24,6 +24,7 @@ from ...models.schemas import (
     Attraction,
     TripRequest,
     TripPlan,
+    TripPlanQualityIssue,
     TripPlanResponse,
     ErrorResponse
 )
@@ -208,13 +209,54 @@ def _reject_identity_mutation(edited: TripPlan, existing: TripPlan) -> None:
             )
 
 
-def _quality_blocks_edit_save(quality) -> bool:
+def _mark_legacy_weak_validation(quality) -> None:
+    """Product rule for rows without a generation-time request snapshot.
+
+    Editing and saving stay allowed, but the weaker context must be
+    visible and can never silently upgrade the plan to publishable; the
+    user is told a regenerate restores the full quality gate.
+    """
     if quality is None:
-        return True
+        return
+    quality.validation_mode = "legacy_weak"
+    if not any(
+        getattr(issue, "code", "") == "LEGACY_WEAK_VALIDATION"
+        for issue in quality.issues
+    ):
+        quality.issues.append(
+            TripPlanQualityIssue(
+                code="LEGACY_WEAK_VALIDATION",
+                severity="info",
+                path="quality",
+                message="该行程缺少生成时的完整请求快照，本次为弱校验。",
+                suggestion="重新生成行程可获得完整质量校验。",
+            )
+        )
+    if quality.quality_status == "publishable":
+        quality.quality_status = "needs_review"
+        quality.publishable = False
+
+
+def can_save_user_draft(quality) -> bool:
+    """Whether a user-edited plan may be stored as their own draft.
+
+    This is a **draft-save** policy, deliberately laxer than publishability,
+    and it is not a fourth ``quality_status`` derivation: publishability is
+    decided solely by ``resolve_plan_quality_status``. A plan the gate calls
+    ``needs_review`` is still the user's own work and stays savable; only a
+    failed evaluation or an error-severity issue is refused.
+
+    Saving a draft never implies the plan may be published, and never relaxes
+    the identity, ownership or unforgeable-field checks that run before it
+    (``_reject_identity_mutation``, ``_restore_verified_plan_facts``, the
+    owner-scoped lookup and the If-Match revision guard).
+    """
+    if quality is None:
+        return False
     status = str(getattr(quality, "status", "") or "").strip().lower()
     if status == "failed":
-        return True
-    return any(
+        return False
+    return not any(
         str(getattr(issue, "severity", "") or "").strip().lower() == "error"
         for issue in (getattr(quality, "issues", None) or [])
     )
@@ -752,12 +794,25 @@ async def update_trip_history(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     request_ctx = None
-    get_request = getattr(service, "get_trip_request", None)
-    if callable(get_request):
-        request_ctx = get_request(plan_no, current_user.user_id)
+    validation_mode = "legacy_weak"
+    get_request_ctx = getattr(service, "get_trip_request_with_context", None)
+    if callable(get_request_ctx):
+        request_ctx, validation_mode = get_request_ctx(
+            plan_no, current_user.user_id
+        )
+    else:
+        # Duck-typed services without the snapshot interface keep the
+        # pre-snapshot behavior; legacy_weak is only asserted when the
+        # real service explicitly reports a degraded context.
+        get_request = getattr(service, "get_trip_request", None)
+        if callable(get_request):
+            request_ctx = get_request(plan_no, current_user.user_id)
+            validation_mode = "full"
     if request_ctx is not None:
         plan.quality = get_trip_plan_quality_service().evaluate(request_ctx, plan)
-        if _quality_blocks_edit_save(plan.quality):
+        if validation_mode == "legacy_weak":
+            _mark_legacy_weak_validation(plan.quality)
+        if not can_save_user_draft(plan.quality):
             raise HTTPException(
                 status_code=422,
                 detail={

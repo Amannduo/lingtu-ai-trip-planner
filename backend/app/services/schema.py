@@ -38,6 +38,14 @@ def _run_compatibility_migrations() -> None:
                         "ADD COLUMN user_budget NUMERIC(14, 2)"
                     )
                 )
+            if "request_json" not in columns:
+                connection.execute(
+                    text("ALTER TABLE travel_plans ADD COLUMN request_json TEXT")
+                )
+            if "contract_json" not in columns:
+                connection.execute(
+                    text("ALTER TABLE travel_plans ADD COLUMN contract_json TEXT")
+                )
 
         if "users" in tables:
             columns = _column_names("users")

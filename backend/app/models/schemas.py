@@ -560,6 +560,13 @@ class TripPlanQualityResult(BaseModel):
         default="blocked",
         description="blocked | needs_review | publishable — unified gate decision",
     )
+    validation_mode: str = Field(
+        default="full",
+        description=(
+            "full | legacy_weak — 校验所用请求上下文完整度；legacy_weak 表示缺少"
+            "生成时请求快照的弱校验，结果不允许自动升级为 publishable"
+        ),
+    )
     checked_items: List[str] = Field(default_factory=list)
     issues: List[TripPlanQualityIssue] = Field(default_factory=list)
     verified_facts: int = Field(default=0)
