@@ -16,11 +16,23 @@
             <a-select-option :value="0">长期</a-select-option>
           </a-select>
         </div>
-        <a-button v-if="!editMode" @click="toggleEditMode" type="default">
+        <a-button
+          v-if="!editMode"
+          @click="toggleEditMode"
+          type="default"
+          :disabled="!canEditForHistory"
+          :title="!canEditForHistory ? editDisabledReason : undefined"
+        >
           <EditOutlined />
           <span>编辑行程</span>
         </a-button>
-        <a-button v-else @click="saveChanges" type="primary">
+        <a-button
+          v-else
+          @click="saveChanges"
+          type="primary"
+          :disabled="!canEditForHistory"
+          :title="!canEditForHistory ? editDisabledReason : undefined"
+        >
           <SaveOutlined />
           <span>保存修改</span>
         </a-button>
@@ -29,7 +41,7 @@
           <span>取消编辑</span>
         </a-button>
 
-        <!-- 导出按钮 -->
+        <!-- 导出按钮：查看用途保留；blocked 时仅提示，不伪装为可出发交付 -->
         <a-dropdown v-if="!editMode">
           <template #overlay>
             <a-menu>
@@ -71,6 +83,62 @@
       </div>
     </div>
 
+    <!-- 质量与可信状态总览：直接使用后端 quality 结构化字段 -->
+    <section
+      v-if="tripPlan"
+      id="trust-status"
+      class="trust-status-banner"
+      :class="'tone-' + trustTone"
+      role="region"
+      :aria-label="'方案质量：' + trustTitle"
+    >
+      <div class="trust-status-main">
+        <div class="trust-status-heading">
+          <span class="trust-status-kicker">方案质量</span>
+          <h2 class="trust-status-title">{{ trustTitle }}</h2>
+          <div class="trust-status-tags">
+            <span class="trust-tag" :class="'tone-' + trustTone" :aria-label="trustTitle">
+              {{ trustBadge }}
+            </span>
+            <span
+              v-if="generationModeTag"
+              class="trust-tag tone-neutral"
+              :title="generationModeHintText"
+            >
+              {{ generationModeTag }}
+            </span>
+            <span v-if="verifiedFactsText" class="trust-tag tone-neutral">
+              {{ verifiedFactsText }}
+            </span>
+          </div>
+        </div>
+        <p class="trust-status-desc">{{ trustDescription }}</p>
+        <p v-if="generationModeHintText && generationModeTag" class="trust-status-mode-hint">
+          {{ generationModeHintText }}
+        </p>
+        <p v-if="isPlanBlocked" class="trust-status-action-hint" role="status">
+          保存到历史记录与邮件发送已禁用。可返回首页重新生成，或继续查看下方行程细节。
+        </p>
+        <p v-else-if="trustStatus === 'needs_review'" class="trust-status-action-hint" role="status">
+          可保存与使用，但请先核对下方待确认事项；保存修改前会再次确认。
+        </p>
+      </div>
+      <div class="trust-status-side" aria-hidden="false">
+        <div class="trust-stat">
+          <span>阻断项</span>
+          <strong>{{ blockingIssues.length }}</strong>
+        </div>
+        <div class="trust-stat">
+          <span>待核对</span>
+          <strong>{{ advisoryIssues.length }}</strong>
+        </div>
+        <div class="trust-stat">
+          <span>提示</span>
+          <strong>{{ infoIssues.length }}</strong>
+        </div>
+      </div>
+    </section>
+
     <div v-if="tripPlan" class="content-wrapper">
       <!-- 侧边导航 -->
       <div class="side-nav">
@@ -87,17 +155,20 @@
                 第{{ day.day_index + 1 }}天
               </a-menu-item>
             </a-sub-menu>
+            <a-menu-item key="budget" v-if="tripPlan.budget">
+              <span>💰 预算明细</span>
+            </a-menu-item>
             <a-menu-item key="weather">
               <span>🌤️ 天气信息</span>
             </a-menu-item>
             <a-menu-item key="web-guide" v-if="tripPlan.web_guide">
               <span>🌐 联网攻略</span>
             </a-menu-item>
-            <a-menu-item key="web-meta" v-if="normalizedWebReferences.length">
+            <a-menu-item key="web-meta" v-if="safeWebReferences.length">
               <span>🔎 资料来源</span>
             </a-menu-item>
             <a-menu-item key="agent-audit" v-if="tripPlan.agent_audit">
-              <span>✅ 审核检查</span>
+              <span>✅ 来源审核</span>
             </a-menu-item>
           </a-menu>
         </a-affix>
@@ -105,37 +176,94 @@
 
       <!-- 主内容区 -->
       <div class="main-content">
-        <!-- 智能审查与提示卡片 -->
-        <a-card v-if="qualityIssuesList.length > 0" class="quality-advisory-card" :bordered="false">
+        <!-- 质量问题：blocking 与 advisory 分组，不按中文文案推断 -->
+        <a-card
+          v-if="qualityIssuesList.length > 0 || trustStatus !== 'unknown'"
+          id="quality-gate"
+          class="quality-advisory-card"
+          :class="'quality-tone-' + trustTone"
+          :bordered="false"
+        >
           <div class="quality-advisory-header">
             <div class="quality-advisory-title">
-              <span class="advisory-icon">💡</span>
-              <span class="advisory-text-title">智能审查与提示</span>
-              <a-tag :color="advisoryTagColor" class="advisory-status-tag">
-                {{ advisoryStatusText }}
+              <span class="advisory-icon" aria-hidden="true">{{ isPlanBlocked ? '⛔' : trustStatus === 'needs_review' ? '⚠️' : '✅' }}</span>
+              <span class="advisory-text-title">方案质量检查</span>
+              <a-tag :color="qualityTagColor" class="advisory-status-tag">
+                {{ trustTitle }}
               </a-tag>
-              <span class="advisory-count-badge">共 {{ qualityIssuesList.length }} 项需关注</span>
+              <span class="advisory-count-badge" v-if="qualityIssuesList.length">
+                阻断 {{ blockingIssues.length }} · 待核对 {{ advisoryIssues.length }} · 提示 {{ infoIssues.length }}
+              </span>
             </div>
-            <a-button type="link" size="small" @click="toggleQualityExpand">
-              {{ isQualityExpanded ? '收起' : '展开' }} {{ qualityIssuesList.length > 3 ? `(全部 ${qualityIssuesList.length} 项)` : '' }}
+            <a-button
+              v-if="qualityIssuesList.length > 3"
+              type="link"
+              size="small"
+              @click="toggleQualityExpand"
+            >
+              {{ isQualityExpanded ? '收起' : `展开全部 ${qualityIssuesList.length} 项` }}
             </a-button>
           </div>
-          <div class="quality-advisory-body">
-            <div
-              v-for="(item, idx) in visibleQualityIssues"
-              :key="idx"
-              class="quality-issue-item"
-              :class="item.severity || 'warning'"
-            >
-              <div class="issue-main">
-                <a-tag :color="item.severity === 'info' ? 'blue' : 'orange'" class="issue-badge">
-                  {{ item.severity === 'info' ? '提示' : '建议确认' }}
-                </a-tag>
-                <span class="issue-message">{{ item.message }}</span>
-                <span v-if="item.code" class="issue-code">({{ item.code }})</span>
+
+          <div v-if="!qualityIssuesList.length" class="quality-empty-ok" :class="{ 'quality-empty-blocked': isPlanBlocked || trustStatus === 'unknown' }">
+            {{ qualityEmptyStateText }}
+          </div>
+
+          <div v-else class="quality-advisory-body">
+            <div v-if="visibleBlockingIssues.length" class="quality-group" role="group" aria-label="阻断性问题">
+              <div class="quality-group-title">
+                <span class="sr-only">严重程度：阻断</span>
+                阻断性问题（须处理后方可保存/发送）
               </div>
-              <div v-if="item.suggestion" class="issue-suggestion">
-                💡 {{ item.suggestion }}
+              <div
+                v-for="(item, idx) in visibleBlockingIssues"
+                :key="'b-' + item.code + '-' + idx"
+                class="quality-issue-item blocking"
+              >
+                <div class="issue-main">
+                  <a-tag color="red" class="issue-badge">阻断</a-tag>
+                  <span class="issue-message">{{ item.message }}</span>
+                  <span v-if="item.code" class="issue-code">{{ item.code }}</span>
+                </div>
+                <div v-if="item.suggestion" class="issue-suggestion">建议：{{ item.suggestion }}</div>
+              </div>
+            </div>
+
+            <div v-if="visibleAdvisoryIssues.length" class="quality-group" role="group" aria-label="待核对事项">
+              <div class="quality-group-title">
+                <span class="sr-only">严重程度：待核对</span>
+                待核对事项（可使用，建议出发前确认）
+              </div>
+              <div
+                v-for="(item, idx) in visibleAdvisoryIssues"
+                :key="'a-' + item.code + '-' + idx"
+                class="quality-issue-item warning"
+              >
+                <div class="issue-main">
+                  <a-tag color="orange" class="issue-badge">待核对</a-tag>
+                  <span class="issue-message">{{ item.message }}</span>
+                  <span v-if="item.code" class="issue-code">{{ item.code }}</span>
+                </div>
+                <div v-if="item.suggestion" class="issue-suggestion">建议：{{ item.suggestion }}</div>
+              </div>
+            </div>
+
+            <div v-if="visibleInfoIssues.length" class="quality-group" role="group" aria-label="提示信息">
+              <div class="quality-group-title">
+                <span class="sr-only">严重程度：提示</span>
+                提示信息
+              </div>
+              <div
+                v-for="(item, idx) in visibleInfoIssues"
+                :key="'i-' + item.code + '-' + idx"
+                class="quality-issue-item info"
+              >
+                <div class="issue-main">
+                  <a-tag color="blue" class="issue-badge">提示</a-tag>
+                  <span class="issue-message">{{ item.message }}</span>
+                  <span v-if="item.code" class="issue-code">{{ item.code }}</span>
+                </div>
+                <div v-if="item.suggestion" class="issue-suggestion">建议：{{ item.suggestion }}</div>
               </div>
             </div>
           </div>
@@ -286,7 +414,12 @@
                         <p><strong>游览时长:</strong> {{ item.visit_duration }}分钟</p>
                         <p><strong>描述:</strong> {{ item.description }}</p>
                         <p v-if="item.rating"><strong>评分:</strong> {{ item.rating }}⭐</p>
-                        <a-tag v-if="item.coordinate_source === 'amap_poi'" color="green">高德 POI 坐标已校准</a-tag>
+                        <a-tag
+                          :color="poiTrustTagColor(item.coordinate_source)"
+                          class="poi-trust-tag"
+                        >
+                          {{ poiTrustLabel(item.coordinate_source) }}
+                        </a-tag>
                       </div>
                     </a-card>
                   </a-list-item>
@@ -301,13 +434,14 @@
                     <span class="route-title">{{ route.from_name }} → {{ route.to_name }}</span>
                     <span class="route-mode">
                       {{ getRouteTypeLabel(route.route_type) }}
-                      · {{ route.verified ? '高德路线已校验' : '路线摘要' }}
+                      · {{ routeTrustText(route) }}
                     </span>
                   </div>
-                  <div class="route-meta">
+                  <div v-if="routeShowMetrics(route)" class="route-meta">
                     <span v-if="route.distance">{{ formatRouteDistance(route.distance) }}</span>
                     <span v-if="route.duration">{{ formatRouteDuration(route.duration) }}</span>
                   </div>
+                  <div v-else class="route-meta route-meta-pending">距离与时间待地图确认</div>
                   <p class="route-desc">{{ route.description }}</p>
                 </div>
               </div>
@@ -352,32 +486,109 @@
           </a-collapse>
         </a-card>
 
+        <!-- 预算：仅展示服务端 breakdown，不在前端二次乘人数 -->
+        <a-card
+          v-if="tripPlan.budget"
+          id="budget"
+          title="💰 预算明细"
+          style="margin-top: 20px"
+          :bordered="false"
+          class="budget-card"
+        >
+          <div class="budget-source-line">
+            <a-tag :color="budgetSourceMeta.isFallback ? 'orange' : budgetSourceMeta.isProvider ? 'green' : 'blue'">
+              {{ budgetSourceMeta.isFallback ? '兜底估算' : budgetSourceMeta.isProvider ? '含服务端报价参考' : '服务端估算' }}
+            </a-tag>
+            <span>{{ budgetSourceMeta.label }}</span>
+          </div>
+          <div class="budget-grid">
+            <div class="budget-item">
+              <span class="budget-label">门票合计</span>
+              <strong class="budget-value">{{ formatBudgetAmount(tripPlan.budget.total_attractions) }}</strong>
+            </div>
+            <div class="budget-item">
+              <span class="budget-label">酒店合计</span>
+              <strong class="budget-value">{{ formatBudgetAmount(tripPlan.budget.total_hotels) }}</strong>
+            </div>
+            <div class="budget-item">
+              <span class="budget-label">餐饮合计</span>
+              <strong class="budget-value">{{ formatBudgetAmount(tripPlan.budget.total_meals) }}</strong>
+            </div>
+            <div class="budget-item">
+              <span class="budget-label">交通合计</span>
+              <strong class="budget-value">{{ formatBudgetAmount(tripPlan.budget.total_transportation) }}</strong>
+            </div>
+            <div class="budget-item budget-total">
+              <span class="budget-label">总预算</span>
+              <strong class="budget-value">{{ formatBudgetAmount(tripPlan.budget.total) }}</strong>
+            </div>
+          </div>
+          <div class="budget-meta">
+            <div v-if="isFiniteMoney(tripPlan.budget.hotel_unit_price)">
+              酒店单晚参考价 {{ formatBudgetAmount(tripPlan.budget.hotel_unit_price) }}
+              <span class="budget-unit-hint">{{ hotelUnitHint }}</span>
+            </div>
+            <div v-if="isFiniteMoney(tripPlan.budget.transport_unit_price)">
+              城际单人往返参考价 {{ formatBudgetAmount(tripPlan.budget.transport_unit_price) }}
+              <span class="budget-unit-hint">{{ transportUnitHint }}</span>
+            </div>
+            <div v-if="isFiniteMoney(tripPlan.budget.intercity_transportation)">
+              城际交通总额 {{ formatBudgetAmount(tripPlan.budget.intercity_transportation) }}
+              （服务端已按人数聚合，前端不再乘人数）
+            </div>
+            <div v-if="isFiniteMoney(tripPlan.budget.local_transportation)">
+              市内交通 {{ formatBudgetAmount(tripPlan.budget.local_transportation) }}
+            </div>
+            <div v-if="tripPlan.budget.hotel_reference" class="budget-reference">
+              酒店参考：{{ tripPlan.budget.hotel_reference }}
+            </div>
+            <div v-if="tripPlan.budget.transport_reference" class="budget-reference">
+              交通参考：{{ tripPlan.budget.transport_reference }}
+            </div>
+          </div>
+          <ul v-if="tripPlan.budget.budget_notes?.length" class="budget-notes">
+            <li v-for="(note, idx) in tripPlan.budget.budget_notes" :key="idx">{{ note }}</li>
+          </ul>
+          <p class="budget-disclaimer">
+            金额为服务端规划结果中的估算或参考价，不是实时票价，也不表示已支付/已预订。
+          </p>
+        </a-card>
+
         <a-card id="weather" title="天气信息" style="margin-top: 20px" :bordered="false">
+          <p class="weather-source-note">{{ weatherCoverageSummary }}</p>
+          <p class="weather-source-note secondary">
+            来源：服务端行程天气字段（非浏览器实时雷达；缺失日期显示「暂无预报」，不默认晴天）
+          </p>
           <a-list
-            v-if="tripPlan.weather_info && tripPlan.weather_info.length > 0"
-            :data-source="tripPlan.weather_info"
+            v-if="displayWeatherDays.length > 0"
+            :data-source="displayWeatherDays"
             :grid="{ gutter: 16, xs: 1, sm: 2, md: 3, lg: 3, xl: 3 }"
           >
             <template #renderItem="{ item }">
               <a-list-item>
-                <a-card size="small" class="weather-card">
+                <a-card size="small" class="weather-card" :class="{ 'weather-missing': item.missing }">
                   <div class="weather-date">{{ item.date }}</div>
-                  <div class="weather-info-row">
-                    <span class="weather-icon">☀️</span>
-                    <div>
-                      <div class="weather-label">白天</div>
-                      <div class="weather-value">{{ item.day_weather }} {{ item.day_temp }}°C</div>
+                  <template v-if="!item.missing">
+                    <div class="weather-info-row">
+                      <span class="weather-icon" aria-hidden="true">🌤️</span>
+                      <div>
+                        <div class="weather-label">白天</div>
+                        <div class="weather-value">{{ item.day_weather }} {{ item.day_temp }}°C</div>
+                      </div>
                     </div>
-                  </div>
-                  <div class="weather-info-row">
-                    <span class="weather-icon">🌙</span>
-                    <div>
-                      <div class="weather-label">夜间</div>
-                      <div class="weather-value">{{ item.night_weather }} {{ item.night_temp }}°C</div>
+                    <div class="weather-info-row">
+                      <span class="weather-icon" aria-hidden="true">🌙</span>
+                      <div>
+                        <div class="weather-label">夜间</div>
+                        <div class="weather-value">{{ item.night_weather }} {{ item.night_temp }}°C</div>
+                      </div>
                     </div>
-                  </div>
-                  <div class="weather-wind">
-                    💨 {{ item.wind_direction }} {{ item.wind_power }}
+                    <div class="weather-wind">
+                      {{ item.wind_direction }} {{ item.wind_power }}
+                    </div>
+                  </template>
+                  <div v-else class="weather-missing-body">
+                    暂无预报
                   </div>
                 </a-card>
               </a-list-item>
@@ -395,21 +606,31 @@
           :bordered="false"
           class="web-guide-card"
         >
+          <a-alert
+            type="info"
+            show-icon
+            message="攻略为背景建议，不是景点地图验证结果"
+            description="以下内容来自联网攻略补充，仅供参考；不得视为 POI 已验证、实时票价或官方认证。"
+            style="margin-bottom: 12px"
+          />
           <div class="web-guide-content" v-html="renderedWebGuide"></div>
         </a-card>
 
         <a-card
           id="web-meta"
-          v-if="normalizedWebReferences.length"
-          title="🔎 资料来源"
+          v-if="safeWebReferences.length"
+          title="🔎 资料来源（攻略参考）"
           :bordered="false"
           class="web-meta-card"
         >
+          <p class="reference-disclaimer">
+            以下链接为攻略/资料来源，不表示对应景点已通过地图 POI 验证。
+          </p>
           <div class="reference-list">
             <a
-              v-for="reference in normalizedWebReferences"
+              v-for="reference in safeWebReferences"
               :key="reference.url || reference.title"
-              :href="reference.url || undefined"
+              :href="reference.url"
               target="_blank"
               rel="noopener noreferrer"
               class="reference-item"
@@ -506,6 +727,34 @@ import {
   type CacheRetentionMinutes
 } from '@/services/tripCache'
 import type { Attraction, TripPlan } from '@/types'
+import {
+  asStrictBool,
+  budgetSourceTrust,
+  canPersistPlan,
+  deriveTrustStatus,
+  escapeHtml,
+  formatMoneyCNY,
+  generationModeHint,
+  generationModeLabel,
+  groupQualityIssues,
+  hotelUnitPriceHint,
+  isFiniteMoney,
+  isUsableWeatherDescription,
+  normalizeDateKey,
+  normalizeGenerationMode,
+  normalizeQualityIssues,
+  poiCoordinateTrustLabel,
+  renderSafeGuideMarkdown,
+  routeTrustLabel,
+  safeHttpUrl,
+  transportUnitPriceHint,
+  trustStatusDescription,
+  trustStatusLabel,
+  trustStatusTone,
+  weatherCoverageNote,
+  type DerivedTrustStatus,
+  type DisplayQualityIssue
+} from '@/utils/tripTrust'
 
 const route = useRoute()
 const router = useRouter()
@@ -540,54 +789,96 @@ const mapSummaryAttractions = computed(() => {
     )
     .slice(0, 8)
 })
-const normalizedWebReferences = computed(() => tripPlan.value?.web_references ?? [])
-const qualityIssuesList = computed(() => {
+// Only structured quality.issues here — agent_audit stays in its own card.
+const qualityIssuesList = computed((): DisplayQualityIssue[] => {
   if (!tripPlan.value) return []
-  const items: Array<{ code?: string; severity?: string; message: string; suggestion?: string }> = []
-  if (tripPlan.value.quality && Array.isArray(tripPlan.value.quality.issues)) {
-    for (const issue of tripPlan.value.quality.issues) {
-      if (issue && issue.message) {
-        items.push({
-          code: issue.code || '',
-          severity: issue.severity || 'warning',
-          message: issue.message,
-          suggestion: issue.suggestion || ''
-        })
-      }
-    }
+  return normalizeQualityIssues(tripPlan.value.quality?.issues)
+})
+
+const groupedQualityIssues = computed(() => groupQualityIssues(qualityIssuesList.value))
+const blockingIssues = computed(() => groupedQualityIssues.value.blocking)
+const advisoryIssues = computed(() => groupedQualityIssues.value.advisory)
+const infoIssues = computed(() => groupedQualityIssues.value.info)
+
+const PREVIEW_PER_GROUP = 3
+const visibleBlockingIssues = computed(() =>
+  isQualityExpanded.value ? blockingIssues.value : blockingIssues.value.slice(0, PREVIEW_PER_GROUP)
+)
+const visibleAdvisoryIssues = computed(() =>
+  isQualityExpanded.value ? advisoryIssues.value : advisoryIssues.value.slice(0, PREVIEW_PER_GROUP)
+)
+const visibleInfoIssues = computed(() =>
+  isQualityExpanded.value ? infoIssues.value : infoIssues.value.slice(0, PREVIEW_PER_GROUP)
+)
+
+const trustStatus = computed((): DerivedTrustStatus => deriveTrustStatus(tripPlan.value?.quality))
+const trustTone = computed(() => trustStatusTone(trustStatus.value))
+const trustTitle = computed(() => trustStatusLabel(trustStatus.value))
+const trustDescription = computed(() => trustStatusDescription(trustStatus.value))
+const trustBadge = computed(() => {
+  switch (trustStatus.value) {
+    case 'blocked':
+      return 'BLOCKED'
+    case 'needs_review':
+      return 'NEEDS REVIEW'
+    case 'passed':
+      return 'PASSED'
+    default:
+      return 'UNKNOWN'
   }
-  if (tripPlan.value.agent_audit && Array.isArray(tripPlan.value.agent_audit.issues)) {
-    for (const issueText of tripPlan.value.agent_audit.issues) {
-      if (typeof issueText === 'string' && issueText.trim()) {
-        if (!items.some(i => i.message === issueText.trim())) {
-          items.push({
-            code: 'WEB_AUDIT_ITEM',
-            severity: 'warning',
-            message: issueText.trim(),
-            suggestion: '出发前请参考官网或官方渠道确认'
-          })
-        }
-      }
-    }
+})
+const isPlanBlocked = computed(() => trustStatus.value === 'blocked')
+/** History-oriented edit/save: blocked and unknown cannot enter save path. */
+const canEditForHistory = computed(() => canPersistPlan(tripPlan.value?.quality))
+const editDisabledReason = computed(() => {
+  if (trustStatus.value === 'blocked') {
+    return '存在阻止使用的问题，无法编辑保存到历史记录'
   }
-  return items
+  if (trustStatus.value === 'unknown') {
+    return '缺少服务端质量结果，无法编辑保存到历史记录'
+  }
+  return '当前无法保存到历史记录'
 })
-const visibleQualityIssues = computed(() => {
-  if (isQualityExpanded.value) return qualityIssuesList.value
-  return qualityIssuesList.value.slice(0, 3)
+const qualityEmptyStateText = computed(() => {
+  switch (trustStatus.value) {
+    case 'blocked':
+      return '当前方案不可保存/发送。结构化问题列表为空或已被安全过滤，仍请以顶部质量状态为准，并返回首页重新生成。'
+    case 'unknown':
+      return '未获得服务端结构化质量结果（可能是浏览器缓存草稿）。请勿当作已通过检查的正式方案；无法写入历史记录。'
+    case 'needs_review':
+      return '未列出额外结构化问题，但方案仍标记为需核对（例如评分、修复路径或生成模式）。票务与天气仍以出发前官方信息为准。'
+    case 'passed':
+      return '当前未列出结构化问题。票务、开放状态与实时天气仍以出发前官方信息为准。'
+    default:
+      return '质量状态未知。'
+  }
 })
-const advisoryStatusText = computed(() => {
-  if (tripPlan.value?.quality?.status === 'passed') return '已通过事实核对'
-  if (tripPlan.value?.agent_audit?.audit_level === 'offline_fallback') return '动态数据未复核'
-  return '建议确认'
+const qualityTagColor = computed(() => {
+  if (trustStatus.value === 'blocked') return 'red'
+  if (trustStatus.value === 'needs_review') return 'orange'
+  if (trustStatus.value === 'passed') return 'green'
+  return 'default'
 })
-const advisoryTagColor = computed(() => {
-  if (tripPlan.value?.quality?.status === 'passed') return 'green'
-  return 'orange'
+
+const generationMode = computed(() => normalizeGenerationMode(tripPlan.value?.generation_mode))
+const generationModeTag = computed(() => {
+  if (!tripPlan.value) return ''
+  if (generationMode.value === 'primary') return ''
+  return generationModeLabel(generationMode.value)
 })
+const generationModeHintText = computed(() => generationModeHint(generationMode.value))
+const verifiedFactsText = computed(() => {
+  const n = tripPlan.value?.quality?.verified_facts
+  if (typeof n === 'number' && Number.isFinite(n) && n >= 0) {
+    return `已核对事实 ${n}`
+  }
+  return ''
+})
+
 function toggleQualityExpand() {
   isQualityExpanded.value = !isQualityExpanded.value
 }
+
 const displayWebGuide = computed(() => {
   const text = tripPlan.value?.web_guide?.trim() ?? ''
   return text
@@ -595,15 +886,130 @@ const displayWebGuide = computed(() => {
     .replace(/\n+#{0,6}\s*审核检查[:：]?[\s\S]*$/u, '')
     .trim()
 })
-const renderedWebGuide = computed(() => renderMarkdown(displayWebGuide.value))
+const renderedWebGuide = computed(() => renderSafeGuideMarkdown(displayWebGuide.value))
+
+const safeWebReferences = computed(() => {
+  const refs = tripPlan.value?.web_references ?? []
+  return refs
+    .map((ref) => {
+      const url = safeHttpUrl(ref?.url)
+      if (!url) return null
+      return {
+        title: String(ref?.title || '').trim(),
+        site_name: String(ref?.site_name || '').trim(),
+        url,
+      }
+    })
+    .filter((x): x is { title: string; site_name: string; url: string } => x != null)
+})
+
+const budgetSourceMeta = computed(() => budgetSourceTrust(tripPlan.value?.budget?.budget_source))
+const hotelUnitHint = computed(() =>
+  hotelUnitPriceHint(
+    tripPlan.value?.budget?.hotel_nights ?? 0,
+    tripPlan.value?.budget?.hotel_rooms ?? 1,
+  )
+)
+const transportUnitHint = computed(() => transportUnitPriceHint())
+
+const formatBudgetAmount = (value: unknown) => formatMoneyCNY(value, '待确认')
+
 const totalBudgetText = computed(() => {
   const total = tripPlan.value?.budget?.total
-  return typeof total === 'number' ? `¥${total}` : '待估算'
+  return isFiniteMoney(total) ? formatMoneyCNY(total) : '待确认'
 })
+
+const tripDateList = computed(() => {
+  if (!tripPlan.value) return [] as string[]
+  const fromDays = (tripPlan.value.days ?? [])
+    .map((d) => normalizeDateKey(d.date))
+    .filter(Boolean)
+  if (fromDays.length) return fromDays
+  // Fall back to start/end only when day list empty — no string date guessing beyond given fields.
+  const start = normalizeDateKey(tripPlan.value.start_date)
+  const end = normalizeDateKey(tripPlan.value.end_date)
+  if (start && end && start === end) return [start]
+  if (start) return [start]
+  return []
+})
+
+const weatherByDate = computed(() => {
+  const map = new Map<string, NonNullable<TripPlan['weather_info']>[number]>()
+  for (const w of tripPlan.value?.weather_info ?? []) {
+    const d = normalizeDateKey(w?.date)
+    if (d) map.set(d, w)
+  }
+  return map
+})
+
+const displayWeatherDays = computed(() => {
+  const dates = tripDateList.value
+  if (!dates.length) {
+    // No structured trip dates: show raw server weather without inventing sunny defaults.
+    return (tripPlan.value?.weather_info ?? []).map((w) => {
+      const usable = isUsableWeatherDescription(w.day_weather, w.night_weather)
+      return {
+        date: normalizeDateKey(w.date) || w.date,
+        day_weather: w.day_weather,
+        night_weather: w.night_weather,
+        day_temp: w.day_temp,
+        night_temp: w.night_temp,
+        wind_direction: w.wind_direction,
+        wind_power: w.wind_power,
+        missing: !usable,
+      }
+    })
+  }
+  return dates.map((date) => {
+    const w = weatherByDate.value.get(date)
+    if (!w || !isUsableWeatherDescription(w.day_weather, w.night_weather)) {
+      return {
+        date,
+        day_weather: '',
+        night_weather: '',
+        day_temp: '',
+        night_temp: '',
+        wind_direction: '',
+        wind_power: '',
+        missing: true,
+      }
+    }
+    return {
+      date,
+      day_weather: w.day_weather,
+      night_weather: w.night_weather,
+      day_temp: w.day_temp,
+      night_temp: w.night_temp,
+      wind_direction: w.wind_direction,
+      wind_power: w.wind_power,
+      missing: false,
+    }
+  })
+})
+
+const weatherCoverageSummary = computed(() => {
+  const weatherDates = (tripPlan.value?.weather_info ?? [])
+    .filter((w) => isUsableWeatherDescription(w.day_weather, w.night_weather))
+    .map((w) => normalizeDateKey(w.date))
+    .filter(Boolean)
+  return weatherCoverageNote(tripDateList.value, weatherDates).summary
+})
+
 const weatherReviewText = computed(() => {
   if (!tripPlan.value) return '暂未获取到可展示的天气信息。'
-  return `${tripPlan.value.city}${tripPlan.value.start_date} 至 ${tripPlan.value.end_date} 的逐日天气暂未获取到可靠预报。当前天气源可能只覆盖近期预报，请在出发前3-7天复核每日天气、温差和降雨。`
+  return `${tripPlan.value.city} ${tripPlan.value.start_date} 至 ${tripPlan.value.end_date} 的逐日天气暂未获取到可靠预报。请在出发前 3–7 天复核每日天气、温差和降雨。`
 })
+
+const poiTrustLabel = (source?: string) => poiCoordinateTrustLabel(source).label
+const poiTrustTagColor = (source?: string) => {
+  const tone = poiCoordinateTrustLabel(source).tone
+  if (tone === 'success') return 'green'
+  if (tone === 'warning') return 'orange'
+  return 'default'
+}
+const routeTrustText = (route: { verified?: boolean; source?: string }) => routeTrustLabel(route).label
+const routeShowMetrics = (route: { verified?: boolean; source?: string; distance?: number; duration?: number }) =>
+  routeTrustLabel(route).showMetrics
 const auditAlertType = computed(() => {
   const status = tripPlan.value?.agent_audit?.status
   if (status === 'passed') return 'success'
@@ -616,109 +1022,6 @@ const auditStatusText = computed(() => {
   if (status === 'failed') return '审核未通过'
   return '需要复核'
 })
-
-const escapeHtml = (value: string): string => {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
-const renderInlineMarkdown = (value: string): string => {
-  return escapeHtml(value)
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(
-      /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
-    )
-}
-
-const isGuideHeading = (line: string, lineIndex: number): boolean => {
-  if (lineIndex === 0 && line.length <= 24) {
-    return true
-  }
-  if (!/[：:]$/.test(line)) {
-    return false
-  }
-  return line.length <= 18 && !/[。；;，,]/.test(line)
-}
-
-const renderMarkdown = (source: string): string => {
-  const lines = source.replace(/\r\n/g, '\n').split('\n')
-  const html: string[] = []
-  let paragraph: string[] = []
-  let listType: 'ol' | 'ul' | null = null
-
-  const closeParagraph = () => {
-    if (!paragraph.length) return
-    html.push(`<p>${paragraph.map(renderInlineMarkdown).join('<br>')}</p>`)
-    paragraph = []
-  }
-
-  const closeList = () => {
-    if (!listType) return
-    html.push(`</${listType}>`)
-    listType = null
-  }
-
-  const openList = (type: 'ol' | 'ul') => {
-    if (listType === type) return
-    closeList()
-    html.push(`<${type}>`)
-    listType = type
-  }
-
-  lines.forEach((rawLine, index) => {
-    const line = rawLine.trim()
-    if (!line) {
-      closeParagraph()
-      closeList()
-      return
-    }
-
-    const markdownHeading = line.match(/^(#{1,4})\s+(.+)$/)
-    if (markdownHeading) {
-      closeParagraph()
-      closeList()
-      const level = Math.min(Math.max(markdownHeading[1].length, 2), 4)
-      html.push(`<h${level}>${renderInlineMarkdown(markdownHeading[2].trim())}</h${level}>`)
-      return
-    }
-
-    const ordered = line.match(/^\d+[.)]\s+(.+)$/)
-    if (ordered) {
-      closeParagraph()
-      openList('ol')
-      html.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`)
-      return
-    }
-
-    const unordered = line.match(/^[-*]\s+(.+)$/)
-    if (unordered) {
-      closeParagraph()
-      openList('ul')
-      html.push(`<li>${renderInlineMarkdown(unordered[1])}</li>`)
-      return
-    }
-
-    if (isGuideHeading(line, index)) {
-      closeParagraph()
-      closeList()
-      html.push(`<h3>${renderInlineMarkdown(line.replace(/[：:]$/, ''))}</h3>`)
-      return
-    }
-
-    closeList()
-    paragraph.push(line)
-  })
-
-  closeParagraph()
-  closeList()
-  return html.join('')
-}
 
 const normalizeTripPlan = (raw: any): TripPlan | null => {
   if (!raw || typeof raw !== 'object') {
@@ -750,14 +1053,26 @@ const normalizeTripPlan = (raw: any): TripPlan | null => {
       }
     : undefined
 
+  const quality = raw.quality && typeof raw.quality === 'object'
+    ? {
+        ...raw.quality,
+        publishable: asStrictBool(raw.quality.publishable),
+        review_required: asStrictBool(raw.quality.review_required),
+        issues: Array.isArray(raw.quality.issues) ? raw.quality.issues : [],
+        checked_items: Array.isArray(raw.quality.checked_items) ? raw.quality.checked_items : [],
+      }
+    : undefined
+
   return {
     ...raw,
+    generation_mode: normalizeGenerationMode(raw.generation_mode),
     days,
     weather_info: Array.isArray(raw.weather_info) ? raw.weather_info : [],
     budget,
     web_guide: typeof raw.web_guide === 'string' ? raw.web_guide : null,
     web_references: Array.isArray(raw.web_references) ? raw.web_references : [],
     agent_audit: agentAudit,
+    quality,
     map_context: Array.isArray(raw.map_context) ? raw.map_context : []
   } as TripPlan
 }
@@ -775,7 +1090,8 @@ const activatePlan = async (raw: unknown, planNo?: string | null) => {
       tripPlan.value.map_context = mapContext
       saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
       saveTripSession(tripPlan.value)
-      if (currentPlanNo.value) {
+      // Never auto-persist map context for non-publishable / blocked plans.
+      if (currentPlanNo.value && canPersistPlan(tripPlan.value.quality)) {
         updateTripPlan(currentPlanNo.value, tripPlan.value).catch(error => {
           console.warn('[result] map context persistence skipped:', error)
         })
@@ -858,28 +1174,71 @@ const scrollToSection = ({ key }: { key: string }) => {
 
 // 切换编辑模式
 const toggleEditMode = () => {
+  if (!canEditForHistory.value) {
+    message.error(editDisabledReason.value + '。请返回首页重新生成。')
+    return
+  }
   editMode.value = true
   // 保存原始数据用于取消编辑
   originalPlan.value = JSON.parse(JSON.stringify(tripPlan.value))
   message.info('进入编辑模式')
 }
 
-// 保存修改
+const isSavingChanges = ref(false)
+
+// 保存修改 — 与后端门禁对齐：blocked 不可持久化；needs_review 需确认
 const saveChanges = async () => {
-  editMode.value = false
-  if (tripPlan.value) {
-    saveTripSession(tripPlan.value)
-    saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
-    if (currentPlanNo.value) {
-      try {
-        await updateTripPlan(currentPlanNo.value, tripPlan.value)
-        message.success('修改已保存到历史记录')
-      } catch (error: any) {
-        message.warning(`修改已保存在本地草稿，但同步历史记录失败：${error.message}`)
-      }
+  if (!tripPlan.value || isSavingChanges.value) return
+
+  // Handler-level gate (not CSS-only). Re-read quality from live plan (not a cached flag).
+  if (!canPersistPlan(tripPlan.value.quality)) {
+    if (trustStatus.value === 'unknown') {
+      message.error('缺少服务端质量结果，无法将草稿保存为历史记录。请返回首页重新生成行程。')
     } else {
-      message.success('修改已保存到本地草稿')
+      message.error('当前方案存在阻止使用的问题，无法保存到历史记录或作为可出发方案。')
     }
+    editMode.value = false
+    return
+  }
+
+  if (trustStatus.value === 'needs_review') {
+    const ok = window.confirm(
+      '该方案仍有待核对事项。确认你已查看质量提示，并仍要保存修改？',
+    )
+    if (!ok) return
+  }
+
+  isSavingChanges.value = true
+  editMode.value = false
+  // Local draft keeps viewing recovery; server history requires publishable quality.
+  saveTripSession(tripPlan.value)
+  saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
+  if (currentPlanNo.value) {
+    try {
+      // Re-check immediately before network write (quality may have been mutated in memory).
+      if (!canPersistPlan(tripPlan.value.quality)) {
+        message.error('质量状态已变更，已取消写入历史记录。')
+        return
+      }
+      await updateTripPlan(currentPlanNo.value, tripPlan.value)
+      message.success(
+        trustStatus.value === 'needs_review'
+          ? '修改已保存到历史记录（仍含待核对事项）'
+          : '修改已保存到历史记录',
+      )
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail
+      const serverMsg =
+        typeof detail === 'string'
+          ? detail
+          : detail?.message || error?.message || '同步失败'
+      message.warning(`修改已保存在本地草稿，但同步历史记录失败：${serverMsg}`)
+    } finally {
+      isSavingChanges.value = false
+    }
+  } else {
+    isSavingChanges.value = false
+    message.success('修改已保存到本地草稿')
   }
 
   // 重新初始化地图以反映更改
@@ -1042,17 +1401,21 @@ const waitForExportImages = async (root: HTMLElement) => {
 const buildExportSummary = () => {
   const summary = document.createElement('section')
   summary.className = 'export-summary pdf-break-unit'
+  const trustLine = escapeHtml(`${trustTitle.value}（${trustBadge.value}）`)
+  const trustNote = escapeHtml(trustDescription.value)
   summary.innerHTML = `
     <div class="export-summary__kicker">LINGTU TRIP DOSSIER</div>
     <div class="export-summary__headline">
       <div>
-        <h1>${tripPlan.value?.city || '旅行计划'}</h1>
-        <p>${tripPlan.value?.start_date || ''} 至 ${tripPlan.value?.end_date || ''}</p>
+        <h1>${escapeHtml(tripPlan.value?.city || '旅行计划')}</h1>
+        <p>${escapeHtml(tripPlan.value?.start_date || '')} 至 ${escapeHtml(tripPlan.value?.end_date || '')}</p>
+        <p class="export-summary__trust"><strong>方案质量：</strong>${trustLine}</p>
+        <p class="export-summary__trust-note">${trustNote}</p>
       </div>
       <div class="export-summary__metrics">
         <div><span>天数</span><strong>${totalDays.value}</strong></div>
         <div><span>景点</span><strong>${totalAttractions.value}</strong></div>
-        <div><span>预算</span><strong>${totalBudgetText.value}</strong></div>
+        <div><span>预算</span><strong>${escapeHtml(totalBudgetText.value)}</strong></div>
       </div>
     </div>
   `
@@ -2705,17 +3068,142 @@ const drawRoutes = (AMap: any) => {
     gap: 10px;
   }
 }
+.trust-status-banner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px 24px;
+  margin: 0 0 16px;
+  padding: 16px 18px;
+  border-radius: 12px;
+  border: 1px solid #d9d9d9;
+  background: #fafafa;
+}
+.trust-status-banner.tone-danger {
+  border-color: #ffa39e;
+  background: #fff2f0;
+}
+.trust-status-banner.tone-warning {
+  border-color: #ffd591;
+  background: #fffbe6;
+}
+.trust-status-banner.tone-success {
+  border-color: #b7eb8f;
+  background: #f6ffed;
+}
+.trust-status-banner.tone-neutral {
+  border-color: #d9d9d9;
+  background: #fafafa;
+}
+.trust-status-kicker {
+  display: block;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: #8c8c8c;
+  margin-bottom: 4px;
+}
+.trust-status-title {
+  margin: 0 0 8px;
+  font-size: 20px;
+  line-height: 1.3;
+  color: #141414;
+}
+.trust-status-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.trust-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+.trust-tag.tone-danger {
+  color: #a8071a;
+  background: #fff1f0;
+  border-color: #ffa39e;
+}
+.trust-tag.tone-warning {
+  color: #ad4e00;
+  background: #fff7e6;
+  border-color: #ffd591;
+}
+.trust-tag.tone-success {
+  color: #237804;
+  background: #f6ffed;
+  border-color: #b7eb8f;
+}
+.trust-tag.tone-neutral {
+  color: #595959;
+  background: #f5f5f5;
+  border-color: #d9d9d9;
+}
+.trust-status-desc,
+.trust-status-mode-hint,
+.trust-status-action-hint {
+  margin: 0 0 6px;
+  color: #434343;
+  font-size: 14px;
+  line-height: 1.55;
+}
+.trust-status-action-hint {
+  font-weight: 500;
+}
+.trust-status-side {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(64px, 1fr));
+  gap: 8px;
+  align-content: start;
+}
+.trust-stat {
+  min-width: 72px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  text-align: center;
+}
+.trust-stat span {
+  display: block;
+  font-size: 12px;
+  color: #8c8c8c;
+}
+.trust-stat strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 18px;
+  color: #141414;
+}
+
 .quality-advisory-card {
   margin-bottom: 16px;
   border-radius: 8px;
   background: #fffbe6;
   border: 1px solid #ffe58f;
 }
+.quality-advisory-card.quality-tone-danger {
+  background: #fff2f0;
+  border-color: #ffa39e;
+}
+.quality-advisory-card.quality-tone-success {
+  background: #f6ffed;
+  border-color: #b7eb8f;
+}
+.quality-advisory-card.quality-tone-neutral {
+  background: #fafafa;
+  border-color: #d9d9d9;
+}
 .quality-advisory-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .quality-advisory-title {
   display: flex;
@@ -2723,7 +3211,8 @@ const drawRoutes = (AMap: any) => {
   gap: 8px;
   font-size: 16px;
   font-weight: 600;
-  color: #d46b08;
+  color: #262626;
+  flex-wrap: wrap;
 }
 .advisory-status-tag {
   font-weight: normal;
@@ -2733,19 +3222,38 @@ const drawRoutes = (AMap: any) => {
   color: #8c8c8c;
   font-weight: normal;
 }
+.quality-empty-ok {
+  color: #595959;
+  font-size: 14px;
+  line-height: 1.5;
+}
 .quality-advisory-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
+}
+.quality-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #595959;
+  margin-bottom: 8px;
 }
 .quality-issue-item {
   padding: 10px 12px;
   background: #ffffff;
   border-radius: 6px;
   border-left: 4px solid #fa8c16;
+  margin-bottom: 8px;
+}
+.quality-issue-item.blocking {
+  border-left-color: #f5222d;
+  background: #fff7f6;
 }
 .quality-issue-item.info {
   border-left-color: #1890ff;
+}
+.quality-issue-item.warning {
+  border-left-color: #fa8c16;
 }
 .issue-main {
   display: flex;
@@ -2763,11 +3271,98 @@ const drawRoutes = (AMap: any) => {
 .issue-code {
   font-size: 12px;
   color: #8c8c8c;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .issue-suggestion {
   margin-top: 4px;
   font-size: 13px;
   color: #595959;
   padding-left: 4px;
+}
+.poi-trust-tag {
+  margin-top: 6px;
+}
+.route-meta-pending {
+  color: #8c8c8c;
+  font-size: 13px;
+}
+.budget-source-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: #595959;
+  font-size: 13px;
+}
+.budget-unit-hint,
+.budget-disclaimer,
+.weather-source-note,
+.reference-disclaimer {
+  color: #8c8c8c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.weather-source-note {
+  margin: 0 0 6px;
+  color: #595959;
+  font-size: 13px;
+}
+.weather-source-note.secondary {
+  margin-bottom: 12px;
+  color: #8c8c8c;
+  font-size: 12px;
+}
+.weather-missing {
+  border-style: dashed;
+}
+.weather-missing-body {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  color: #8c8c8c;
+  font-size: 14px;
+}
+.budget-disclaimer {
+  margin-top: 10px;
+}
+.reference-disclaimer {
+  margin: 0 0 10px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 768px) {
+  .trust-status-banner {
+    grid-template-columns: 1fr;
+    padding: 14px;
+  }
+  .trust-status-title {
+    font-size: 18px;
+  }
+  .trust-status-side {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .quality-advisory-header {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 430px) {
+  .trust-stat strong {
+    font-size: 16px;
+  }
+  .trust-status-tags {
+    gap: 6px;
+  }
 }
 </style>
