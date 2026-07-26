@@ -192,7 +192,10 @@ class MultiAgentTripPlanner:
         - ``publishable`` → return plan as-is
         """
         from ..services.trip_generation_errors import TripPlanQualityRejectedError
-        from ..services.trip_plan_quality_service import get_trip_plan_quality_service
+        from ..services.trip_plan_quality_service import (
+            get_trip_plan_quality_service,
+            resolve_plan_quality_status,
+        )
 
         if plan.quality is None:
             plan.quality = get_trip_plan_quality_service().evaluate(request, plan)
@@ -200,21 +203,8 @@ class MultiAgentTripPlanner:
         if allow_unpublishable:
             return plan
 
-        quality_status = getattr(plan.quality, "quality_status", None)
-        # Backward-compatible fallback: if quality_status is not set,
-        # compute it from publishable + score + issues.
-        if not quality_status:
-            if bool(getattr(plan.quality, "publishable", False)):
-                quality_status = "publishable"
-            elif plan.quality is not None:
-                has_error = any(
-                    str(getattr(i, "severity", "")).strip().lower() == "error"
-                    for i in (getattr(plan.quality, "issues", None) or [])
-                )
-                quality_status = "blocked" if has_error else "needs_review"
-            else:
-                quality_status = "blocked"
-        if quality_status == "blocked":
+        # Same unified resolver as the HTTP layer — one gate, one decision.
+        if resolve_plan_quality_status(plan) == "blocked":
             raise TripPlanQualityRejectedError(quality=plan.quality, plan=plan)
         return plan
 

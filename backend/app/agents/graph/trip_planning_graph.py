@@ -23,7 +23,10 @@ from ...models.schemas import (
     TripRequest,
     VerificationMeta,
 )
-from ...services.trip_plan_quality_service import get_trip_plan_quality_service
+from ...services.trip_plan_quality_service import (
+    get_trip_plan_quality_service,
+    refresh_quality_gate,
+)
 from ...services.trip_generation_errors import TripGenerationCancelledError
 
 
@@ -158,10 +161,7 @@ class TripPlanningAgentGraph:
             return self._run_sequential(initial)
         try:
             result = self._compiled_graph.invoke(initial)
-            plan = result.get("trip_plan")
-            if isinstance(plan, TripPlan):
-                return plan
-            raise RuntimeError("trip graph returned no plan")
+            return self._select_final_plan(result)
         except TripGenerationCancelledError:
             raise
         except Exception as exc:
@@ -186,17 +186,50 @@ class TripPlanningAgentGraph:
             state.update(self._fallback_node(state))
         state.update(self._enrich_node(state))
         state.update(self._quality_node(state))
-        # Sequential quality repair loop (same logic as graph edges).
-        _state_for_loop = dict(state)
-        for _ in range(2):
-            route = self._after_quality(_state_for_loop)
-            if route == "end":
+        # Sequential quality repair loop (same routing as the graph edges).
+        for _ in range(self._MAX_QUALITY_REPAIRS):
+            if self._after_quality(state) == "end":
                 break
-            _state_for_loop.update(self._repair_quality_node(_state_for_loop))
-            _state_for_loop.update(self._refresh_enrichment_node(_state_for_loop))
-            _state_for_loop.update(self._quality_node(_state_for_loop))
-        state.update(_state_for_loop)
-        return state["trip_plan"]
+            state.update(self._repair_quality_node(state))
+            state.update(self._refresh_enrichment_node(state))
+            state.update(self._quality_node(state))
+        return self._select_final_plan(state)
+
+    @staticmethod
+    def _plan_rank(plan: Optional[TripPlan]) -> tuple[int, int, int]:
+        """Order plans by deliverability first, score second.
+
+        Score alone is not a total order over "goodness": a repair round can
+        raise the score while introducing a blocking issue, so ranking on the
+        number would let a rejected plan displace a deliverable one.
+        """
+        quality = getattr(plan, "quality", None) if plan is not None else None
+        if quality is None:
+            return (-1, -1, -1)
+        not_blocked = int(
+            str(getattr(quality, "quality_status", "blocked")) != "blocked"
+        )
+        no_errors = int(
+            not any(issue.severity == "error" for issue in quality.issues)
+        )
+        return (not_blocked, no_errors, int(quality.score))
+
+    @classmethod
+    def _select_final_plan(cls, state: TripPlanningState) -> TripPlan:
+        """Pick the final answer, restoring the best repair-round snapshot.
+
+        The repair loop can legitimately end on a plan that ranks lower than
+        an earlier round; in that case the tracked best snapshot (including
+        its own quality report) is returned instead.
+        """
+        plan = state.get("trip_plan")
+        best = state.get("best_trip_plan")
+        if isinstance(plan, TripPlan) and isinstance(best, TripPlan):
+            if cls._plan_rank(best) > cls._plan_rank(plan):
+                return best
+        if isinstance(plan, TripPlan):
+            return plan
+        raise RuntimeError("trip graph returned no plan")
 
     def _recover_from_checkpoint(self, initial: TripPlanningState) -> TripPlan:
         """Finish safely after a late LangGraph/framework failure.
@@ -219,7 +252,7 @@ class TripPlanningAgentGraph:
             and isinstance(plan, TripPlan)
             and isinstance(plan.quality, TripPlanQualityResult)
         ):
-            return plan
+            return self._select_final_plan(state)
 
         if not state.get("parsed") and state.get("model_ready"):
             state.update(self._parse_node(state))
@@ -236,7 +269,7 @@ class TripPlanningAgentGraph:
             state.update(self._enrich_node(state))
         if "quality" not in completed_stages:
             state.update(self._quality_node(state))
-        return state["trip_plan"]
+        return self._select_final_plan(state)
 
     def _discovery_node(self, state: TripPlanningState) -> dict:
         request = state["request"]
@@ -872,14 +905,13 @@ class TripPlanningAgentGraph:
                     plan.quality.readiness_score = max(
                         0, plan.quality.readiness_score - 6
                     )
-            plan.quality.publishable = (
-                plan.quality.publishable
-                and plan.quality.score >= 75
-                and not enrichment_errors
-                and not any(
-                    issue.severity == "error"
-                    for issue in plan.quality.issues
-                )
+            # Recompute the unified gate triple after the score/issue
+            # mutations above; partial enrichment demotes the plan without
+            # fabricating an error issue.
+            refresh_quality_gate(
+                plan.quality,
+                generation_mode=plan.generation_mode,
+                force_unpublishable=bool(enrichment_errors),
             )
             blocking_codes = sorted(
                 issue.code for issue in plan.quality.issues
@@ -925,7 +957,19 @@ class TripPlanningAgentGraph:
                 "generation_mode": plan.generation_mode,
             },
         )
-        return self._record_result(state, "quality", {"trip_plan": plan})
+        updates: dict[str, Any] = {"trip_plan": plan}
+        # Track the best plan across repair rounds via the node return value
+        # (edge predicates cannot persist state), so the loop can never end on
+        # a worse plan than an earlier round. Ranked by deliverability first:
+        # a blocked round must never displace a deliverable snapshot, however
+        # much its raw score improved.
+        best_plan = state.get("best_trip_plan")
+        if not isinstance(best_plan, TripPlan) or self._plan_rank(
+            plan
+        ) > self._plan_rank(best_plan):
+            updates["best_quality_score"] = plan.quality.score if plan.quality else 0
+            updates["best_trip_plan"] = plan.model_copy(deep=True)
+        return self._record_result(state, "quality", updates)
 
     # ── quality repair loop ────────────────────────────────────────────
 
@@ -938,8 +982,17 @@ class TripPlanningAgentGraph:
         "ATTRACTION_TYPE_CONCENTRATION",
     })
 
+    # Hard bound for quality-repair rounds, shared by the LangGraph edge
+    # predicate and the sequential fallback loop.
+    _MAX_QUALITY_REPAIRS: int = 2
+
     def _after_quality(self, state: TripPlanningState) -> str:
-        """Route: repair if score < 75 with no blocking issues, else end."""
+        """Route: repair if score < 75 with no blocking issues, else end.
+
+        This is a conditional-edge predicate: it must stay read-only.
+        LangGraph never merges ``state[...] = ...`` writes made here back
+        into the graph channels, so any tracking belongs in node returns.
+        """
         plan = state.get("trip_plan")
         quality = getattr(plan, "quality", None) if isinstance(plan, TripPlan) else None
         if quality is None:
@@ -947,7 +1000,7 @@ class TripPlanningAgentGraph:
 
         quality_status = getattr(quality, "quality_status", "blocked")
         repair_count = int(state.get("repair_count", 0))
-        max_repairs = 2
+        max_repairs = self._MAX_QUALITY_REPAIRS
 
         if quality_status != "needs_review":
             logger.info(
@@ -964,13 +1017,6 @@ class TripPlanningAgentGraph:
                 max_repairs, quality.score,
             )
             return "end"
-
-        # Track best result across rounds.
-        best_score = int(state.get("best_quality_score", 0))
-        best_plan = state.get("best_trip_plan")
-        if quality.score > best_score or best_plan is None:
-            state["best_quality_score"] = quality.score
-            state["best_trip_plan"] = plan.model_copy(deep=True)
 
         repairable = [
             i for i in quality.issues
@@ -993,12 +1039,17 @@ class TripPlanningAgentGraph:
         return "repair_quality"
 
     def _repair_quality_node(self, state: TripPlanningState) -> dict:
-        """Deterministic quality repair — no LLM calls."""
+        """Deterministic quality repair — no LLM calls.
+
+        All loop-tracking state (``repair_count``, ``repaired_issue_codes``,
+        ``dirty_enrichments``) is communicated exclusively through the
+        returned update dict so it merges into the LangGraph channels.
+        """
         self._check_cancelled(state)
         plan = state["trip_plan"]
         quality = plan.quality
         repair_count = int(state.get("repair_count", 0))
-        repaired = state.get("repaired_issue_codes") or set()
+        repaired = set(state.get("repaired_issue_codes") or ())
         dirty: set[str] = set()
         actions: list[str] = []
 
@@ -1056,8 +1107,7 @@ class TripPlanningAgentGraph:
                 "[trip_graph] repair: no action taken — "
                 "all repairable issues already attempted"
             )
-            state["repair_count"] = repair_count + 1
-            return {"trip_plan": plan}
+            return {"trip_plan": plan, "repair_count": repair_count + 1}
 
         for code in {i.code for i in quality.issues
                      if i.code in self._REPAIRABLE_ISSUES}:
@@ -1068,15 +1118,16 @@ class TripPlanningAgentGraph:
         # Web guide consistency may be affected by attraction changes.
         dirty.add("web_guide")
 
-        state["trip_plan"] = plan
-        state["repair_count"] = repair_count + 1
-        state["repaired_issue_codes"] = repaired
-        state["dirty_enrichments"] = dirty
         logger.info(
             "[trip_graph] repair actions: %s, dirty=%s",
             "; ".join(actions), sorted(dirty),
         )
-        return {"trip_plan": plan, "dirty_enrichments": dirty}
+        return {
+            "trip_plan": plan,
+            "repair_count": repair_count + 1,
+            "repaired_issue_codes": repaired,
+            "dirty_enrichments": dirty,
+        }
 
     @staticmethod
     def _build_attraction_from_poi(poi: Any, visit_duration: int = 120) -> Attraction:
@@ -1194,8 +1245,17 @@ class TripPlanningAgentGraph:
         if len(matches) <= limit:
             return plan
 
-        # Drop the last (most recently assigned) excess item.
-        day, dropped = matches[-1]
+        # Drop the last excess item that is not the only thing on its day —
+        # emptying a day raises EMPTY_DAY, a blocking issue worse than the
+        # cap violation this repair is meant to relieve.
+        droppable = [
+            (day, attraction)
+            for day, attraction in matches
+            if len(day.attractions or []) > 1
+        ]
+        if not droppable:
+            return plan
+        day, dropped = droppable[-1]
         day.attractions = [a for a in (day.attractions or []) if a is not dropped]
         label = "博物馆" if code == "TOO_MANY_MUSEUMS" else "公园"
         actions.append(
@@ -1337,21 +1397,32 @@ class TripPlanningAgentGraph:
                 )
 
         # Budget changes when attractions or hotel change.
+        enrichment_errors = list(state.get("enrichment_errors") or [])
         if dirty.intersection({"routes", "budget", "hotel_distance"}):
+            # Keep the previous budget: BUDGET_MISSING is a blocking code, so
+            # clearing it and then failing would turn a transient estimator
+            # outage into a hard rejection of an otherwise deliverable plan.
+            before_stage = plan.model_copy(deep=True)
             plan.budget = None
             try:
                 candidate = self.planner._apply_budget_estimate(request, plan)
                 if isinstance(candidate, TripPlan):
                     plan = candidate
             except Exception as exc:
+                plan = before_stage
                 logger.info(
                     "[trip_graph] repair budget refresh failed: %s",
                     type(exc).__name__,
                 )
+                # Surface the degradation so the quality gate demotes the plan
+                # instead of silently publishing a stale budget.
+                enrichment_errors.append(f"budget:{type(exc).__name__}")
 
-        state["trip_plan"] = plan
-        state["dirty_enrichments"] = set()
-        return {"trip_plan": plan, "dirty_enrichments": set()}
+        return {
+            "trip_plan": plan,
+            "dirty_enrichments": set(),
+            "enrichment_errors": enrichment_errors,
+        }
 
     def _after_discovery(self, state: TripPlanningState) -> str:
         return "compose" if state.get("context_ready") else "fallback"

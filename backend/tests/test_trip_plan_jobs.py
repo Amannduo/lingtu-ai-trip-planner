@@ -135,8 +135,9 @@ def test_create_job_streams_progress_and_result(job_client, monkeypatch) -> None
     assert "event: result" in streamed.text
     assert "正在核验景点信息" in streamed.text
     save.assert_called_once()
+    # Email was not requested in the payload, but a saved plan must push.
     email.assert_not_called()
-    notify.assert_not_called()
+    notify.assert_called_once_with("user-jobs", "杭州", "P-JOB-1")
 
 
 def test_needs_review_plan_streams_result_without_auto_save(

@@ -566,6 +566,14 @@ class TripGenerationJobService:
             except TripPlanQualityRejectedError as exc:
                 payload = quality_rejection_event_payload(exc)
                 job.publish("error", **payload)
+            except TripGenerationCapacityError:
+                # Slot-level capacity pressure is retryable; reporting it as
+                # a generic generation failure would mislead the client.
+                job.publish(
+                    "error",
+                    message="当前规划任务较多，请稍后重试。",
+                    error_type="capacity_exhausted",
+                )
             except TripGenerationCancelledError as exc:
                 job.cancellation_token.cancel(exc.reason)
                 timed_out = exc.reason == "generation_timeout"

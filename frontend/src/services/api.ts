@@ -348,7 +348,20 @@ export async function generateTripPlanWithProgress(
       try {
         const event = JSON.parse((rawEvent as MessageEvent).data)
         cleanup()
-        reject(new Error(event.message || '旅行规划生成失败'))
+        // Keep the structured issues from the SSE error payload so the
+        // form can highlight concrete problems and suggestions, exactly
+        // like the sync path's 422 handling.
+        const parsed = parseApiErrorDetail(event)
+        const errorType = typeof event.error_type === 'string' ? event.error_type : ''
+        const status = errorType === 'quality_rejected'
+          ? 422
+          : errorType === 'generation_timeout'
+            ? 504
+            : undefined
+        reject(new ApiClientError(
+          parsed.message || event.message || '旅行规划生成失败',
+          { status, issues: parsed.issues }
+        ))
       } catch {
         failMalformedEvent()
       }

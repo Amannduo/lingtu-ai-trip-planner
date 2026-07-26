@@ -21,6 +21,28 @@ class TripPlanQualityService:
     """Validate facts and cross-field constraints before a plan is persisted."""
 
     FORECAST_WINDOW_DAYS = 16
+    # Issue codes that always block automatic persistence/delivery,
+    # regardless of the numeric score.
+    BLOCKING_CODES = frozenset({
+        "CITY_MISMATCH",
+        "SHORT_TRIP_DESTINATION_UNREACHABLE",
+        "PLAN_DATE_RANGE_MISMATCH",
+        "INVALID_DATE_RANGE",
+        "PAST_TRIP_DATE",
+        "DAY_COUNT_MISMATCH",
+        "DAY_DATE_MISMATCH",
+        "EMPTY_DAY",
+        "DAY_SCHEDULE_IMPOSSIBLE",
+        "BUDGET_MISSING",
+        "HOTEL_GAP",
+        "UNVERIFIED_HOTEL",
+        "HOTEL_REFERENCE_MISMATCH",
+        "HOTEL_PLAN_BUDGET_PRICE_MISMATCH",
+        "TRANSPORT_MODE_MISMATCH",
+        "TRANSPORT_REFERENCE_MISMATCH",
+        "POI_DESTINATION_MISMATCH",
+        "INVALID_COORDINATE",
+    })
     ISSUE_PENALTIES = {
         "FALLBACK_PLAN": 30,
         "MODEL_OUTPUT_REPAIRED": 8,
@@ -1296,53 +1318,21 @@ class TripPlanQualityService:
         elif plan.generation_mode == "repaired":
             score = min(score, 92)
         status = "failed" if error_count else "warning" if warning_count else "passed"
-        blocking_codes = {
-            "CITY_MISMATCH",
-            "SHORT_TRIP_DESTINATION_UNREACHABLE",
-            "PLAN_DATE_RANGE_MISMATCH",
-            "INVALID_DATE_RANGE",
-            "PAST_TRIP_DATE",
-            "DAY_COUNT_MISMATCH",
-            "DAY_DATE_MISMATCH",
-            "EMPTY_DAY",
-            "DAY_SCHEDULE_IMPOSSIBLE",
-            "BUDGET_MISSING",
-            "HOTEL_GAP",
-            "UNVERIFIED_HOTEL",
-            "HOTEL_REFERENCE_MISMATCH",
-            "HOTEL_PLAN_BUDGET_PRICE_MISMATCH",
-            "TRANSPORT_MODE_MISMATCH",
-            "TRANSPORT_REFERENCE_MISMATCH",
-            "POI_DESTINATION_MISMATCH",
-            "INVALID_COORDINATE",
-        }
-        has_blocking = (
-            error_count > 0
-            or plan.generation_mode == "map_fallback"
-            or any(issue.code in blocking_codes for issue in issues)
-        )
-        publishable = not has_blocking and score >= 75
-        # Unified quality_status: the single source of truth for gate decisions.
-        if has_blocking:
-            quality_status = "blocked"
-        elif score >= 75:
-            quality_status = "publishable"
-        else:
-            quality_status = "needs_review"
-        return TripPlanQualityResult(
+        result = TripPlanQualityResult(
             status=status,
             score=score,
             constraint_score=constraint_score,
             executability_score=executability_score,
             evidence_score=evidence_score,
             readiness_score=readiness_score,
-            publishable=publishable,
-            quality_status=quality_status,
             checked_items=list(self.CHECKED_ITEMS),
             issues=issues,
             verified_facts=verified_facts,
             generated_at=datetime.now().isoformat(timespec="seconds"),
         )
+        # Unified gate triple (publishable + quality_status): single source.
+        refresh_quality_gate(result, generation_mode=plan.generation_mode)
+        return result
 
     def _normalized_label(self, value: str) -> str:
         return re.sub(r"[\W_]+", "", value or "").casefold()
@@ -1479,7 +1469,9 @@ class TripPlanQualityService:
             }
         ]
         if pending_critical:
-            acknowledged = "[用户已确认待核对约束]" in (request.free_text_input or "")
+            # Single acknowledgment source: structured boolean first, with
+            # legacy free-text marker compatibility handled inside it.
+            acknowledged = risks_acked
             add(
                 "SEMANTIC_PENDING_FIELDS",
                 "info",
@@ -1984,6 +1976,80 @@ class TripPlanQualityService:
     def _meal_names(self, meal_types: set[str]) -> str:
         labels = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}
         return "、".join(labels.get(value, value) for value in sorted(meal_types))
+
+
+def _has_error_issues(quality: TripPlanQualityResult | None) -> bool:
+    return any(
+        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
+        for issue in (getattr(quality, "issues", None) or [])
+    )
+
+
+def refresh_quality_gate(
+    quality: TripPlanQualityResult,
+    *,
+    generation_mode: str = "primary",
+    force_unpublishable: bool = False,
+) -> TripPlanQualityResult:
+    """Recompute the gate triple (``publishable`` + ``quality_status``).
+
+    The single source of truth for gate decisions.  Must be called after
+    any mutation of ``score``/``issues``; ``force_unpublishable`` lets the
+    pipeline demote a plan (e.g. partial enrichment) without inventing an
+    error issue — the result is ``needs_review`` unless already blocked.
+    """
+    has_blocking = (
+        _has_error_issues(quality)
+        or generation_mode == "map_fallback"
+        or any(
+            issue.code in TripPlanQualityService.BLOCKING_CODES
+            for issue in quality.issues
+        )
+    )
+    quality.publishable = (
+        not has_blocking and quality.score >= 75 and not force_unpublishable
+    )
+    if has_blocking:
+        quality.quality_status = "blocked"
+    elif quality.publishable:
+        quality.quality_status = "publishable"
+    else:
+        quality.quality_status = "needs_review"
+    return quality
+
+
+def resolve_plan_quality_status(plan: TripPlan) -> str:
+    """Read the unified gate decision for a plan.
+
+    Prefers the coherent ``quality_status`` written by ``evaluate()`` /
+    ``refresh_quality_gate``.  Tolerates legacy or stub quality objects
+    that set ``publishable`` while leaving the default
+    ``quality_status="blocked"``, and objects with no status at all.
+    """
+    quality = getattr(plan, "quality", None)
+    if quality is None:
+        return "blocked"
+
+    generation_mode = str(getattr(plan, "generation_mode", "") or "")
+    has_error = _has_error_issues(quality)
+    status = str(getattr(quality, "quality_status", "") or "").strip().lower()
+    if status in {"publishable", "needs_review", "blocked"}:
+        if (
+            status == "blocked"
+            and bool(getattr(quality, "publishable", False))
+            and generation_mode != "map_fallback"
+            and not has_error
+        ):
+            # Incomplete stub/legacy quality objects (publishable=True with
+            # the field default status): trust the explicit publishable flag.
+            return "publishable"
+        return status
+
+    if bool(getattr(quality, "publishable", False)):
+        return "publishable"
+    if has_error or generation_mode == "map_fallback":
+        return "blocked"
+    return "needs_review"
 
 
 _trip_plan_quality_service: TripPlanQualityService | None = None
