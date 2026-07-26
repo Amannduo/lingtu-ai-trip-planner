@@ -954,6 +954,14 @@ class MultiAgentTripPlanner:
         return False
 
     def _needs_gentle_pacing(self, request: TripRequest) -> bool:
+        # Structured channel first (S4a): the server-built contract's pace
+        # binding is the authoritative decided value.
+        contract = getattr(request, "semantic_contract", None)
+        pace = getattr(contract, "pace", None) if contract is not None else None
+        if pace is not None and pace.is_known():
+            return str(pace.value or "") == "轻松"
+        # Machine-block / preference keyword channel — kept as the compat
+        # fallback until the token handoff (S4b/S4c) fully replaces it.
         text = (
             f"{decided_constraint_text(request.free_text_input)} "
             f"{' '.join(request.preferences)}"
