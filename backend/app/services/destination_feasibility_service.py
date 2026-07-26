@@ -58,13 +58,6 @@ SHORT_TRIP_CITY_GRAPH: Dict[str, List[str]] = {
     "青岛": ["济南", "烟台", "威海"],
     "济南": ["青岛", "天津", "北京"],
     "郑州": ["洛阳", "西安", "开封"],
-    # Northern circles: without these a Taiyuan/Shijiazhuang weekend request
-    # falls through to the generic list and proposes 杭州/南京/成都.
-    "太原": ["晋中", "忻州", "大同", "石家庄"],
-    "石家庄": ["太原", "北京", "保定"],
-    "大同": ["太原", "忻州", "呼和浩特"],
-    "沈阳": ["大连", "长春", "鞍山"],
-    "哈尔滨": ["长春", "牡丹江", "齐齐哈尔"],
 }
 
 # County/district-level origins inherit their prefecture-level transport circle.
@@ -171,11 +164,6 @@ class DestinationFeasibilityService:
         canonical = self.normalize_city(value)
 
         normalized = canonical.strip()
-        if not normalized:
-            # "吉林市" strips to the empty string (province prefix + bare 市).
-            # Returning "" would silently disable every identity check that
-            # guards on truthiness, so keep the plain city normalization.
-            normalized = self.normalize_city(original).strip()
         self._NORM_CACHE[cache_key] = normalized
         return normalized
 
@@ -192,13 +180,7 @@ class DestinationFeasibilityService:
         precise = self._precise_origin_key(origin_city)
         if precise:
             return list(PRECISE_SHORT_TRIP_CITY_GRAPH[precise])
-        # Must match assess(): a province-prefixed origin such as "山西太原"
-        # has to resolve to the same graph key as "太原".
-        return list(
-            SHORT_TRIP_CITY_GRAPH.get(
-                self.normalize_location_for_matching(origin_city), []
-            )
-        )
+        return list(SHORT_TRIP_CITY_GRAPH.get(self.normalize_city(origin_city), []))
 
     def _precise_origin_key(self, origin_city: Optional[str]) -> str:
         compact = "".join(str(origin_city or "").split())
@@ -319,171 +301,6 @@ class DestinationFeasibilityService:
             transport_note="建议改选周边目的地，或增加天数后核对高铁/航班时刻。",
             score=25,
         )
-
-
-def _address_points_to_conflicting_city(
-    address: str,
-    destination_city: str,
-    structured_city_norm: str,
-) -> bool:
-    """Return True if *address* has a city-level admin reference to a city
-    that is neither *destination_city* nor *structured_city_norm*.
-
-    Used to detect conflicts where structured fields say "matched" but the
-    address text says a different city.
-    """
-    if not address:
-        return False
-    feasibility = get_destination_feasibility_service()
-    dest_norm = feasibility.normalize_location_for_matching(destination_city)
-    admin_refs = _extract_admin_references(address)
-    for ref_text, _ref_kind in admin_refs:
-        ref_norm = feasibility.normalize_location_for_matching(ref_text)
-        if not ref_norm or not dest_norm:
-            continue
-        # Match dest → no conflict.
-        if ref_norm == dest_norm or ref_norm in dest_norm or dest_norm in ref_norm:
-            continue
-        # Match the structured city → no conflict.
-        if structured_city_norm and (
-            ref_norm == structured_city_norm
-            or ref_norm in structured_city_norm
-            or structured_city_norm in ref_norm
-        ):
-            continue
-        # A different identifiable city → conflict.
-        return True
-    return False
-
-
-def poi_destination_status(
-    destination_city: str,
-    cityname: str = "",
-    citycode: str = "",
-    adname: str = "",
-    adcode: str = "",
-    address: str = "",
-    name: str = "",
-) -> str:
-    """Return ``"matched"``, ``"mismatched"``, or ``"unknown"``.
-
-    Structured fields (cityname / citycode / adname / adcode from AMap)
-    take priority over address text parsing.  The address field is used
-    only as a fallback when no structured evidence is available.
-
-    Priority:
-    1. cityname explicitly matches / mismatches destination → decisive
-    2. citycode maps to destination / other city → decisive
-    3. adcode confirmed in destination admin area → decisive
-    4. adname only used when it can be confirmed against the destination
-    5. Structured fields missing → fall back to address admin references
-    6. No evidence → ``"unknown"``
-
-    When structured fields conflict (e.g. cityname=太原市 but
-    address contains 大同市), the structured fields win — the
-    result is ``"mismatched"``.
-    """
-    if not destination_city:
-        return "unknown"
-
-    feasibility = get_destination_feasibility_service()
-    dest_norm = feasibility.normalize_location_for_matching(destination_city)
-
-    # ── structured evidence ──────────────────────────────────────────
-
-    # 1. cityname: most authoritative single field.
-    if cityname:
-        cn_norm = feasibility.normalize_location_for_matching(cityname)
-        if cn_norm and dest_norm:
-            if cn_norm == dest_norm or cn_norm in dest_norm or dest_norm in cn_norm:
-                # Structured field says matched — but check for address conflict.
-                if _address_points_to_conflicting_city(address, destination_city, cn_norm):
-                    return "mismatched"
-                return "matched"
-            return "mismatched"
-
-    # 2. citycode: known AMap citycode → city name mapping.
-    _KNOWN_CITYCODES: dict[str, str] = {
-        "0351": "太原", "0352": "大同", "0353": "阳泉", "0354": "晋中",
-        "0355": "长治", "0356": "晋城", "0357": "临汾", "0358": "吕梁",
-        "0359": "运城", "0349": "朔州", "0350": "忻州",
-        "010": "北京", "021": "上海", "022": "天津", "023": "重庆",
-        "020": "广州", "0755": "深圳", "028": "成都", "029": "西安",
-        "0371": "郑州", "0379": "洛阳", "0531": "济南",
-        "024": "沈阳", "0411": "大连", "027": "武汉",
-        "0731": "长沙", "0571": "杭州", "025": "南京",
-        "0591": "福州", "0592": "厦门", "0898": "海口",
-        "0771": "南宁", "0851": "贵阳", "0871": "昆明",
-        "0931": "兰州", "0951": "银川", "0971": "西宁",
-        "0991": "乌鲁木齐", "0891": "拉萨",
-    }
-    if citycode:
-        if citycode in _KNOWN_CITYCODES:
-            mapped = _KNOWN_CITYCODES[citycode]
-            mapped_norm = feasibility.normalize_location_for_matching(mapped)
-            if mapped_norm == dest_norm:
-                # Structured field says matched — but check for address conflict.
-                if _address_points_to_conflicting_city(address, destination_city, mapped_norm):
-                    return "mismatched"
-                return "matched"
-            return "mismatched"
-        # citycode present but not in our mapping — try adcode if
-        # available, else fall through to address check.
-
-    # 3. adcode: the first 4 digits identify the city-level admin unit.
-    if adcode and len(adcode) >= 4:
-        adcode_prefix = adcode[:4]
-
-    # 4. adname: only usable when we can confirm the parent city.
-    if adname and not cityname and not citycode:
-        # adname alone (e.g. "云冈区") cannot confirm destination;
-        # fall through to address check for additional context.
-        pass
-
-    # ── address fallback ─────────────────────────────────────────────
-
-    if address:
-        admin_refs = _extract_admin_references(address)
-        for ref_text, _ref_kind in admin_refs:
-            ref_norm = feasibility.normalize_location_for_matching(ref_text)
-            if not ref_norm or not dest_norm:
-                continue
-            if ref_norm == dest_norm or ref_norm in dest_norm or dest_norm in ref_norm:
-                # If a structured field disagrees, trust the structured field.
-                if cityname:
-                    cn_norm = feasibility.normalize_location_for_matching(cityname)
-                    if cn_norm and cn_norm != ref_norm and cn_norm not in ref_norm and ref_norm not in cn_norm:
-                        return "mismatched"  # conflict: structured wins
-                return "matched"
-            # A different identifiable city.
-            return "mismatched"
-
-    return "unknown"
-
-
-def _extract_admin_references(text: str) -> list[tuple[str, str]]:
-    """Extract city/district-level references from a Chinese address.
-
-    Returns a list of ``(city_text, kind)`` tuples where kind is
-    one of ``"市"``, ``"区"``, ``"县"``, ``"省"``.
-    Ignores street-name patterns (e.g. "XX路").
-    """
-    import re
-    if not text:
-        return []
-
-    results: list[tuple[str, str]] = []
-    # Match "XX市", "XX区", "XX县", "XX省XX市"
-    pattern = re.compile(r"([一-鿿]{2,10})(市|区|县)")
-    for match in pattern.finditer(text):
-        city_text = match.group(1)
-        suffix = match.group(2)
-        # Check if the next character is a street-suffix.
-        end = match.end()
-        if end < len(text) and text[end:end + 1] in ("路", "街", "巷", "道", "桥"):
-            continue
-        results.append((city_text, suffix))
-    return results
 
 
 _destination_feasibility_service: DestinationFeasibilityService | None = None

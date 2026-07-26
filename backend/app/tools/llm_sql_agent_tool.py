@@ -198,6 +198,8 @@ def _build_llm_sql_plan(message: str, user_id: str, role: str) -> SQLPlan | None
     role = normalize_role(role)
     # Dynamic model-authored SQL is reserved for administrators. User and
     # manager analytics use the deterministic allow-list planner.
+    # Public API below currently disables all callers; this gate remains as
+    # defense-in-depth if private helpers are ever re-exposed.
     if role != "admin":
         return None
     is_scoped = False
@@ -245,6 +247,7 @@ def _try_generate_sql(agent, prompt: str, fallback_message: str) -> tuple[str | 
     try:
         response = agent.run(prompt)
     except Exception as exc:
+        # Do not log exception text or model prompts (may contain secrets).
         print(f"[llm_sql] LLM call failed: {type(exc).__name__}")
         return None, "", ""
 
@@ -257,6 +260,7 @@ def _try_generate_sql(agent, prompt: str, fallback_message: str) -> tuple[str | 
 
     valid, err = _validate_sql(sql)
     if not valid:
+        # Never log SQL snippets — they may contain user identifiers.
         print(f"[llm_sql] SQL validation failed: {err}")
         return None, "", ""
 
@@ -279,7 +283,11 @@ def _finalise_plan(
 # ── Public API ─────────────────────────────────────────────────────────
 
 def build_sql_plan_with_llm(message: str, user_id: str, role: str) -> SQLPlan | None:
-    """Dynamic SQL is disabled; callers must use deterministic allow-list plans."""
+    """Dynamic SQL is disabled; callers must use deterministic allow-list plans.
+
+    Travel analytics authorization depends on server-side SQL templates with
+    enforced role scope. Model-authored SQL is not accepted for any role.
+    """
     return None
 
 

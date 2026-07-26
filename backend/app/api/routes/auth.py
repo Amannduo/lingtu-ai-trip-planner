@@ -11,11 +11,13 @@ from ...config import get_settings
 from ...services.auth_service import (
     AuthError,
     AuthenticatedUser,
+    InvalidTokenError,
     authenticate_user,
     create_access_token,
     register_user,
     revoke_user_tokens,
     update_user_email,
+    user_from_access_token,
 )
 from ..auth import get_current_user
 
@@ -56,6 +58,12 @@ def _public_user(user: AuthenticatedUser) -> AuthUserResponse:
     return AuthUserResponse(**user.as_dict())
 
 
+def _auth_cookie_secure(http_request: Request) -> bool:
+    """Secure when configured or the request itself is HTTPS."""
+    settings = get_settings()
+    return bool(settings.auth_cookie_secure or http_request.url.scheme == "https")
+
+
 def _set_auth_cookie(response: Response, token: str, http_request: Request) -> None:
     settings = get_settings()
     response.set_cookie(
@@ -63,15 +71,39 @@ def _set_auth_cookie(response: Response, token: str, http_request: Request) -> N
         value=token,
         max_age=settings.auth_access_token_minutes * 60,
         httponly=True,
-        secure=settings.auth_cookie_secure or http_request.url.scheme == "https",
+        secure=_auth_cookie_secure(http_request),
         samesite="lax",
         path="/",
     )
     response.headers["Cache-Control"] = "no-store"
 
 
+def _clear_auth_cookie(response: Response, http_request: Request) -> None:
+    settings = get_settings()
+    response.delete_cookie(
+        key=settings.auth_cookie_name,
+        path="/",
+        secure=_auth_cookie_secure(http_request),
+        httponly=True,
+        samesite="lax",
+    )
+    response.headers["Cache-Control"] = "no-store"
+
+
+def _extract_request_token(http_request: Request) -> str | None:
+    settings = get_settings()
+    token = http_request.cookies.get(settings.auth_cookie_name)
+    if token:
+        return token
+    authorization = http_request.headers.get("authorization") or ""
+    scheme, _, credentials = authorization.partition(" ")
+    if scheme.lower() == "bearer" and credentials.strip():
+        return credentials.strip()
+    return None
+
+
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-def register(request: RegisterRequest, response: Response, http_request: Request):
+async def register(request: RegisterRequest, response: Response, http_request: Request):
     try:
         user = register_user(
             username=request.username,
@@ -87,7 +119,7 @@ def register(request: RegisterRequest, response: Response, http_request: Request
 
 
 @router.post("/login", response_model=AuthResponse)
-def login(request: LoginRequest, response: Response, http_request: Request):
+async def login(request: LoginRequest, response: Response, http_request: Request):
     try:
         user = authenticate_user(request.username, request.password)
         _set_auth_cookie(response, create_access_token(user), http_request)
@@ -97,12 +129,12 @@ def login(request: LoginRequest, response: Response, http_request: Request):
 
 
 @router.get("/me", response_model=AuthResponse)
-def me(user: AuthenticatedUser = Depends(get_current_user)):
+async def me(user: AuthenticatedUser = Depends(get_current_user)):
     return AuthResponse(user=_public_user(user))
 
 
 @router.patch("/me", response_model=AuthResponse)
-def update_me(
+async def update_me(
     request: UpdateEmailRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
@@ -117,19 +149,19 @@ def update_me(
 
 
 @router.post("/logout")
-def logout(
-    response: Response,
-    http_request: Request,
-    user: AuthenticatedUser = Depends(get_current_user),
-):
-    settings = get_settings()
-    revoke_user_tokens(user.user_id)
-    response.delete_cookie(
-        key=settings.auth_cookie_name,
-        path="/",
-        secure=settings.auth_cookie_secure or http_request.url.scheme == "https",
-        httponly=True,
-        samesite="lax",
-    )
-    response.headers["Cache-Control"] = "no-store"
+async def logout(response: Response, http_request: Request):
+    """Clear the auth cookie and revoke every access token for this user.
+
+    Revocation is user-level via ``token_version``: every device/session that
+    still holds a token with the previous version becomes invalid.
+    """
+    token = _extract_request_token(http_request)
+    if token:
+        try:
+            user = user_from_access_token(token)
+            revoke_user_tokens(user.user_id)
+        except (InvalidTokenError, AuthError):
+            # Still clear the browser cookie even when the token is already dead.
+            pass
+    _clear_auth_cookie(response, http_request)
     return {"success": True}

@@ -196,6 +196,7 @@ def consume_email_quota(
             exc.retry_after_seconds,
         )
     except SQLAlchemyError as exc:
+        # Avoid logging exception text that may include connection details.
         logger.warning("Email quota persistence failed: %s", type(exc).__name__)
         return _decision(
             False,

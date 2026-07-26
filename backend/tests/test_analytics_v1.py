@@ -407,6 +407,8 @@ def test_capabilities_and_data_status_follow_authenticated_scope(analytics_clien
     assert personal_status["sufficient_for"]["trend"] is False
     assert personal_status["sufficient_for"]["prediction"] is False
     assert any("数据还比较少" in warning for warning in personal_status["warnings"])
+    # Synthetic / field-completeness notes stay out of free-text warnings.
+    assert not any("模拟数据" in warning for warning in personal_status["warnings"])
 
     sparse_chat = _chat(client, "统计本月旅行去向")
     assert sparse_chat["extra"]["analysis"]["sample_size"] == 1
