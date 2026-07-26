@@ -194,15 +194,31 @@ export const parseApiErrorDetail = (
   return { message: '', issues: [] }
 }
 
+/**
+ * Prefer the unified top-level {message, issues} the backend now sends for
+ * every error class; fall back to parsing the legacy `detail` shapes.
+ */
+const parseApiErrorPayload = (
+  data: unknown
+): { message: string; issues: ApiIssue[] } => {
+  if (data && typeof data === 'object') {
+    const raw = data as Record<string, unknown>
+    const topLevel = parseApiErrorDetail(raw)
+    if (topLevel.issues.length || topLevel.message) return topLevel
+    return parseApiErrorDetail(raw.detail)
+  }
+  return { message: '', issues: [] }
+}
+
 const responseError = (error: any, fallback: string) => {
-  const parsed = parseApiErrorDetail(error?.response?.data?.detail)
+  const parsed = parseApiErrorPayload(error?.response?.data)
   if (parsed.message) return parsed.message
   return error?.message || fallback
 }
 
 const toApiClientError = (error: any, fallback: string) => {
   const status = error?.response?.status
-  const parsed = parseApiErrorDetail(error?.response?.data?.detail)
+  const parsed = parseApiErrorPayload(error?.response?.data)
   const message = parsed.message || error?.message || fallback
   return new ApiClientError(message, {
     status: typeof status === 'number' ? status : undefined,
