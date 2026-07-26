@@ -36,6 +36,8 @@ export interface Meal {
   location?: Location
   description?: string
   estimated_cost?: number
+  poi_id?: string
+  coordinate_source?: string
 }
 
 export interface RouteSegment {
@@ -99,6 +101,24 @@ export interface AgentAuditResult {
   suggestions: string[]
 }
 
+export interface TripPlanQualityIssue {
+  code: string
+  severity: 'info' | 'warning' | 'error' | string
+  path: string
+  message: string
+  suggestion: string
+  auto_repaired: boolean
+}
+
+export interface TripPlanQualityResult {
+  status: 'passed' | 'warning' | 'failed' | string
+  score: number
+  checked_items: string[]
+  issues: TripPlanQualityIssue[]
+  verified_facts: number
+  generated_at: string
+}
+
 export interface DayPlan {
   date: string
   day_index: number
@@ -125,6 +145,7 @@ export interface TripPlan {
   city: string
   start_date: string
   end_date: string
+  generation_mode: 'primary' | 'repaired' | 'map_fallback'
   days: DayPlan[]
   weather_info: WeatherInfo[]
   overall_suggestions: string
@@ -132,6 +153,7 @@ export interface TripPlan {
   web_guide?: string | null
   web_references: WebReference[]
   agent_audit?: AgentAuditResult | null
+  quality?: TripPlanQualityResult | null
   map_context?: MapContextPOI[]
 }
 
@@ -243,7 +265,6 @@ export interface DestinationRecommendation {
   schedule_summary?: string | null
 }
 
-
 export type FieldSource =
   | 'user_explicit'
   | 'rule_inferred'
@@ -287,8 +308,8 @@ export interface DestinationChatResponse {
   message: string
   reply: string
   needs_more_info: boolean
-  /** Apply-safe flat fields plus optional semantic_contract */
-  interpreted_context?: Record<string, unknown>
+  /** Apply-safe flat fields plus optional semantic_contract / conflicts / pending_fields */
+  interpreted_context: Record<string, unknown>
   semantic_contract?: SemanticTripContract | null
   recommendations: DestinationRecommendation[]
 }

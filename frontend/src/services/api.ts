@@ -11,6 +11,16 @@ import type {
 } from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000
+const planEtags = new Map<string, string>()
+
+const planPath = (planNo: string) => `/api/trip/history/${encodeURIComponent(planNo)}`
+
+const rememberPlanEtag = (planNo: string, value: unknown) => {
+  if (typeof value === 'string' && value.trim()) {
+    planEtags.set(planNo, value.trim())
+  }
+}
 
 const resolveTripStreamUrl = (rawUrl: string): string => {
   const apiOrigin = new URL(API_BASE_URL || window.location.origin, window.location.origin)
@@ -23,8 +33,6 @@ const resolveTripStreamUrl = (rawUrl: string): string => {
   }
   return target.toString()
 }
-
-const DEFAULT_REQUEST_TIMEOUT_MS = 120000
 
 const readTimeoutMs = (rawValue: string | undefined, fallbackMs: number) => {
   const timeoutMs = Number(rawValue)
@@ -203,7 +211,6 @@ const toApiClientError = (error: any, fallback: string) => {
 }
 
 
-
 export async function fetchVapidPublicKey(): Promise<string> {
   try {
     const response = await apiClient.get<VapidPublicKeyResponse>(
@@ -258,6 +265,7 @@ export async function generateTripPlan(formData: TripFormData): Promise<TripPlan
     throw toApiClientError(error, '生成旅行计划失败')
   }
 }
+
 
 export interface TripGenerationProgress {
   id: number
@@ -348,7 +356,6 @@ export async function generateTripPlanWithProgress(
   })
 }
 
-
 export async function chatDestinationRecommendation(
   payload: DestinationChatRequest
 ): Promise<DestinationChatResponse> {
@@ -413,26 +420,19 @@ export type TripHistoryResponse = {
   }[]
 }
 
-const emptyHistory = (): TripHistoryResponse => ({
-  success: false,
-  user_id: '',
-  stats: { total_trips: 0, avg_budget: 0, total_days: 0 },
-  fav_cities: [],
-  trips: []
-})
-
 export async function fetchTripHistory(): Promise<TripHistoryResponse> {
   try {
     const response = await apiClient.get<TripHistoryResponse>('/api/trip/history')
     return response.data
-  } catch {
-    return emptyHistory()
+  } catch (error: any) {
+    throw new Error(responseError(error, '\u8bfb\u53d6\u65c5\u884c\u5386\u53f2\u5931\u8d25'))
   }
 }
 
 export async function fetchTripPlan(planNo: string): Promise<TripPlanResponse> {
   try {
-    const response = await apiClient.get<TripPlanResponse>(`/api/trip/history/${planNo}`)
+    const response = await apiClient.get<TripPlanResponse>(planPath(planNo))
+    rememberPlanEtag(planNo, response.headers.etag)
     return response.data
   } catch (error: any) {
     throw new Error(responseError(error, '读取历史行程失败'))
@@ -444,10 +444,13 @@ export async function updateTripPlan(
   plan: NonNullable<TripPlanResponse['data']>
 ): Promise<TripPlanResponse> {
   try {
+    const etag = planEtags.get(planNo)
     const response = await apiClient.put<TripPlanResponse>(
-      `/api/trip/history/${planNo}`,
-      plan
+      planPath(planNo),
+      plan,
+      { headers: etag ? { 'If-Match': etag } : undefined }
     )
+    rememberPlanEtag(planNo, response.headers.etag)
     return response.data
   } catch (error: any) {
     throw new Error(responseError(error, '保存旅行计划失败'))

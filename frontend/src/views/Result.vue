@@ -71,6 +71,45 @@
       </div>
     </div>
 
+    <section
+      v-if="tripPlan"
+      class="trip-readiness"
+      :class="'is-' + readinessTone"
+      aria-labelledby="readiness-title"
+    >
+      <div class="readiness-copy">
+        <span class="readiness-kicker">AI EXECUTIVE BRIEF · {{ generationModeLabel }}</span>
+        <div class="readiness-title-row">
+          <h2 id="readiness-title">{{ readinessTitle }}</h2>
+          <span class="readiness-badge">{{ readinessBadge }}</span>
+        </div>
+        <p>{{ tripPlan.overall_suggestions }}</p>
+      </div>
+      <div class="readiness-metrics">
+        <div><span>已验证事实</span><strong>{{ verifiedFactsDisplay }}</strong></div>
+        <div><span>可靠路线</span><strong>{{ verifiedRouteCount }}</strong></div>
+        <div><span>需留意</span><strong>{{ qualityIssues.length }}</strong></div>
+      </div>
+      <div v-if="topQualityIssues.length" class="readiness-focus">
+        <div class="focus-head">
+          <span>出发前优先确认</span>
+          <button type="button" @click="scrollToSection({ key: 'quality-gate' })">查看全部</button>
+        </div>
+        <ul>
+          <li v-for="issue in topQualityIssues" :key="issue.code + issue.path">
+            <i :class="'is-' + issue.severity"></i>
+            <span>{{ issue.message }}</span>
+          </li>
+        </ul>
+      </div>
+      <div v-else-if="isServerBackedPlan && tripPlan.quality" class="readiness-clear">
+        <span>✓</span>当前未发现结构性问题；票务、开放状态和实时天气仍以出发前官方信息为准
+      </div>
+      <div v-else class="readiness-unchecked">
+        <span>!</span>当前内容来自浏览器缓存，天气、预算、地图、餐饮和评分均不作为服务端验证结论
+      </div>
+    </section>
+
     <div v-if="tripPlan" class="content-wrapper">
       <!-- 侧边导航 -->
       <div class="side-nav">
@@ -96,8 +135,11 @@
             <a-menu-item key="web-meta" v-if="normalizedWebReferences.length">
               <span>🔎 资料来源</span>
             </a-menu-item>
-            <a-menu-item key="agent-audit" v-if="tripPlan.agent_audit">
-              <span>✅ 审核检查</span>
+            <a-menu-item key="quality-gate" v-if="isServerBackedPlan && tripPlan.quality">
+              <span>方案质量</span>
+            </a-menu-item>
+            <a-menu-item key="agent-audit" v-if="isServerBackedPlan && tripPlan.agent_audit">
+              <span>来源审核</span>
             </a-menu-item>
           </a-menu>
         </a-affix>
@@ -234,8 +276,8 @@
 
                       <!-- 编辑模式下可编辑的字段 -->
                       <div v-if="editMode">
-                        <p><strong>地址:</strong></p>
-                        <a-input v-model:value="item.address" size="small" style="margin-bottom: 8px" />
+                        <p><strong>地址:</strong> {{ item.address }}</p>
+                        <a-tag color="green" style="margin-bottom: 8px">地图事实不可直接修改</a-tag>
 
                         <p><strong>游览时长(分钟):</strong></p>
                         <a-input-number v-model:value="item.visit_duration" :min="10" :max="480" size="small" style="width: 100%; margin-bottom: 8px" />
@@ -250,7 +292,7 @@
                         <p><strong>游览时长:</strong> {{ item.visit_duration }}分钟</p>
                         <p><strong>描述:</strong> {{ item.description }}</p>
                         <p v-if="item.rating"><strong>评分:</strong> {{ item.rating }}⭐</p>
-                        <a-tag v-if="item.coordinate_source === 'amap_poi'" color="green">高德 POI 坐标已校准</a-tag>
+                        <a-tag v-if="isServerBackedPlan && item.coordinate_source === 'amap_poi'" color="green">高德 POI 坐标已校准</a-tag>
                       </div>
                     </a-card>
                   </a-list-item>
@@ -265,7 +307,7 @@
                     <span class="route-title">{{ route.from_name }} → {{ route.to_name }}</span>
                     <span class="route-mode">
                       {{ getRouteTypeLabel(route.route_type) }}
-                      · {{ route.verified ? '高德路线已校验' : '路线摘要' }}
+                      · {{ isRouteServerVerified(route) ? '高德路线已校验' : '路线摘要（需复核）' }}
                     </span>
                   </div>
                   <div class="route-meta">
@@ -316,7 +358,7 @@
           </a-collapse>
         </a-card>
 
-        <a-card id="weather" title="天气信息" style="margin-top: 20px" :bordered="false">
+        <a-card id="weather" :title="weatherSectionTitle" style="margin-top: 20px" :bordered="false">
           <a-list
             v-if="tripPlan.weather_info && tripPlan.weather_info.length > 0"
             :data-source="tripPlan.weather_info"
@@ -385,8 +427,39 @@
         </a-card>
 
         <a-card
+          id="quality-gate"
+          v-if="isServerBackedPlan && tripPlan.quality"
+          title="方案质量检查"
+          :bordered="false"
+          class="agent-audit-card quality-card"
+        >
+          <a-alert
+            :type="qualityAlertType"
+            :message="qualityStatusText"
+            :description="qualityDescription"
+            show-icon
+          />
+          <div class="audit-grid">
+            <div>
+              <div class="audit-heading">确定性检查</div>
+              <ul class="audit-list">
+                <li v-for="item in tripPlan.quality.checked_items" :key="item">{{ item }}</li>
+              </ul>
+            </div>
+            <div v-if="tripPlan.quality.issues.length">
+              <div class="audit-heading">需要留意</div>
+              <ul class="audit-list">
+                <li v-for="issue in tripPlan.quality.issues.slice(0, 8)" :key="issue.code + ':' + issue.path">
+                  {{ issue.message }}<span v-if="issue.suggestion"> · {{ issue.suggestion }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </a-card>
+
+        <a-card
           id="agent-audit"
-          v-if="tripPlan.agent_audit"
+          v-if="isServerBackedPlan && tripPlan.agent_audit"
           title="✅ 审核检查"
           :bordered="false"
           class="agent-audit-card"
@@ -439,7 +512,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted, nextTick, watch } from 'vue'
+import { computed, ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
@@ -450,9 +523,6 @@ import {
   ExportOutlined,
   SaveOutlined
 } from '@ant-design/icons-vue'
-import AMapLoader from '@amap/amap-jsapi-loader'
-import html2canvas from 'html2canvas'
-import jsPDF from 'jspdf'
 import TripMapPoster from '@/components/TripMapPoster.vue'
 import apiClient, {
   fetchMapContext,
@@ -460,6 +530,7 @@ import apiClient, {
   PHOTO_REQUEST_TIMEOUT_MS,
   updateTripPlan
 } from '@/services/api'
+import { getCurrentUser } from '@/services/auth'
 import {
   getCacheRetention,
   loadTripCache,
@@ -476,7 +547,11 @@ const router = useRouter()
 const tripPlan = ref<TripPlan | null>(null)
 const isPlanLoading = ref(true)
 const planLoadingText = '\u6b63\u5728\u6062\u590d\u65c5\u884c\u8ba1\u5212...'
+type PlanSource = 'server' | 'local'
+
 const currentPlanNo = ref<string | null>(null)
+const planSource = ref<PlanSource>('local')
+const isServerBackedPlan = computed(() => planSource.value === 'server')
 const cacheRetention = ref<CacheRetentionMinutes>(getCacheRetention())
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
@@ -487,6 +562,34 @@ const activeDays = ref<number[]>([0]) // 默认展开第一天
 let map: any = null
 
 const isMobileViewport = ref(false)
+let draftTimer: number | undefined
+let mapResizeTimer: number | undefined
+let activationRevision = 0
+let viewDisposed = false
+let authContextInvalidated = false
+const viewOwnerUserId = getCurrentUser()?.user_id ?? null
+
+const isViewOwnerActive = () => (
+  !viewDisposed
+  && !authContextInvalidated
+  && (getCurrentUser()?.user_id ?? null) === viewOwnerUserId
+)
+
+const handleAuthContextChange = () => {
+  if (authContextInvalidated || (getCurrentUser()?.user_id ?? null) === viewOwnerUserId) return
+  authContextInvalidated = true
+  activationRevision += 1
+  window.clearTimeout(draftTimer)
+  window.clearTimeout(mapResizeTimer)
+  tripPlan.value = null
+  currentPlanNo.value = null
+  if (map) {
+    map.destroy()
+    map = null
+  }
+  message.info('\u8d26\u53f7\u5df2\u5207\u6362\uff0c\u4e0a\u4e00\u8d26\u53f7\u7684\u884c\u7a0b\u5df2\u5173\u95ed\u3002')
+  void router.replace('/')
+}
 
 const totalDays = computed(() => tripPlan.value?.days.length ?? 0)
 const totalAttractions = computed(() => {
@@ -504,6 +607,63 @@ const mapSummaryAttractions = computed(() => {
     .slice(0, 8)
 })
 const normalizedWebReferences = computed(() => tripPlan.value?.web_references ?? [])
+const qualityIssues = computed(() =>
+  isServerBackedPlan.value ? tripPlan.value?.quality?.issues ?? [] : []
+)
+const topQualityIssues = computed(() => qualityIssues.value.slice(0, 3))
+const isRouteServerVerified = (route: { verified?: boolean }) => (
+  isServerBackedPlan.value && route.verified === true
+)
+const verifiedRouteCount = computed(() =>
+  isServerBackedPlan.value
+    ? tripPlan.value?.days.reduce(
+        (total, day) => total + day.routes.filter(isRouteServerVerified).length,
+        0
+      ) ?? 0
+    : 0
+)
+const verifiedFactsDisplay = computed(() =>
+  isServerBackedPlan.value ? tripPlan.value?.quality?.verified_facts ?? '—' : '未验证'
+)
+const readinessTone = computed(() => {
+  if (!isServerBackedPlan.value) return 'unchecked'
+  const status = tripPlan.value?.quality?.status
+  if (!status) return 'unchecked'
+  if (status === 'failed') return 'danger'
+  if (status === 'warning') return 'caution'
+  return 'ready'
+})
+const generationModeLabel = computed(() => {
+  if (!isServerBackedPlan.value) return '本地草稿 · 未重新验证'
+  const mode = tripPlan.value?.generation_mode
+  if (mode === 'map_fallback') return '地图备选'
+  if (mode === 'repaired') return '结构修复或地图可信补全'
+  return '主规划'
+})
+const readinessTitle = computed(() => {
+  if (!isServerBackedPlan.value) return '本地缓存仅供恢复编辑，请联网重新核验'
+  const status = tripPlan.value?.quality?.status
+  if (!status) return '这份方案尚未执行完整质量检查'
+  if (status === 'failed') return '这份方案需要先修复关键问题'
+  if (tripPlan.value?.generation_mode === 'map_fallback') {
+    return '当前为地图备选，建议重新生成主规划'
+  }
+  if (tripPlan.value?.generation_mode === 'repaired') {
+    return status === 'warning'
+      ? '方案已完成结构修复或地图可信补全，部分信息建议出发前复核'
+      : '方案已完成结构修复或地图可信补全'
+  }
+  if (status === 'warning') return '方案可执行，部分信息建议出发前复核'
+  return '当前检查未发现已知结构性错误'
+})
+const readinessBadge = computed(() => {
+  if (!isServerBackedPlan.value) return '缓存内容 · 未验证'
+  const quality = tripPlan.value?.quality
+  if (!quality) return '尚未复核'
+  if (quality.status === 'failed') return '暂不建议直接执行'
+  if (quality.status === 'warning') return quality.score + ' 分 · 建议复核'
+  return quality.score + ' 分 · 自动检查结果'
+})
 const displayWebGuide = computed(() => {
   const text = tripPlan.value?.web_guide?.trim() ?? ''
   return text
@@ -514,12 +674,34 @@ const displayWebGuide = computed(() => {
 const renderedWebGuide = computed(() => renderMarkdown(displayWebGuide.value))
 const totalBudgetText = computed(() => {
   const total = tripPlan.value?.budget?.total
-  return typeof total === 'number' ? `¥${total}` : '待估算'
+  if (typeof total !== 'number') return '待估算'
+  return isServerBackedPlan.value ? `¥${total}` : `缓存参考 ¥${total}`
 })
+const weatherSectionTitle = computed(() =>
+  isServerBackedPlan.value ? '天气信息' : '天气信息（浏览器缓存，需重新核验）'
+)
 const weatherReviewText = computed(() => {
   if (!tripPlan.value) return '暂未获取到可展示的天气信息。'
   return `${tripPlan.value.city}${tripPlan.value.start_date} 至 ${tripPlan.value.end_date} 的逐日天气暂未获取到可靠预报。当前天气源可能只覆盖近期预报，请在出发前3-7天复核每日天气、温差和降雨。`
 })
+const qualityAlertType = computed(() => {
+  const status = tripPlan.value?.quality?.status
+  if (status === 'passed') return 'success'
+  if (status === 'failed') return 'error'
+  return 'warning'
+})
+const qualityStatusText = computed(() => {
+  const status = tripPlan.value?.quality?.status
+  if (status === 'passed') return '自动检查未发现已知结构性错误'
+  if (status === 'failed') return '方案存在关键问题，已阻止自动保存'
+  return '方案可用，但出发前建议复核提醒项'
+})
+const qualityDescription = computed(() => {
+  const quality = tripPlan.value?.quality
+  if (!quality) return '尚未执行当前版本的自动检查。'
+  return `已验证 ${quality.verified_facts} 项事实 · 自动检查评分 ${quality.score}/100。评分只反映已覆盖规则，不代表票务、开放状态、天气和价格的绝对保证。`
+})
+
 const auditAlertType = computed(() => {
   const status = tripPlan.value?.agent_audit?.status
   if (status === 'passed') return 'success'
@@ -636,74 +818,287 @@ const renderMarkdown = (source: string): string => {
   return html.join('')
 }
 
-const normalizeTripPlan = (raw: any): TripPlan | null => {
-  if (!raw || typeof raw !== 'object') {
-    return null
-  }
+const isRecord = (value: unknown): value is Record<string, any> => (
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+)
 
-  const days = Array.isArray(raw.days)
-    ? raw.days.map((day: any) => ({
-        ...day,
-        attractions: Array.isArray(day?.attractions) ? day.attractions : [],
-        routes: Array.isArray(day?.routes) ? day.routes : [],
-        meals: Array.isArray(day?.meals) ? day.meals : []
-      }))
-    : []
+const boundedText = (value: unknown, maxLength: number, fallback = ''): string => (
+  typeof value === 'string' ? value.slice(0, maxLength) : fallback
+)
 
-  const budget = raw.budget && typeof raw.budget === 'object'
-    ? {
-        ...raw.budget,
-        budget_notes: Array.isArray(raw.budget.budget_notes) ? raw.budget.budget_notes : []
-      }
-    : undefined
-
-  const agentAudit = raw.agent_audit && typeof raw.agent_audit === 'object'
-    ? {
-        ...raw.agent_audit,
-        checked_items: Array.isArray(raw.agent_audit.checked_items) ? raw.agent_audit.checked_items : [],
-        issues: Array.isArray(raw.agent_audit.issues) ? raw.agent_audit.issues : [],
-        suggestions: Array.isArray(raw.agent_audit.suggestions) ? raw.agent_audit.suggestions : []
-      }
-    : undefined
-
-  return {
-    ...raw,
-    days,
-    weather_info: Array.isArray(raw.weather_info) ? raw.weather_info : [],
-    budget,
-    web_guide: typeof raw.web_guide === 'string' ? raw.web_guide : null,
-    web_references: Array.isArray(raw.web_references) ? raw.web_references : [],
-    agent_audit: agentAudit,
-    map_context: Array.isArray(raw.map_context) ? raw.map_context : []
-  } as TripPlan
+const boundedNumber = (value: unknown, fallback = 0): number => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
 }
 
-const activatePlan = async (raw: unknown, planNo?: string | null) => {
+const safeHttpUrl = (value: unknown): string | undefined => {
+  if (typeof value !== 'string' || !value || value.length > 2048) return undefined
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const normalizeLocation = (value: unknown) => {
+  if (!isRecord(value)) return null
+  const longitude = boundedNumber(value.longitude, Number.NaN)
+  const latitude = boundedNumber(value.latitude, Number.NaN)
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) return null
+  if (Math.abs(longitude) > 180 || Math.abs(latitude) > 90) return null
+  return { longitude, latitude }
+}
+
+const normalizeTripPlan = (raw: any): TripPlan | null => {
+  if (!isRecord(raw)) return null
+  const city = boundedText(raw.city, 64).trim()
+  const startDate = boundedText(raw.start_date, 10)
+  const endDate = boundedText(raw.end_date, 10)
+  if (!city || !startDate || !endDate) return null
+
+  const days = (Array.isArray(raw.days) ? raw.days : [])
+    .slice(0, 30)
+    .filter(isRecord)
+    .map((day: Record<string, any>, dayIndex: number) => {
+      const attractions = (Array.isArray(day.attractions) ? day.attractions : [])
+        .slice(0, 10)
+        .filter(isRecord)
+        .map((item: Record<string, any>) => {
+          const location = normalizeLocation(item.location)
+          const name = boundedText(item.name, 200).trim()
+          if (!location || !name) return null
+          return {
+            name,
+            address: boundedText(item.address, 500),
+            location,
+            visit_duration: Math.min(1440, Math.max(0, boundedNumber(item.visit_duration))),
+            description: boundedText(item.description, 4000),
+            category: boundedText(item.category, 200, '景点'),
+            rating: item.rating == null ? undefined : boundedNumber(item.rating),
+            photos: (Array.isArray(item.photos) ? item.photos : [])
+              .slice(0, 10)
+              .map(safeHttpUrl)
+              .filter((url): url is string => Boolean(url)),
+            image_url: safeHttpUrl(item.image_url),
+            poi_id: boundedText(item.poi_id, 200),
+            coordinate_source: boundedText(item.coordinate_source, 100),
+            ticket_price: Math.max(0, boundedNumber(item.ticket_price))
+          }
+        })
+        .filter(Boolean)
+
+      const routes = (Array.isArray(day.routes) ? day.routes : [])
+        .slice(0, 20)
+        .filter(isRecord)
+        .map((route: Record<string, any>) => ({
+          from_name: boundedText(route.from_name, 200),
+          to_name: boundedText(route.to_name, 200),
+          origin_address: boundedText(route.origin_address, 500),
+          destination_address: boundedText(route.destination_address, 500),
+          route_type: boundedText(route.route_type, 32, 'walking'),
+          distance: Math.max(0, boundedNumber(route.distance)),
+          duration: Math.max(0, boundedNumber(route.duration)),
+          description: boundedText(route.description, 2000),
+          path: (Array.isArray(route.path) ? route.path : [])
+            .slice(0, 5000)
+            .map(normalizeLocation)
+            .filter(Boolean),
+          source: boundedText(route.source, 100),
+          verified: route.verified === true
+        }))
+
+      const meals = (Array.isArray(day.meals) ? day.meals : [])
+        .slice(0, 10)
+        .filter(isRecord)
+        .map((meal: Record<string, any>) => ({
+          type: ['breakfast', 'lunch', 'dinner', 'snack'].includes(meal.type) ? meal.type : 'snack',
+          name: boundedText(meal.name, 200, '餐饮待确认'),
+          address: boundedText(meal.address, 500) || undefined,
+          location: normalizeLocation(meal.location) || undefined,
+          description: boundedText(meal.description, 2000) || undefined,
+          estimated_cost: Math.max(0, boundedNumber(meal.estimated_cost)),
+          poi_id: boundedText(meal.poi_id, 200),
+          coordinate_source: boundedText(meal.coordinate_source, 100)
+        }))
+
+      const hotel = isRecord(day.hotel)
+        ? {
+            name: boundedText(day.hotel.name, 200, '住宿待确认'),
+            address: boundedText(day.hotel.address, 500),
+            location: normalizeLocation(day.hotel.location) || undefined,
+            price_range: boundedText(day.hotel.price_range, 200),
+            rating: boundedText(day.hotel.rating, 100),
+            distance: boundedText(day.hotel.distance, 500),
+            type: boundedText(day.hotel.type, 200),
+            estimated_cost: Math.max(0, boundedNumber(day.hotel.estimated_cost)),
+            poi_id: boundedText(day.hotel.poi_id, 200),
+            selection_reason: boundedText(day.hotel.selection_reason, 2000)
+          }
+        : undefined
+
+      return {
+        date: boundedText(day.date, 10),
+        day_index: Math.max(0, boundedNumber(day.day_index, dayIndex)),
+        description: boundedText(day.description, 4000),
+        transportation: boundedText(day.transportation, 200),
+        accommodation: boundedText(day.accommodation, 200),
+        hotel,
+        attractions,
+        routes,
+        meals
+      }
+    })
+
+  const budget = isRecord(raw.budget)
+    ? {
+        ...raw.budget,
+        total_attractions: Math.max(0, boundedNumber(raw.budget.total_attractions)),
+        total_hotels: Math.max(0, boundedNumber(raw.budget.total_hotels)),
+        total_meals: Math.max(0, boundedNumber(raw.budget.total_meals)),
+        total_transportation: Math.max(0, boundedNumber(raw.budget.total_transportation)),
+        total: Math.max(0, boundedNumber(raw.budget.total)),
+        hotel_nights: Math.max(0, boundedNumber(raw.budget.hotel_nights)),
+        hotel_rooms: Math.max(0, boundedNumber(raw.budget.hotel_rooms, 1)),
+        hotel_unit_price: Math.max(0, boundedNumber(raw.budget.hotel_unit_price)),
+        intercity_transportation: Math.max(0, boundedNumber(raw.budget.intercity_transportation)),
+        local_transportation: Math.max(0, boundedNumber(raw.budget.local_transportation)),
+        transport_unit_price: Math.max(0, boundedNumber(raw.budget.transport_unit_price)),
+        budget_source: boundedText(raw.budget.budget_source, 500),
+        hotel_reference: boundedText(raw.budget.hotel_reference, 2000) || null,
+        transport_reference: boundedText(raw.budget.transport_reference, 2000) || null,
+        budget_notes: (Array.isArray(raw.budget.budget_notes) ? raw.budget.budget_notes : [])
+          .slice(0, 50)
+          .map((item: unknown) => boundedText(item, 1000))
+      }
+    : undefined
+
+  const rawQuality = isRecord(raw.quality) ? raw.quality : null
+  const quality = rawQuality
+    ? {
+        status: ['passed', 'warning', 'failed'].includes(rawQuality.status) ? rawQuality.status : 'warning',
+        score: Math.min(100, Math.max(0, boundedNumber(rawQuality.score))),
+        verified_facts: Math.max(0, boundedNumber(rawQuality.verified_facts)),
+        generated_at: boundedText(rawQuality.generated_at, 100),
+        checked_items: (Array.isArray(rawQuality.checked_items) ? rawQuality.checked_items : [])
+          .slice(0, 100)
+          .map((item: unknown) => boundedText(item, 1000)),
+        issues: (Array.isArray(rawQuality.issues) ? rawQuality.issues : [])
+          .slice(0, 100)
+          .filter(isRecord)
+          .map((issue: Record<string, any>) => ({
+            code: boundedText(issue.code, 100),
+            severity: ['info', 'warning', 'error'].includes(issue.severity) ? issue.severity : 'warning',
+            path: boundedText(issue.path, 500),
+            message: boundedText(issue.message, 2000),
+            suggestion: boundedText(issue.suggestion, 2000),
+            auto_repaired: issue.auto_repaired === true
+          }))
+      }
+    : undefined
+
+  const rawAudit = isRecord(raw.agent_audit) ? raw.agent_audit : null
+  const agentAudit = rawAudit
+    ? {
+        status: ['passed', 'warning', 'failed'].includes(rawAudit.status) ? rawAudit.status : 'warning',
+        source: boundedText(rawAudit.source, 200),
+        checked_items: (Array.isArray(rawAudit.checked_items) ? rawAudit.checked_items : []).slice(0, 100).map((item: unknown) => boundedText(item, 1000)),
+        issues: (Array.isArray(rawAudit.issues) ? rawAudit.issues : []).slice(0, 100).map((item: unknown) => boundedText(item, 2000)),
+        suggestions: (Array.isArray(rawAudit.suggestions) ? rawAudit.suggestions : []).slice(0, 100).map((item: unknown) => boundedText(item, 2000))
+      }
+    : undefined
+
+  const generationMode: TripPlan['generation_mode'] = (
+    raw.generation_mode === 'repaired' || raw.generation_mode === 'map_fallback'
+  ) ? raw.generation_mode : 'primary'
+
+  return {
+    city,
+    start_date: startDate,
+    end_date: endDate,
+    generation_mode: generationMode,
+    days: days as TripPlan['days'],
+    weather_info: (Array.isArray(raw.weather_info) ? raw.weather_info : [])
+      .slice(0, 30)
+      .filter(isRecord)
+      .map((weather: Record<string, any>) => ({
+        date: boundedText(weather.date, 10),
+        day_weather: boundedText(weather.day_weather, 100),
+        night_weather: boundedText(weather.night_weather, 100),
+        day_temp: boundedNumber(weather.day_temp),
+        night_temp: boundedNumber(weather.night_temp),
+        wind_direction: boundedText(weather.wind_direction, 100),
+        wind_power: boundedText(weather.wind_power, 100)
+      })),
+    overall_suggestions: boundedText(raw.overall_suggestions, 20_000),
+    budget: budget as TripPlan['budget'],
+    web_guide: typeof raw.web_guide === 'string' ? raw.web_guide.slice(0, 50_000) : null,
+    web_references: (Array.isArray(raw.web_references) ? raw.web_references : [])
+      .slice(0, 50)
+      .filter(isRecord)
+      .map((reference: Record<string, any>) => ({
+        title: boundedText(reference.title, 500),
+        url: safeHttpUrl(reference.url) || '',
+        site_name: boundedText(reference.site_name, 200),
+        source_type: boundedText(reference.source_type, 100),
+        publish_time: reference.publish_time == null ? null : boundedNumber(reference.publish_time)
+      })),
+    agent_audit: agentAudit,
+    quality: quality as TripPlan['quality'],
+    map_context: (Array.isArray(raw.map_context) ? raw.map_context : [])
+      .slice(0, 100)
+      .filter(isRecord)
+      .map((poi: Record<string, any>) => {
+        const location = normalizeLocation(poi.location)
+        if (!location) return null
+        return {
+          name: boundedText(poi.name, 200),
+          category: boundedText(poi.category, 100),
+          address: boundedText(poi.address, 500),
+          location,
+          poi_id: boundedText(poi.poi_id, 200),
+          source: boundedText(poi.source, 100)
+        }
+      })
+      .filter((poi): poi is NonNullable<typeof poi> => Boolean(poi))
+  }
+}
+
+
+const activatePlan = async (
+  raw: unknown,
+  planNo?: string | null,
+  source: PlanSource = 'local'
+): Promise<boolean> => {
+  if (!isViewOwnerActive()) return false
+  const currentActivation = ++activationRevision
   const normalized = normalizeTripPlan(raw)
   if (!normalized) throw new Error('旅行计划数据格式无效')
   currentPlanNo.value = planNo || null
+  planSource.value = source
   tripPlan.value = normalized
   saveTripCache(normalized, currentPlanNo.value, cacheRetention.value)
   saveTripSession(normalized)
   if (!normalized.map_context?.length) {
     const mapContext = await fetchMapContext(normalized)
+    if (!isViewOwnerActive() || currentActivation !== activationRevision) return false
     if (mapContext.length && tripPlan.value) {
       tripPlan.value.map_context = mapContext
       saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
       saveTripSession(tripPlan.value)
-      if (currentPlanNo.value) {
-        updateTripPlan(currentPlanNo.value, tripPlan.value).catch(error => {
-          console.warn('[result] map context persistence skipped:', error)
-        })
-      }
+      // Map context is useful for this view, but remains server-owned and is
+      // never persisted by sending a client-supplied full plan back automatically.
     }
   }
   await nextTick()
+  if (!isViewOwnerActive() || currentActivation !== activationRevision) return false
   if (!isMobileViewport.value) initMap()
   loadAttractionPhotos()
+  return true
 }
 
 onMounted(async () => {
+  window.addEventListener('lingtu-auth-change', handleAuthContextChange)
   isMobileViewport.value = window.matchMedia('(max-width: 768px)').matches
   const queryPlanNo = typeof route.query.plan === 'string' ? route.query.plan : ''
   try {
@@ -711,24 +1106,22 @@ onMounted(async () => {
       try {
         const response = await fetchTripPlan(queryPlanNo)
         if (response.data) {
-          await activatePlan(response.data, response.plan_no || queryPlanNo)
-          return
+          if (await activatePlan(response.data, response.plan_no || queryPlanNo, 'server')) return
         }
       } catch (error) {
         console.warn('[result] historical plan unavailable, using local draft', error)
       }
+      if (!isViewOwnerActive()) return
     }
 
     const cached = loadTripCache()
-    if (cached) {
-      await activatePlan(cached.plan, cached.planNo)
-      return
+    if (cached && (!queryPlanNo || cached.planNo === queryPlanNo)) {
+      if (await activatePlan(cached.plan, cached.planNo, 'local')) return
     }
 
-    const legacy = loadTripSession()
-    if (legacy) {
-      await activatePlan(legacy, null)
-      return
+    const sessionDraft = queryPlanNo ? null : loadTripSession()
+    if (sessionDraft) {
+      if (await activatePlan(sessionDraft, null, 'local')) return
     }
     console.warn('[result] no cached or historical trip plan found')
   } catch (error: any) {
@@ -739,20 +1132,34 @@ onMounted(async () => {
   }
 })
 
-let draftTimer: number | undefined
+onUnmounted(() => {
+  viewDisposed = true
+  activationRevision += 1
+  window.removeEventListener('lingtu-auth-change', handleAuthContextChange)
+  window.clearTimeout(draftTimer)
+  window.clearTimeout(mapResizeTimer)
+  if (map) {
+    map.destroy()
+    map = null
+  }
+})
+
 watch(
   tripPlan,
   value => {
-    if (!value) return
+    if (!value || !isViewOwnerActive()) return
     window.clearTimeout(draftTimer)
     draftTimer = window.setTimeout(() => {
-      saveTripCache(value, currentPlanNo.value, cacheRetention.value)
+      if (isViewOwnerActive() && tripPlan.value === value) {
+        saveTripCache(value, currentPlanNo.value, cacheRetention.value)
+      }
     }, 250)
   },
   { deep: true }
 )
 
 const changeCacheRetention = (value: CacheRetentionMinutes) => {
+  if (!isViewOwnerActive()) return
   cacheRetention.value = value
   setCacheRetention(value)
   if (tripPlan.value) saveTripCache(tripPlan.value, currentPlanNo.value, value)
@@ -782,28 +1189,48 @@ const toggleEditMode = () => {
 
 // 保存修改
 const saveChanges = async () => {
-  editMode.value = false
-  if (tripPlan.value) {
-    saveTripSession(tripPlan.value)
-    saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
-    if (currentPlanNo.value) {
-      try {
-        await updateTripPlan(currentPlanNo.value, tripPlan.value)
-        message.success('修改已保存到历史记录')
-      } catch (error: any) {
-        message.warning(`修改已保存在本地草稿，但同步历史记录失败：${error.message}`)
-      }
-    } else {
-      message.success('修改已保存到本地草稿')
+  if (!tripPlan.value || !isViewOwnerActive()) return
+
+  if (currentPlanNo.value) {
+    try {
+      const response = await updateTripPlan(currentPlanNo.value, tripPlan.value)
+      if (!isViewOwnerActive()) return
+      if (!response.data) throw new Error('服务端未返回更新后的行程')
+      tripPlan.value = normalizeTripPlan(response.data)
+      if (!tripPlan.value) throw new Error('服务端返回的行程格式无效')
+      planSource.value = 'server'
+      message.success(response.message || '修改已重新检查并保存')
+    } catch (error: any) {
+      message.error(error.message || '修改后的行程未通过检查')
+      return
     }
+  } else {
+    tripPlan.value.quality = null
+    if (tripPlan.value.agent_audit) {
+      const localEditWarning = '本地草稿已编辑，联网审核结论需要重新复核。'
+      tripPlan.value.agent_audit = {
+        ...tripPlan.value.agent_audit,
+        status: 'warning',
+        issues: tripPlan.value.agent_audit.issues.includes(localEditWarning)
+          ? tripPlan.value.agent_audit.issues
+          : [...tripPlan.value.agent_audit.issues, localEditWarning]
+      }
+    }
+    message.warning('修改已保存为本地草稿，质量状态将在重新生成后更新')
   }
 
-  // 重新初始化地图以反映更改
+  if (!isViewOwnerActive()) return
+  editMode.value = false
+  saveTripSession(tripPlan.value)
+  saveTripCache(tripPlan.value, currentPlanNo.value, cacheRetention.value)
+
   if (map) {
+    window.clearTimeout(mapResizeTimer)
     map.destroy()
+    map = null
   }
   nextTick(() => {
-    if (!isMobileViewport.value) {
+    if (isViewOwnerActive() && !isMobileViewport.value) {
       initMap()
     }
   })
@@ -962,13 +1389,13 @@ const buildExportSummary = () => {
     <div class="export-summary__kicker">LINGTU TRIP DOSSIER</div>
     <div class="export-summary__headline">
       <div>
-        <h1>${tripPlan.value?.city || '旅行计划'}</h1>
-        <p>${tripPlan.value?.start_date || ''} 至 ${tripPlan.value?.end_date || ''}</p>
+        <h1>${escapeHtml(tripPlan.value?.city || '旅行计划')}</h1>
+        <p>${escapeHtml(tripPlan.value?.start_date || '')} 至 ${escapeHtml(tripPlan.value?.end_date || '')}</p>
       </div>
       <div class="export-summary__metrics">
         <div><span>天数</span><strong>${totalDays.value}</strong></div>
         <div><span>景点</span><strong>${totalAttractions.value}</strong></div>
-        <div><span>预算</span><strong>${totalBudgetText.value}</strong></div>
+        <div><span>预算</span><strong>${escapeHtml(totalBudgetText.value)}</strong></div>
       </div>
     </div>
   `
@@ -1152,6 +1579,7 @@ const createExportContainer = async () => {
 }
 
 const renderExportCanvas = async (container: HTMLElement, preferredScale: number) => {
+  const { default: html2canvas } = await import('html2canvas')
   const safeHeight = Math.max(1, container.scrollHeight)
   const safeWidth = Math.max(1, container.scrollWidth)
   const maxDimensionScale = Math.min(30000 / safeHeight, 16000 / safeWidth)
@@ -1170,6 +1598,12 @@ const renderExportCanvas = async (container: HTMLElement, preferredScale: number
     scrollY: 0
   })
 }
+const assertExportContext = () => {
+  if (!isViewOwnerActive() || !tripPlan.value) {
+    throw new Error('\u8d26\u53f7\u5df2\u5207\u6362\uff0c\u5df2\u53d6\u6d88\u5bfc\u51fa\u4e0a\u4e00\u8d26\u53f7\u7684\u884c\u7a0b\u3002')
+  }
+}
+
 const downloadCanvas = async (canvas: HTMLCanvasElement, filename: string) => {
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
@@ -1178,6 +1612,7 @@ const downloadCanvas = async (canvas: HTMLCanvasElement, filename: string) => {
       0.92
     )
   })
+  assertExportContext()
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.download = filename
@@ -1187,12 +1622,16 @@ const downloadCanvas = async (canvas: HTMLCanvasElement, filename: string) => {
 }
 
 const exportAsImage = async () => {
+  if (!isViewOwnerActive() || !tripPlan.value) return
   let container: HTMLElement | null = null
   try {
     message.loading({ content: '正在生成高清图片...', key: 'export', duration: 0 })
     await expandAllDaysForExport()
+    assertExportContext()
     container = await createExportContainer()
+    assertExportContext()
     const canvas = await renderExportCanvas(container, 2.3)
+    assertExportContext()
     await downloadCanvas(
       canvas,
       `旅行计划_${tripPlan.value?.city}_${new Date().getTime()}.jpg`
@@ -1251,13 +1690,18 @@ const calculatePdfSlices = (
 }
 
 const exportAsPDF = async () => {
+  if (!isViewOwnerActive() || !tripPlan.value) return
   let container: HTMLElement | null = null
   try {
     message.loading({ content: '正在生成高清 PDF...', key: 'export', duration: 0 })
     await expandAllDaysForExport()
+    assertExportContext()
     container = await createExportContainer()
+    assertExportContext()
     const canvas = await renderExportCanvas(container, 2.15)
-
+    assertExportContext()
+    const { default: jsPDF } = await import('jspdf')
+    assertExportContext()
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true })
     const pageWidth = 194
     const pageHeightMm = 277
@@ -1284,6 +1728,7 @@ const exportAsPDF = async () => {
       pdf.addImage(imageData, 'JPEG', 8, 10, pageWidth, renderedHeight, undefined, 'FAST')
     })
 
+    assertExportContext()
     pdf.save(`旅行计划_${tripPlan.value?.city}_${new Date().getTime()}.pdf`)
     message.success({ content: `PDF 导出成功，共 ${slices.length} 页`, key: 'export' })
   } catch (error: any) {
@@ -1295,6 +1740,7 @@ const exportAsPDF = async () => {
 }
 // 初始化地图
 const initMap = async () => {
+  if (!isViewOwnerActive() || !tripPlan.value) return
   try {
     const loadConfig: {
       key: string
@@ -1311,7 +1757,9 @@ const initMap = async () => {
       loadConfig.securityJsCode = securityJsCode
     }
 
+    const { default: AMapLoader } = await import('@amap/amap-jsapi-loader')
     const AMap = await AMapLoader.load(loadConfig)
+    if (!isViewOwnerActive() || !tripPlan.value || !document.getElementById('amap-container')) return
 
     map = new AMap.Map('amap-container', {
       zoom: 12,
@@ -1320,19 +1768,28 @@ const initMap = async () => {
     })
 
     await nextTick()
-    window.setTimeout(() => {
+    if (!isViewOwnerActive() || !tripPlan.value) {
+      map.destroy()
+      map = null
+      return
+    }
+    window.clearTimeout(mapResizeTimer)
+    mapResizeTimer = window.setTimeout(() => {
+      if (!isViewOwnerActive() || !map) return
       try {
         map.resize?.()
         window.requestAnimationFrame(() => {
-          addAttractionMarkers(AMap)
+          if (isViewOwnerActive() && map) addAttractionMarkers(AMap)
         })
       } catch (markerError) {
         console.warn('Map markers skipped:', markerError)
       }
     }, 300)
 
+    if (!isViewOwnerActive()) return
     message.success('地图加载成功')
   } catch (error) {
+    if (!isViewOwnerActive()) return
     console.error('地图加载失败:', error)
     message.error('地图加载失败')
   }
@@ -1400,10 +1857,10 @@ const addAttractionMarkers = (AMap: any) => {
     const infoWindow = new AMap.InfoWindow({
       content: `
         <div style="padding: 10px;">
-          <h4 style="margin: 0 0 8px 0;">${attraction.name}</h4>
-          <p style="margin: 4px 0;"><strong>地址:</strong> ${attraction.address}</p>
-          <p style="margin: 4px 0;"><strong>游览时长:</strong> ${attraction.visit_duration}分钟</p>
-          <p style="margin: 4px 0;"><strong>描述:</strong> ${attraction.description}</p>
+          <h4 style="margin: 0 0 8px 0;">${escapeHtml(String(attraction.name || ''))}</h4>
+          <p style="margin: 4px 0;"><strong>地址:</strong> ${escapeHtml(String(attraction.address || ''))}</p>
+          <p style="margin: 4px 0;"><strong>游览时长:</strong> ${escapeHtml(String(attraction.visit_duration || 0))}分钟</p>
+          <p style="margin: 4px 0;"><strong>描述:</strong> ${escapeHtml(String(attraction.description || ''))}</p>
           <p style="margin: 4px 0; color: #1890ff;"><strong>第${attraction.dayIndex + 1}天 景点${attraction.attrIndex + 1}</strong></p>
         </div>
       `,
@@ -1431,7 +1888,7 @@ const addAttractionMarkers = (AMap: any) => {
       }
     })
     const hotelInfo = new AMap.InfoWindow({
-      content: `<div style="padding:10px"><h4 style="margin:0 0 8px">${hotel.name}</h4><p>${hotel.address}</p><p>${hotel.distance}</p></div>`,
+      content: `<div style="padding:10px"><h4 style="margin:0 0 8px">${escapeHtml(String(hotel.name || ''))}</h4><p>${escapeHtml(String(hotel.address || ''))}</p><p>${escapeHtml(String(hotel.distance || ''))}</p></div>`,
       offset: new AMap.Pixel(0, -30)
     })
     hotelMarker.on('click', () => hotelInfo.open(map, hotelMarker.getPosition()))
@@ -2620,5 +3077,213 @@ const drawRoutes = (AMap: any) => {
   .weather-info-row {
     gap: 10px;
   }
+}
+
+
+/* Executive brief: conclusions first, evidence on demand */
+.trip-readiness {
+  max-width: 1400px;
+  margin: 0 auto 22px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.65fr);
+  gap: 22px 30px;
+  padding: 25px 28px;
+  border: 1px solid rgba(15, 118, 110, 0.17);
+  border-radius: 18px;
+  background: radial-gradient(circle at 100% 0, rgba(37, 99, 235, 0.08), transparent 36%), #ffffff;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.065);
+}
+
+.trip-readiness.is-caution { border-color: rgba(217, 119, 6, 0.22); }
+.trip-readiness.is-danger { border-color: rgba(220, 38, 38, 0.22); }
+
+.readiness-kicker {
+  color: #0f766e;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+}
+
+.readiness-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 7px;
+}
+
+.readiness-title-row h2 {
+  margin: 0;
+  color: #172033;
+  font-size: clamp(20px, 2.4vw, 28px);
+  line-height: 1.2;
+  letter-spacing: -0.035em;
+}
+
+.readiness-badge {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #ecfdf3;
+  color: #067647;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.is-caution .readiness-badge { background: #fffaeb; color: #b54708; }
+.is-danger .readiness-badge { background: #fef3f2; color: #b42318; }
+
+.readiness-copy > p {
+  max-width: 820px;
+  margin: 12px 0 0;
+  color: #667085;
+  line-height: 1.7;
+}
+
+.readiness-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-self: center;
+  gap: 8px;
+}
+
+.readiness-metrics div {
+  min-width: 0;
+  padding: 13px 10px;
+  border: 1px solid #e8eeec;
+  border-radius: 12px;
+  background: #f8fbfa;
+  text-align: center;
+}
+
+.readiness-metrics span,
+.readiness-metrics strong { display: block; }
+
+.readiness-metrics span {
+  overflow: hidden;
+  color: #7b8494;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.readiness-metrics strong {
+  margin-top: 4px;
+  color: #172033;
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.readiness-focus,
+.readiness-clear {
+  grid-column: 1 / -1;
+  padding-top: 17px;
+  border-top: 1px solid #edf1f0;
+}
+
+.focus-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.focus-head button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #0f766e;
+  cursor: pointer;
+  font: inherit;
+}
+
+.readiness-focus ul {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.readiness-focus li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 11px;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #475467;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.readiness-focus i {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #f59e0b;
+}
+
+.readiness-focus i.is-error { background: #ef4444; }
+.readiness-focus i.is-info { background: #3b82f6; }
+
+.readiness-clear {
+  color: #067647;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.readiness-clear span {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  margin-right: 7px;
+  place-items: center;
+  border-radius: 50%;
+  background: #ecfdf3;
+}
+
+@media (max-width: 900px) {
+  .trip-readiness { grid-template-columns: 1fr; }
+  .readiness-focus ul { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .trip-readiness { padding: 20px 17px; border-radius: 14px; }
+  .readiness-title-row { align-items: flex-start; flex-direction: column; }
+}
+
+
+.trip-readiness.is-unchecked {
+  border-color: rgba(100, 116, 139, 0.22);
+}
+
+.is-unchecked .readiness-badge {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.readiness-unchecked {
+  grid-column: 1 / -1;
+  padding-top: 17px;
+  border-top: 1px solid #edf1f0;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.readiness-unchecked span {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  margin-right: 7px;
+  place-items: center;
+  border-radius: 50%;
+  background: #f1f5f9;
 }
 </style>

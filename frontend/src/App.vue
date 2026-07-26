@@ -26,7 +26,7 @@
                 <MailOutlined />
                 <span>收件邮箱</span>
               </a-menu-item>
-              <a-menu-item @click="handleLogout">退出登录</a-menu-item>
+              <a-menu-item :disabled="logoutBusy" @click="handleLogout">退出登录</a-menu-item>
             </a-menu>
           </template>
         </a-dropdown>
@@ -85,13 +85,21 @@ import {
 } from '@ant-design/icons-vue'
 import AgentAssistantModal from '@/components/AgentAssistantModal.vue'
 import AuthDialog from '@/components/AuthDialog.vue'
-import { getCurrentUser, logout, restoreSession, updateEmail, type LocalUser } from '@/services/auth'
+import {
+  getCurrentUser,
+  logout,
+  LogoutNotConfirmedError,
+  restoreSession,
+  updateEmail,
+  type LocalUser
+} from '@/services/auth'
 import { unsubscribeFromPush } from '@/services/pushNotifications'
 
 const authOpen = ref(false)
 const agentOpen = ref(false)
 const emailOpen = ref(false)
 const emailSaving = ref(false)
+const logoutBusy = ref(false)
 const accountEmail = ref('')
 const currentUser = ref<LocalUser | null>(getCurrentUser())
 
@@ -134,17 +142,28 @@ const saveEmail = async () => {
 }
 
 const handleLogout = async () => {
+  if (logoutBusy.value) return
+  logoutBusy.value = true
   try {
-    const result = await unsubscribeFromPush()
-    if (result.cleanupError) {
-      console.warn('[push] Server-side subscription cleanup failed:', result.cleanupError)
+    try {
+      const result = await unsubscribeFromPush()
+      if (result.cleanupError) {
+        console.warn('[push] Server-side subscription cleanup failed:', result.cleanupError)
+      }
+    } catch (error) {
+      console.warn('[push] Browser subscription cleanup failed:', error)
     }
-  } catch (error) {
-    console.warn('[push] Browser subscription cleanup failed:', error)
+    await logout()
+    message.success('\u5df2\u9000\u51fa\u767b\u5f55')
+  } catch (error: unknown) {
+    if (error instanceof LogoutNotConfirmedError) {
+      message.error(error.message)
+    } else {
+      message.error('\u9000\u51fa\u5931\u8d25\uff0c\u5f53\u524d\u767b\u5f55\u72b6\u6001\u5df2\u4fdd\u7559\uff0c\u8bf7\u91cd\u8bd5\u3002')
+    }
+  } finally {
+    logoutBusy.value = false
   }
-  await logout()
-  currentUser.value = null
-  message.success('已退出登录')
 }
 
 onMounted(async () => {
