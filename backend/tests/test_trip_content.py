@@ -445,16 +445,31 @@ def test_gentle_cap_keeps_free_text_named_core_attraction_over_prefix_order() ->
 
 def test_multiple_user_named_attractions_over_cap_are_kept_with_overflow_note() -> None:
     """More named attractions than cap: keep named ones and surface tradeoff note."""
+    from app.services.trip_plan_quality_service import (
+        TripPlanQualityService,
+        issue_disposition,
+    )
+
     planner = _empty_amap_planner()
     plan = _three_attraction_plan()
     named = [item.name for item in plan.days[0].attractions]
     request = _request().model_copy(
         update={
             "origin_city": "北京",
+            "city": "北京",
+            "start_date": "2030-01-01",
+            "end_date": "2030-01-01",
+            "travel_days": 1,
             "preferences": ["轻松出游"],
-            "free_text_input": f"必去{named[0]}、{named[1]}和{named[2]}，缓节奏",
+            "free_text_input": f"必去：{named[0]}、{named[1]}、{named[2]}，缓节奏",
         }
     )
+    plan.start_date = "2030-01-01"
+    plan.end_date = "2030-01-01"
+    for attraction in plan.days[0].attractions:
+        attraction.coordinate_source = "amap_poi"
+        attraction.poi_id = attraction.poi_id or f"poi-{attraction.name}"
+
     result = planner._finalize_generated_content(request, plan)
     kept = [item.name for item in result.days[0].attractions]
 
@@ -462,6 +477,17 @@ def test_multiple_user_named_attractions_over_cap_are_kept_with_overflow_note() 
     assert len(kept) == 3  # overflow allowed for named cores
     assert "优先保留点名景点" in result.overall_suggestions
     assert "取舍" in result.overall_suggestions
+    # Day description must only mention retained names.
+    for name in kept:
+        assert name in (result.days[0].description or "")
+
+    quality = TripPlanQualityService().evaluate(request, result)
+    overload = [issue for issue in quality.issues if issue.code == "RELAXED_PACE_OVERLOAD"]
+    assert overload
+    assert all(issue_disposition(issue) == "advisory" for issue in overload)
+    assert quality.publishable is True
+    assert quality.review_required is True
+    assert quality.status != "failed"
 
 
 def test_pacing_markers_do_not_scan_attraction_descriptions() -> None:
@@ -477,6 +503,126 @@ def test_pacing_markers_do_not_scan_attraction_descriptions() -> None:
     plan = _three_attraction_plan()
     plan.days[0].attractions[0].description = "适合亲子与老人休闲，少走路也不赶行程"
     assert planner._needs_gentle_pacing(request) is False
+
+
+def test_named_attraction_matching_requires_positive_context_and_rejects_generics() -> None:
+    """Rule-based named matching: short specific names yes; generics/negation no."""
+    from app.models.schemas import Attraction, Location
+    from app.services.trip_pacing_contract import is_user_named_attraction
+
+    def att(name: str) -> Attraction:
+        return Attraction(
+            name=name,
+            address="测试市测试区1号",
+            location=Location(longitude=116.3, latitude=39.9),
+            visit_duration=90,
+            description="可执行地点",
+            category="景点",
+            poi_id=f"poi-{name}",
+            coordinate_source="amap_poi",
+        )
+
+    cases = [
+        ("想去西湖", "西湖", True),
+        ("想去西湖", "西湖风景名胜区", True),  # colloquial short form vs grounded official name
+        ("必去：甲乙文化馆", "甲乙文化馆", True),
+        ("不想去西湖", "西湖", False),
+        ("不想去西湖", "西湖风景名胜区", False),
+        ("儿童医院附近找个公园", "公园", False),
+        ("想安排博物馆类景点", "博物馆", False),
+        ("想去博物馆", "陕西历史博物馆", False),  # generic token alone must not match
+        ("想去人民公园", "人民公园", True),
+    ]
+    for free_text, name, expected in cases:
+        request = _request().model_copy(update={"free_text_input": free_text})
+        assert is_user_named_attraction(request, att(name)) is expected, (free_text, name)
+
+
+def test_gentle_cap_keeps_colloquial_named_core_after_official_poi_rename() -> None:
+    """free_text short form still prioritizes grounded official POI name."""
+    planner = _empty_amap_planner()
+    request = _request().model_copy(
+        update={
+            "origin_city": "北京",
+            "preferences": ["亲子"],
+            "free_text_input": "想去西湖，轻松一点",
+        }
+    )
+    plan = _three_attraction_plan()
+    # Simulate post-ground rename: model short name → official AMap name.
+    plan.days[0].attractions[2].name = "西湖风景名胜区"
+    plan.days[0].attractions[2].coordinate_source = "amap_poi"
+    plan.days[0].attractions[2].poi_id = "poi-xihu-official"
+
+    result = planner._finalize_generated_content(request, plan)
+    names = [item.name for item in result.days[0].attractions]
+    assert "西湖风景名胜区" in names
+    assert len(names) == 2
+
+
+def test_place_name_free_text_does_not_false_trigger_gentle_pacing() -> None:
+    """Hospital/street/hotel place names must not alone trigger gentle pacing."""
+    planner = MultiAgentTripPlanner.__new__(MultiAgentTripPlanner)
+    false_triggers = (
+        "儿童医院附近",
+        "老人街附近",
+        "亲子酒店附近",
+        "父母路附近",
+        "儿童公园怎么去",
+        "老人街有什么景点",
+        "推荐一些避暑景点",
+    )
+    for free_text in false_triggers:
+        request = _request().model_copy(
+            update={"preferences": ["历史文化"], "free_text_input": free_text}
+        )
+        assert planner._needs_gentle_pacing(request) is False, free_text
+
+
+def test_summer_retreat_alone_is_not_gentle_but_combined_phrases_are() -> None:
+    """Climate-only 避暑 is not gentle; combined parent/slow phrases still are."""
+    planner = MultiAgentTripPlanner.__new__(MultiAgentTripPlanner)
+    only_summer = _request().model_copy(
+        update={"preferences": [], "free_text_input": "推荐一些避暑景点"}
+    )
+    summer_easy = _request().model_copy(
+        update={"preferences": [], "free_text_input": "避暑，行程轻松一点"}
+    )
+    parents_summer = _request().model_copy(
+        update={"preferences": [], "free_text_input": "带父母去避暑，不想太累"}
+    )
+    assert planner._needs_gentle_pacing(only_summer) is False
+    assert planner._needs_gentle_pacing(summer_easy) is True
+    assert planner._needs_gentle_pacing(parents_summer) is True
+
+    plan = _three_attraction_plan()
+    only_result = planner._finalize_generated_content(
+        only_summer.model_copy(update={"origin_city": "北京"}), plan.model_copy(deep=True)
+    )
+    assert "降低每日主景点密度" not in only_result.overall_suggestions
+    assert len(only_result.days[0].attractions) == 3
+
+
+def test_trimmed_attraction_is_removed_from_day_description() -> None:
+    """Dropped non-named attractions must not remain in rebuilt day description."""
+    planner = _empty_amap_planner()
+    request = _request().model_copy(
+        update={
+            "origin_city": "北京",
+            "preferences": ["亲子"],
+            "free_text_input": "想去测试科技馆丙，轻松一点",
+        }
+    )
+    plan = _three_attraction_plan()
+    result = planner._finalize_generated_content(request, plan)
+    names = [item.name for item in result.days[0].attractions]
+    description = result.days[0].description or ""
+    assert "测试科技馆丙" in names
+    for name in names:
+        assert name in description
+    for attraction in plan.days[0].attractions:
+        if attraction.name not in names:
+            assert attraction.name not in description
 
 
 def test_intercity_arrival_day_caps_lighter_than_mid_trip_default() -> None:
