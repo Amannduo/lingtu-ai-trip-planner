@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 import sys
 import types
 
@@ -61,6 +62,102 @@ def test_field_bindings_carry_explicit_inferred_and_unknown() -> None:
     assert contract.start_date.pending_confirmation is True
     assert contract.destination_city.source == "unknown"
     assert "start_date" in contract.pending_fields
+
+
+def test_explicit_traveler_count_with_party_descriptor_is_preserved() -> None:
+    service = SemanticContractService()
+    contract = service.extract_from_text(
+        "周末从山西太原出发，想去附近的城市避个暑，两个年轻人，预算3000",
+        reference_date=date(2026, 7, 26),
+    )
+
+    assert contract.origin_city.value == "山西太原"
+    assert contract.travel_days.value == 2
+    assert contract.budget.value == 3000
+    assert contract.travelers.value == 2
+    assert contract.travelers.source == "user_explicit"
+    assert contract.travelers.confidence == "high"
+    assert contract.travelers.pending_confirmation is False
+    assert contract.travelers.evidence == "两个年轻人"
+    assert contract.travel_party.value == "两个年轻人"
+    assert "travelers" not in contract.pending_fields
+    assert service.apply_values(contract)["travelers"] == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "两个城市",
+        "三个景点",
+        "住三人间",
+        "订两人房",
+        "住三人标准间",
+        "订两人家庭房",
+    ],
+)
+def test_non_party_counts_are_not_inferred_as_travelers(text: str) -> None:
+    assert SemanticContractService().extract_from_text(text).travelers.value is None
+
+
+def test_additive_party_groups_are_summed_and_preserved() -> None:
+    service = SemanticContractService()
+    contract = service.extract_from_text("两个年轻人和一个老人去避暑")
+
+    assert contract.travelers.value == 3
+    assert contract.travelers.pending_confirmation is False
+    assert contract.travelers.evidence == "两个年轻人和一个老人"
+    assert contract.travel_party.value == "两个年轻人和一个老人"
+
+
+def test_non_additive_party_groups_and_suffix_approximation_stay_pending() -> None:
+    service = SemanticContractService()
+    alternatives = service.extract_from_text("两名学生或三名成人都可以")
+    approximate = service.extract_from_text("两个年轻人左右去避暑")
+
+    assert alternatives.travelers.value == 2
+    assert alternatives.travelers.pending_confirmation is True
+    assert "travelers" in alternatives.pending_fields
+    assert approximate.travelers.value == 2
+    assert approximate.travelers.pending_confirmation is True
+
+
+def test_out_of_range_traveler_total_stays_unknown_and_does_not_project() -> None:
+    service = SemanticContractService()
+    contract = service.extract_from_text(
+        "十个年轻人和十个学生和一个老人从太原出发玩两天"
+    )
+
+    assert contract.travelers.value is None
+    assert contract.travelers.source == "unknown"
+    assert contract.travelers.pending_confirmation is True
+    assert "travelers" in contract.pending_fields
+    assert "1至20人" in contract.travelers.evidence
+    assert contract.travel_party.pending_confirmation is True
+    assert service.to_recommendation_context(contract).travelers is None
+
+
+def test_out_of_range_travelers_survive_merge_as_pending_conflict() -> None:
+    service = SemanticContractService()
+    base = service.contract_from_form(RecommendationContext(travelers=1))
+    incoming = service.extract_from_text(
+        "十个年轻人和十个学生和一个老人从太原出发玩两天"
+    )
+    merged = service.merge(base, incoming)
+
+    assert merged.travelers.value == 1
+    assert merged.travelers.source == "form_confirmed"
+    assert merged.travelers.pending_confirmation is True
+    assert merged.travel_party.pending_confirmation is True
+    assert {"travelers", "travel_party"}.issubset(set(merged.pending_fields))
+    assert merged.conflicts
+
+    agent = build_agent()
+    context = agent._context_from_contract(
+        merged,
+        RecommendationContext(travelers=1),
+    )
+    summary = agent._understood_summary(merged, context)
+    assert "1人（十个年轻人" not in summary
 
 
 def test_latest_user_explicit_overrides_form_defaults() -> None:
