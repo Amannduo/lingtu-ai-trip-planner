@@ -52,8 +52,10 @@ class TransportBudgetService:
         hotel_quote = self._estimate_hotel(request, trip_plan, hotel_nights, hotel_rooms)
         intercity_quote = self._estimate_intercity_transport(request)
 
-        attraction_total = self._sum_attraction_costs(trip_plan)
-        meal_total = self._sum_meal_costs(trip_plan)
+        # ticket_price / meal estimated_cost are per-person unit estimates
+        # (model output and planner defaults); scale by travelers for party total.
+        attraction_total = self._sum_attraction_costs(trip_plan, request.travelers)
+        meal_total = self._sum_meal_costs(trip_plan, request.travelers)
         budget_notes: List[str] = []
 
         if meal_total <= 0:
@@ -233,16 +235,19 @@ class TransportBudgetService:
             chosen.notes = self._unique_notes(chosen.notes)
             return chosen
 
-        fallback_unit = 300
+        # unit_price is single-person ROUNDTRIP (matches FlyAI path and Budget.transport_unit_price).
+        # Do not multiply by an extra *2 — that double-counted the return leg.
+        fallback_unit = 600
+        total_price = fallback_unit * max(1, request.travelers)
         print(
             "[budget] intercity fallback: "
-            f"unit={fallback_unit}, travelers={request.travelers}, total={fallback_unit * request.travelers * 2}"
+            f"roundtrip_unit={fallback_unit}, travelers={request.travelers}, total={total_price}"
         )
         return QuoteResult(
             unit_price=fallback_unit,
-            total_price=fallback_unit * request.travelers * 2,
+            total_price=total_price,
             reference=f"{request.origin_city} 往返 {request.city} 交通兜底估算",
-            notes=["未获取到 FlyAI 城际交通价格，已按单人往返 300 元兜底估算。"],
+            notes=["未获取到 FlyAI 城际交通价格，已按单人往返 600 元兜底估算。"],
             source="heuristic_transport"
         )
 
@@ -397,19 +402,19 @@ class TransportBudgetService:
                     return attraction.name
         return None
 
-    def _sum_attraction_costs(self, trip_plan: TripPlan) -> int:
-        total = 0
+    def _sum_attraction_costs(self, trip_plan: TripPlan, travelers: int = 1) -> int:
+        single_person_total = 0
         for day in trip_plan.days:
             for attraction in day.attractions:
-                total += max(0, int(attraction.ticket_price or 0))
-        return total
+                single_person_total += max(0, int(attraction.ticket_price or 0))
+        return single_person_total * max(1, travelers)
 
-    def _sum_meal_costs(self, trip_plan: TripPlan) -> int:
-        total = 0
+    def _sum_meal_costs(self, trip_plan: TripPlan, travelers: int = 1) -> int:
+        single_person_total = 0
         for day in trip_plan.days:
             for meal in day.meals:
-                total += max(0, int(meal.estimated_cost or 0))
-        return total
+                single_person_total += max(0, int(meal.estimated_cost or 0))
+        return single_person_total * max(1, travelers)
 
     def _estimate_meal_cost(self, request: TripRequest) -> int:
         daily_cost = 120
