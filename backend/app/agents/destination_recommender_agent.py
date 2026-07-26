@@ -1142,6 +1142,20 @@ class DestinationRecommenderAgent:
         early_hint: Optional[str],
         is_friday_early: bool,
     ) -> str:
+        from ..config import get_settings
+
+        if not bool(
+            getattr(
+                get_settings(),
+                "recommendation_machine_block_write_enabled",
+                True,
+            )
+        ):
+            # S4c: the signed token is the structured carrier; free text
+            # keeps only the user's own words so entry extraction reads
+            # pure user intent. Machine-block *reading* stays supported.
+            return str(contract.raw_text or "")[:500]
+
         constraints: List[str] = []
         if contract.pace.is_known():
             constraints.append(str(contract.pace.value))
