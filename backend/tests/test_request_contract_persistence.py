@@ -195,7 +195,9 @@ def test_legacy_weak_rule_demotes_publishable_and_hints_regenerate() -> None:
 
     assert quality.validation_mode == "legacy_weak"
     assert quality.quality_status == "needs_review"
-    assert quality.publishable is False
+    # Reviewable model: saving stays allowed, but never review-free.
+    assert quality.publishable is True
+    assert quality.review_required is True
     legacy = next(
         i for i in quality.issues if i.code == "LEGACY_WEAK_VALIDATION"
     )

@@ -533,7 +533,7 @@ class AgentAuditResult(BaseModel):
     """联网智能体输出审核结果"""
     status: str = Field(default="warning", description="审核状态: passed/warning/failed")
     source: str = Field(default="", description="输出来源")
-    audit_level: Literal["format_only", "semantic_verified"] = Field(
+    audit_level: Literal["format_only", "semantic_verified", "offline_fallback"] = Field(
         default="format_only",
         description="Audit capability: format/citation checks or semantic verification",
     )
@@ -564,9 +564,20 @@ class TripPlanQualityResult(BaseModel):
         default=False,
         description="Whether automatic persistence and delivery are allowed",
     )
+    review_required: bool = Field(
+        default=False,
+        description=(
+            "Reviewable-delivery flag: the plan may persist and deliver, "
+            "but carries notices the user should review"
+        ),
+    )
     quality_status: str = Field(
         default="blocked",
-        description="blocked | needs_review | publishable — unified gate decision",
+        description=(
+            "blocked | needs_review | publishable — unified gate decision "
+            "(blocked ⟺ not publishable; needs_review ⟺ publishable with "
+            "review_required)"
+        ),
     )
     validation_mode: str = Field(
         default="full",

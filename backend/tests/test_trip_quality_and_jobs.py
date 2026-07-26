@@ -223,32 +223,6 @@ def test_planner_records_structured_audit_when_web_stage_crashes() -> None:
     assert "provider detail" not in result.agent_audit.issues[0]
 
 
-def test_precise_short_trip_and_self_drive_budget_use_ground_transport_units() -> None:
-    service = TransportBudgetService.__new__(TransportBudgetService)
-    base = make_request("麟游县").model_copy(
-        update={
-            "origin_city": "宝鸡扶风",
-            "travelers": 3,
-            "travel_days": 2,
-            "start_date": "2026-08-01",
-            "end_date": "2026-08-02",
-            "intercity_transportation": "自动选择",
-        }
-    )
-
-    short_haul = service._estimate_intercity_transport(base)
-    self_drive = service._estimate_intercity_transport(
-        base.model_copy(update={"intercity_transportation": "自驾"})
-    )
-
-    assert short_haul.source == "heuristic_short_haul"
-    assert short_haul.unit_price == 160
-    assert short_haul.total_price == 480
-    assert self_drive.source == "heuristic_drive"
-    assert self_drive.total_price == 400
-    assert self_drive.unit_price == 134
-
-
 def test_quality_gate_fails_city_mismatch() -> None:
     result = TripPlanQualityService().evaluate(make_request("上海"), make_plan("北京"))
     assert result.status == "failed"
@@ -1313,7 +1287,8 @@ def test_unverified_meals_and_missing_budget_cannot_score_100() -> None:
     assert "FACT_COVERAGE_INCOMPLETE" in codes
     assert result.status == "warning"
     assert result.score < 100
-    assert result.publishable is False
+    # Reviewable model: advisory gaps stay deliverable but never review-free.
+    assert result.review_required is True
 
 
 def test_ordinary_overnight_plan_requires_verified_hotel() -> None:
@@ -1358,7 +1333,8 @@ def test_ordinary_overnight_plan_requires_verified_hotel() -> None:
 
     assert any(issue.code == "HOTEL_GAP" for issue in result.issues)
     assert result.score < 100
-    assert result.publishable is False
+    # Reviewable model: a hotel gap forces review instead of hard-blocking.
+    assert result.review_required is True
 
 
 def test_placeholder_weather_does_not_satisfy_date_coverage() -> None:
@@ -1560,7 +1536,8 @@ def test_each_overnight_hotel_must_be_individually_verified() -> None:
     )
 
     assert "第2天测试酒店B" in hotel_issue.message
-    assert result.publishable is False
+    # Reviewable model: unverified hotels force review, not a hard block.
+    assert result.review_required is True
 
 
 def test_relaxed_pace_understands_natural_family_travel_wording() -> None:

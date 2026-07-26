@@ -159,8 +159,9 @@ class _PublishableQualityStub:
     def evaluate(self, _request, _plan) -> TripPlanQualityResult:
         return TripPlanQualityResult(
             status="passed",
-            score=95,
+            score=100,
             publishable=True,
+            review_required=False,
             quality_status="publishable",
             checked_items=["基础检查"],
             issues=[],
@@ -171,8 +172,8 @@ def test_enrichment_failure_demotes_quality_status_not_only_publishable(
     monkeypatch,
 ) -> None:
     """A publishable evaluation + failed enrichment must end as
-    needs_review — never publishable=False with quality_status='publishable'
-    (which downstream gates would persist and deliver)."""
+    needs_review (reviewable model: still savable, but the review flag and
+    quality_status must both reflect the degradation)."""
     monkeypatch.setattr(
         graph_module,
         "get_trip_plan_quality_service",
@@ -183,14 +184,14 @@ def test_enrichment_failure_demotes_quality_status_not_only_publishable(
     result = graph.run(_request())
 
     assert result.quality is not None
-    assert result.quality.publishable is False
+    assert result.quality.review_required is True
     assert result.quality.quality_status == "needs_review"
     assert resolve_plan_quality_status(result) == "needs_review"
 
 
 def test_gate_triple_stays_coherent_after_graph_run(monkeypatch) -> None:
-    """Invariant: quality_status=='publishable' if and only if
-    publishable is True."""
+    """Invariant: quality_status=='publishable' iff publishable without
+    the review flag; 'blocked' iff not publishable."""
     monkeypatch.setattr(
         graph_module,
         "get_trip_plan_quality_service",
@@ -199,9 +200,11 @@ def test_gate_triple_stays_coherent_after_graph_run(monkeypatch) -> None:
     graph = TripPlanningAgentGraph(_PlannerStub())
     result = graph.run(_request())
 
-    assert (result.quality.quality_status == "publishable") == bool(
-        result.quality.publishable
+    quality = result.quality
+    assert (quality.quality_status == "publishable") == bool(
+        quality.publishable and not quality.review_required
     )
+    assert (quality.quality_status == "blocked") == (not quality.publishable)
 
 
 def test_agent_gate_and_route_gate_agree_on_stub_quality_objects() -> None:
@@ -223,11 +226,12 @@ def test_agent_gate_and_route_gate_agree_on_stub_quality_objects() -> None:
 @pytest.mark.parametrize(
     "score,severity,mode,force,expected_status,expected_publishable",
     [
-        (95, None, "primary", False, "publishable", True),
-        (60, None, "primary", False, "needs_review", False),
+        (100, None, "primary", False, "publishable", True),
+        (95, None, "primary", False, "needs_review", True),
+        (60, None, "primary", False, "needs_review", True),
         (95, "error", "primary", False, "blocked", False),
-        (95, None, "map_fallback", False, "blocked", False),
-        (95, None, "primary", True, "needs_review", False),
+        (95, None, "map_fallback", False, "needs_review", True),
+        (95, None, "primary", True, "needs_review", True),
     ],
 )
 def test_refresh_quality_gate_matrix(
@@ -253,8 +257,9 @@ def test_refresh_quality_gate_matrix(
     assert quality.publishable is expected_publishable
 
 
-def test_blocking_code_blocks_even_with_warning_severity() -> None:
-    """Codes in BLOCKING_CODES block regardless of severity or score."""
+def test_soft_budget_warning_is_advisory_not_blocking() -> None:
+    """Integrated disposition policy: a warning-severity budget gap keeps
+    the plan deliverable (advisory + review), it no longer hard-blocks."""
     quality = TripPlanQualityResult(
         score=95,
         issues=[
@@ -262,6 +267,26 @@ def test_blocking_code_blocks_even_with_warning_severity() -> None:
                 code="BUDGET_MISSING",
                 severity="warning",
                 path="budget",
+                message="预算缺失",
+            )
+        ],
+    )
+    refresh_quality_gate(quality, generation_mode="primary")
+    assert quality.quality_status == "needs_review"
+    assert quality.publishable is True
+    assert quality.review_required is True
+
+
+def test_structural_code_blocks_even_with_warning_severity() -> None:
+    """Structural codes in BLOCKING_ISSUE_CODES block regardless of
+    severity or score."""
+    quality = TripPlanQualityResult(
+        score=95,
+        issues=[
+            TripPlanQualityIssue(
+                code="EMPTY_DAY",
+                severity="warning",
+                path="days[0]",
                 message="预算缺失",
             )
         ],

@@ -140,16 +140,18 @@ def test_create_job_streams_progress_and_result(job_client, monkeypatch) -> None
     notify.assert_called_once_with("user-jobs", "杭州", "P-JOB-1")
 
 
-def test_needs_review_plan_streams_result_without_auto_save(
+def test_needs_review_plan_streams_result_and_persists_with_notices(
     job_client, monkeypatch
 ) -> None:
-    """Mid-score non-blocking plans must reach the client without persistence."""
+    """Reviewable-delivery model: mid-score non-blocking plans persist and
+    reach the client carrying their review notices."""
     client, _service, save, email, notify = job_client
     plan = _ok_plan()
     plan.quality = TripPlanQualityResult(
         status="warning",
         score=60,
-        publishable=False,
+        publishable=True,
+        review_required=True,
         quality_status="needs_review",
     )
 
@@ -170,9 +172,10 @@ def test_needs_review_plan_streams_result_without_auto_save(
     assert "event: result" in streamed.text
     assert "event: error" not in streamed.text
     assert '"needs_review":true' in streamed.text.replace(" ", "")
-    save.assert_not_called()
-    email.assert_not_called()
-    notify.assert_not_called()
+    assert '"plan_no":"P-JOB-1"' in streamed.text.replace(" ", "")
+    save.assert_called_once()
+    email.assert_not_called()  # not requested in the payload
+    notify.assert_called_once_with("user-jobs", "杭州", "P-JOB-1")
 
 
 def test_quality_rejection_fails_job_without_save(job_client, monkeypatch) -> None:
