@@ -102,24 +102,6 @@ export interface AgentAuditResult {
   audit_level?: 'format_only' | 'semantic_verified' | 'offline_fallback' | string
 }
 
-export interface TripPlanQualityIssue {
-  code: string
-  severity: 'info' | 'warning' | 'error' | string
-  path: string
-  message: string
-  suggestion: string
-  auto_repaired: boolean
-}
-
-export interface TripPlanQualityResult {
-  status: 'passed' | 'warning' | 'failed' | string
-  score: number
-  checked_items: string[]
-  issues: TripPlanQualityIssue[]
-  verified_facts: number
-  generated_at: string
-}
-
 export interface DayPlan {
   date: string
   day_index: number
@@ -156,6 +138,10 @@ export interface TripPlanQualityResult {
   score: number
   publishable: boolean
   review_required?: boolean
+  /** blocked | needs_review | publishable — unified gate decision */
+  quality_status?: 'blocked' | 'needs_review' | 'publishable' | string
+  /** full | legacy_weak — validation context completeness on edits */
+  validation_mode?: 'full' | 'legacy_weak' | string
   checked_items?: string[]
   issues?: TripPlanQualityIssue[]
   verified_facts?: number
