@@ -157,15 +157,36 @@ def generation_capacity_snapshot() -> dict[str, int]:
     }
 
 
-def reset_generation_capacity_for_tests() -> None:
-    """Recreate the process semaphore after verifying workers released slots.
+class GenerationCapacityBusyError(RuntimeError):
+    """Raised when a capacity reset is attempted while workers still hold slots."""
 
-    Production paths must release via ``run_with_generation_capacity``'s
-    ``finally``. This helper only restores a clean slate for isolated tests
-    when leftover threads from other suites are impossible to join.
+
+def reset_generation_capacity_for_tests() -> None:
+    """Recreate the process semaphore — TESTS ONLY, and only when idle.
+
+    Usage constraint: **every worker must have returned its slot first.**
+    ``run_with_generation_capacity`` releases the semaphore object it acquired,
+    so rebinding the global while a worker is still running lets that worker's
+    release land on the *new* semaphore — either raising
+    ``ValueError: Semaphore released too many times`` inside the worker thread,
+    or inflating real concurrency above ``_GENERATION_SLOT_COUNT``.
+
+    This function therefore refuses to reset while slots are held. Callers must
+    join their threads, or wait on :func:`generation_capacity_snapshot` until
+    ``held == 0``, before calling it. ``held`` is now decremented in the same
+    critical section as ``release()``, so that snapshot is authoritative
+    rather than transiently optimistic.
+
+    Raises:
+        GenerationCapacityBusyError: if any slot is still held.
     """
     global _generation_slots, _generation_slots_held
     with _generation_slots_lock:
+        if _generation_slots_held > 0:
+            raise GenerationCapacityBusyError(
+                f"cannot reset generation capacity: {_generation_slots_held} "
+                "slot(s) still held; join the worker threads first"
+            )
         _generation_slots = threading.BoundedSemaphore(_GENERATION_SLOT_COUNT)
         _generation_slots_held = 0
 
@@ -178,19 +199,22 @@ def run_with_generation_capacity(worker: Callable[[], Any]) -> Any:
     covering success, quality rejection, cancellation, timeout, and crashes.
     """
     global _generation_slots_held
-    acquired = False
-    if not _generation_slots.acquire(blocking=False):
+    # Bind the semaphore we acquire so a concurrent test-only reset can never
+    # redirect our release onto a different object.
+    with _generation_slots_lock:
+        semaphore = _generation_slots
+    if not semaphore.acquire(blocking=False):
         raise TripGenerationCapacityError("all generation slots are busy")
-    acquired = True
     with _generation_slots_lock:
         _generation_slots_held += 1
     try:
         return worker()
     finally:
-        if acquired:
-            with _generation_slots_lock:
-                _generation_slots_held = max(0, _generation_slots_held - 1)
-            _generation_slots.release()
+        # Decrement and release in one critical section: otherwise ``held``
+        # reads 0 while the slot is still out, and waiters gate on a lie.
+        with _generation_slots_lock:
+            _generation_slots_held = max(0, _generation_slots_held - 1)
+            semaphore.release()
 
 
 def _bounded_text(value: Any, limit: int) -> str:

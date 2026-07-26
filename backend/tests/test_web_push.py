@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,7 +58,7 @@ def _configure_vapid(monkeypatch) -> None:
     monkeypatch.setattr(settings, "web_push_dns_timeout_seconds", 3.0)
     monkeypatch.setattr(settings, "web_push_max_subscriptions_per_user", 20)
     monkeypatch.setattr(settings, "web_push_delivery_budget_seconds", 30.0)
-    monkeypatch.setattr(settings, "web_push_allowed_host_suffixes", "")
+    monkeypatch.setattr(settings, "web_push_allowed_host_suffixes", "example.test")
     monkeypatch.setattr(
         "app.services.web_push_service._resolve_global_addresses",
         lambda _hostname, _port, _timeout=None: {"8.8.8.8"},
@@ -163,6 +164,52 @@ def test_push_subscription_routes_are_authenticated_and_idempotent(
                 "success": True,
                 "deleted": False,
             }
+    finally:
+        if user_id:
+            _delete_user(user_id)
+
+
+def test_subscription_quota_is_atomic_under_concurrency(monkeypatch) -> None:
+    _configure_vapid(monkeypatch)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "web_push_max_subscriptions_per_user", 2)
+    suffix = uuid.uuid4().hex[:10]
+    user_id = ""
+
+    try:
+        with TestClient(app) as client:
+            registered = client.post(
+                "/api/auth/register",
+                json={
+                    "username": f"quota_{suffix}",
+                    "password": "Passw0rd123",
+                },
+            )
+            assert registered.status_code == 201
+            user_id = registered.json()["user"]["user_id"]
+
+        endpoints = [
+            f"https://push.example.test/quota/{suffix}/{index}"
+            for index in range(8)
+        ]
+
+        def register(endpoint: str) -> str:
+            try:
+                saved = save_push_subscription(user_id, _subscription(endpoint))
+                return "created" if saved.created else "updated"
+            except ValueError as exc:
+                assert "limit" in str(exc).lower()
+                return "limited"
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            outcomes = list(executor.map(register, endpoints))
+
+        assert outcomes.count("created") == 2
+        assert outcomes.count("limited") == 6
+        assert fetch_scalar(
+            "SELECT COUNT(*) FROM push_subscriptions WHERE user_id = :user_id",
+            {"user_id": user_id},
+        ) == 2
     finally:
         if user_id:
             _delete_user(user_id)

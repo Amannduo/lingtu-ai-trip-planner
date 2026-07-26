@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.api.main import app
 from app.config import get_settings
-from app.models.schemas import TripPlan
+from app.models.schemas import TripPlan, TripPlanQualityResult
 from app.services.database_service import execute
 from app.services.trip_email_service import deliver_trip_plan_email, render_trip_plan_text
 from app.tools.send_email_tool import send_email
@@ -42,7 +42,14 @@ def test_email_registration_login_and_update() -> None:
             assert user["email"] == email
             assert client.get("/api/auth/me").status_code == 200
 
+            cookie_name = get_settings().auth_cookie_name
+            old_token = client.cookies.get(cookie_name)
+            assert old_token
             assert client.post("/api/auth/logout").status_code == 200
+            client.cookies.set(cookie_name, old_token)
+            assert client.get("/api/auth/me").status_code == 401
+            client.cookies.delete(cookie_name)
+
             logged_in = client.post(
                 "/api/auth/login",
                 json={"username": email, "password": "Passw0rd123"},
@@ -82,12 +89,17 @@ def test_trip_email_dry_run(monkeypatch) -> None:
 def test_plan_route_uses_bound_email(monkeypatch) -> None:
     class FakePlanner:
         @staticmethod
-        def plan_trip(_request):
+        def plan_trip(_request, progress_callback=None):
             return TripPlan(
                 city="苏州",
                 start_date="2026-09-01",
                 end_date="2026-09-01",
                 days=[],
+                quality=TripPlanQualityResult(
+                    status="passed",
+                    score=90,
+                    publishable=True,
+                ),
                 overall_suggestions="按预约时间抵达景点。",
             )
 
@@ -261,12 +273,17 @@ def test_invalid_smtp_config_is_reported_without_raising(monkeypatch) -> None:
 def test_unexpected_email_failure_does_not_fail_saved_trip(monkeypatch) -> None:
     class FakePlanner:
         @staticmethod
-        def plan_trip(_request):
+        def plan_trip(_request, progress_callback=None):
             return TripPlan(
                 city="南京",
                 start_date="2026-10-01",
                 end_date="2026-10-01",
                 days=[],
+                quality=TripPlanQualityResult(
+                    status="passed",
+                    score=90,
+                    publishable=True,
+                ),
                 overall_suggestions="提前预约需要的景点。",
             )
 

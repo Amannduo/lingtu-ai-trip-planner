@@ -196,7 +196,11 @@ def _build_llm_sql_plan(message: str, user_id: str, role: str) -> SQLPlan | None
     from hello_agents import SimpleAgent
 
     role = normalize_role(role)
-    is_scoped = role in ("guest", "user")
+    # Dynamic model-authored SQL is reserved for administrators. User and
+    # manager analytics use the deterministic allow-list planner.
+    if role != "admin":
+        return None
+    is_scoped = False
 
     llm = get_llm()
     agent = SimpleAgent(
@@ -241,7 +245,7 @@ def _try_generate_sql(agent, prompt: str, fallback_message: str) -> tuple[str | 
     try:
         response = agent.run(prompt)
     except Exception as exc:
-        print(f"[llm_sql] LLM call failed: {exc}")
+        print(f"[llm_sql] LLM call failed: {type(exc).__name__}")
         return None, "", ""
 
     parsed = _parse_llm_response(response)
@@ -253,7 +257,7 @@ def _try_generate_sql(agent, prompt: str, fallback_message: str) -> tuple[str | 
 
     valid, err = _validate_sql(sql)
     if not valid:
-        print(f"[llm_sql] SQL validation failed: {err}  |  sql={sql[:120]}")
+        print(f"[llm_sql] SQL validation failed: {err}")
         return None, "", ""
 
     title = parsed.get("title", "旅行计划查询")
@@ -275,14 +279,10 @@ def _finalise_plan(
 # ── Public API ─────────────────────────────────────────────────────────
 
 def build_sql_plan_with_llm(message: str, user_id: str, role: str) -> SQLPlan | None:
-    """Try LLM-powered SQL generation; return None to signal fallback."""
-    try:
-        return _build_llm_sql_plan(message, user_id, role)
-    except Exception as exc:
-        print(f"[llm_sql_agent] LLM SQL generation failed: {exc}")
-        return None
+    """Dynamic SQL is disabled; callers must use deterministic allow-list plans."""
+    return None
 
 
 def run_llm_sql_plan(plan: SQLPlan, role: str) -> list[dict]:
-    """Execute a SQLPlan."""
-    return run_sql_plan(plan, role)
+    """Refuse execution of model-authored SQL at the authorization boundary."""
+    raise PermissionError("模型生成 SQL 已禁用，请使用服务端白名单分析计划。")

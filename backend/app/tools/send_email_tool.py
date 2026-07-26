@@ -95,8 +95,8 @@ def send_email(
 
     try:
         quota = consume_email_quota(user_id, client_ip)
-    except Exception:
-        logger.exception("Email quota evaluation failed")
+    except Exception as exc:
+        logger.warning("Email quota evaluation failed: %s", type(exc).__name__)
         quota = {
             "allowed": False,
             "message": "\u90ae\u4ef6\u9650\u989d\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u5df2\u963b\u6b62\u771f\u5b9e\u6295\u9012\u3002",
@@ -167,7 +167,10 @@ def send_email(
             "to": to_email,
         }
     except Exception as exc:
-        logger.exception("Unexpected email delivery failure")
+        logger.warning(
+            "Unexpected email delivery failure: %s",
+            type(exc).__name__,
+        )
         return {
             "sent": False,
             "dry_run": False,

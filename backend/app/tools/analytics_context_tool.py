@@ -290,23 +290,13 @@ def get_data_status(user_id: str, role: str) -> dict[str, Any]:
         if "synthetic" in str(item.get("source") or "").lower()
     )
 
+    # User-facing status stays light: only empty-range hints.
+    # Field completeness / synthetic-data caveats stay internal (quality metrics).
     warnings: list[str] = []
     if visible_plans == 0:
-        warnings.append("当前可见范围内还没有旅行计划数据。")
+        warnings.append("当前还没有可分析的旅行计划，生成或导入行程后再试。")
     elif visible_plans < 3:
-        warnings.append("样本少于 3 条，只适合展示事实记录，不建议判断趋势。")
-    if visible_plans < 12 or covered_months < 3:
-        warnings.append("样本或月份覆盖不足，预测结果不可用或仅供演示。")
-    if span_days and span_days < 365:
-        warnings.append("时间覆盖不足一年，无法可靠计算去年同期或年度趋势。")
-    if visible_plans and _safe_ratio(missing_actual, visible_plans) > 0.4:
-        warnings.append("实际消费字段完整率低于 60%，预算结论仅使用计划预算。")
-    if visible_plans and (1 - _safe_ratio(missing_json, visible_plans)) < 0.6:
-        warnings.append(
-            "完整行程内容字段完整率低于 60%，汇总分析仅使用目的地、日期、预算等结构化字段。"
-        )
-    if synthetic_count:
-        warnings.append("结果包含明确标记的模拟数据，不能直接作为生产经营结论。")
+        warnings.append("数据还比较少，结论会更偏单次事实，样本增加后趋势会更稳。")
 
     capabilities = get_role_capabilities(normalized)
     return {

@@ -20,7 +20,7 @@ router = APIRouter(prefix="/map", tags=["地图服务"])
 
 
 class MapContextRequest(BaseModel):
-    city: str = Field(..., description="目的地城市")
+    city: str = Field(..., min_length=1, max_length=64, description="目的地城市")
     locations: list[Location] = Field(..., min_length=1, max_length=100)
     limit: int = Field(default=24, ge=8, le=32)
 
@@ -118,9 +118,9 @@ def _route_description(data, origin_name: str, destination_name: str, route_type
     summary="搜索POI",
     description="根据关键词搜索POI(兴趣点)"
 )
-async def search_poi(
-    keywords: str = Query(..., description="搜索关键词", examples=["故宫"]),
-    city: str = Query(..., description="城市", examples=["北京"]),
+def search_poi(
+    keywords: str = Query(..., min_length=1, max_length=100, description="搜索关键词", examples=["故宫"]),
+    city: str = Query(..., min_length=1, max_length=64, description="城市", examples=["北京"]),
     citylimit: bool = Query(True, description="是否限制在城市范围内")
 ):
     """
@@ -148,10 +148,10 @@ async def search_poi(
         )
         
     except Exception as e:
-        print(f"❌ POI搜索失败: {str(e)}")
+        print(f"[map] POI search failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"POI搜索失败: {str(e)}"
+            detail="POI 搜索暂时不可用，请稍后重试。"
         )
 
 
@@ -161,8 +161,8 @@ async def search_poi(
     summary="查询天气",
     description="查询指定城市的天气信息"
 )
-async def get_weather(
-    city: str = Query(..., description="城市名称", examples=["北京"])
+def get_weather(
+    city: str = Query(..., min_length=1, max_length=64, description="城市名称", examples=["北京"])
 ):
     """
     查询天气
@@ -187,10 +187,10 @@ async def get_weather(
         )
         
     except Exception as e:
-        print(f"❌ 天气查询失败: {str(e)}")
+        print(f"[map] weather query failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"天气查询失败: {str(e)}"
+            detail="天气查询暂时不可用，请稍后重试。"
         )
 
 
@@ -200,7 +200,7 @@ async def get_weather(
     summary="规划路线",
     description="规划两点之间的路线"
 )
-async def plan_route(request: RouteRequest):
+def plan_route(request: RouteRequest):
     """
     规划路线
     
@@ -248,10 +248,10 @@ async def plan_route(request: RouteRequest):
         )
         
     except Exception as e:
-        print(f"❌ 路线规划失败: {str(e)}")
+        print(f"[map] route planning failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"路线规划失败: {str(e)}"
+            detail="路线规划暂时不可用，请稍后重试。"
         )
 
 
@@ -261,7 +261,7 @@ async def plan_route(request: RouteRequest):
     summary="查询行程周边场所",
     description="按行程坐标中心查询高德餐饮、商店、周边景点和交通站点",
 )
-async def get_map_context(request: MapContextRequest):
+def get_map_context(request: MapContextRequest):
     center = Location(
         longitude=sum(item.longitude for item in request.locations) / len(request.locations),
         latitude=sum(item.latitude for item in request.locations) / len(request.locations),
@@ -319,7 +319,7 @@ async def get_map_context(request: MapContextRequest):
     summary="健康检查",
     description="检查地图服务是否正常"
 )
-async def health_check():
+def health_check():
     """健康检查"""
     try:
         # 检查服务是否可用
@@ -334,5 +334,5 @@ async def health_check():
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"服务不可用: {str(e)}"
+            detail="地图服务暂时不可用，请稍后重试。"
         )

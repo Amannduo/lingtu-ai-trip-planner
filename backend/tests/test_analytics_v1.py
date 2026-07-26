@@ -406,12 +406,10 @@ def test_capabilities_and_data_status_follow_authenticated_scope(analytics_clien
     assert personal_status["sufficient_for"]["facts"] is True
     assert personal_status["sufficient_for"]["trend"] is False
     assert personal_status["sufficient_for"]["prediction"] is False
-    assert any("少于 3 条" in warning for warning in personal_status["warnings"])
-    assert any("模拟数据" in warning for warning in personal_status["warnings"])
+    assert any("数据还比较少" in warning for warning in personal_status["warnings"])
 
     sparse_chat = _chat(client, "统计本月旅行去向")
     assert sparse_chat["extra"]["analysis"]["sample_size"] == 1
-    assert any("样本仅 1 条" in warning for warning in sparse_chat["extra"]["analysis"]["warnings"])
 
     _assume_role(identity, "manager")
     manager_capabilities = client.get("/api/agent/capabilities").json()

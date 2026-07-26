@@ -1,6 +1,6 @@
 """POI相关API路由"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from ...services.amap_service import get_amap_service
@@ -22,7 +22,7 @@ class POIDetailResponse(BaseModel):
     summary="获取POI详情",
     description="根据POI ID获取详细信息,包括图片"
 )
-async def get_poi_detail(poi_id: str):
+def get_poi_detail(poi_id: str = Path(..., min_length=1, max_length=128)):
     """
     获取POI详情
     
@@ -45,10 +45,10 @@ async def get_poi_detail(poi_id: str):
         )
         
     except Exception as e:
-        print(f"❌ 获取POI详情失败: {str(e)}")
+        print(f"[poi] detail lookup failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"获取POI详情失败: {str(e)}"
+            detail="POI 详情暂时不可用，请稍后重试。"
         )
 
 
@@ -57,7 +57,10 @@ async def get_poi_detail(poi_id: str):
     summary="搜索POI",
     description="根据关键词搜索POI"
 )
-async def search_poi(keywords: str, city: str = "北京"):
+def search_poi(
+    keywords: str = Query(..., min_length=1, max_length=100),
+    city: str = Query("北京", min_length=1, max_length=64),
+):
     """
     搜索POI
 
@@ -79,10 +82,10 @@ async def search_poi(keywords: str, city: str = "北京"):
         }
 
     except Exception as e:
-        print(f"❌ 搜索POI失败: {str(e)}")
+        print(f"[poi] search failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"搜索POI失败: {str(e)}"
+            detail="POI 搜索暂时不可用，请稍后重试。"
         )
 
 
@@ -91,7 +94,7 @@ async def search_poi(keywords: str, city: str = "北京"):
     summary="获取景点图片",
     description="根据景点名称从Unsplash获取图片"
 )
-async def get_attraction_photo(name: str):
+def get_attraction_photo(name: str = Query(..., min_length=1, max_length=200)):
     """
     获取景点图片
 
@@ -121,9 +124,9 @@ async def get_attraction_photo(name: str):
         }
 
     except Exception as e:
-        print(f"❌ 获取景点图片失败: {str(e)}")
+        print(f"[poi] photo lookup failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"获取景点图片失败: {str(e)}"
+            detail="景点图片暂时不可用，请稍后重试。"
         )
 

@@ -66,9 +66,10 @@ async def vapid_public_key():
     try:
         return VapidPublicKeyResponse(public_key=get_vapid_public_key())
     except WebPushConfigurationError as exc:
+        print(f"[push] VAPID configuration unavailable: {type(exc).__name__}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
+            detail="桌面通知暂时不可用。",
         ) from exc
 
 

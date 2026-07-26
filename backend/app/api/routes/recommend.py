@@ -21,8 +21,8 @@ async def recommend_destination(request: DestinationChatRequest):
         agent = get_destination_recommender_agent()
         return await run_in_threadpool(agent.chat, request)
     except Exception as e:
-        print(f"❌ 目的地推荐失败: {str(e)}")
+        print(f"[recommend] request failed: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"目的地推荐失败: {str(e)}"
+            detail="目的地推荐暂时不可用，请稍后重试。"
         )

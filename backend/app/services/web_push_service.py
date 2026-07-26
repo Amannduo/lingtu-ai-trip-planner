@@ -15,10 +15,18 @@ from urllib.parse import quote, urlsplit
 import dns.exception
 import dns.resolver
 import requests
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from ..config import get_settings
-from .database_service import execute, fetch_all, fetch_one, fetch_scalar
+from .database_service import (
+    DIALECT_NAME,
+    engine,
+    execute,
+    fetch_all,
+    fetch_one,
+    fetch_scalar,
+)
 from .schema import init_db
 
 logger = logging.getLogger(__name__)
@@ -194,11 +202,11 @@ def _update_subscription(
     expiration_time: int | None,
     user_agent: str | None,
 ) -> None:
-    execute(
-        "UPDATE push_subscriptions SET user_id = :user_id, endpoint = :endpoint, "
+    updated = execute(
+        "UPDATE push_subscriptions SET endpoint = :endpoint, "
         "p256dh = :p256dh, auth = :auth, expiration_time = :expiration_time, "
         "user_agent = :user_agent, failure_count = 0, updated_at = CURRENT_TIMESTAMP "
-        "WHERE subscription_id = :subscription_id",
+        "WHERE subscription_id = :subscription_id AND user_id = :user_id",
         {
             "subscription_id": subscription_id,
             "user_id": user_id,
@@ -209,6 +217,120 @@ def _update_subscription(
             "user_agent": user_agent,
         },
     )
+    if updated != 1:
+        raise ValueError("Push subscription cannot be updated for this account")
+
+
+def _save_subscription_transactionally(
+    user_id: str,
+    endpoint: str,
+    digest: str,
+    p256dh: str,
+    auth: str,
+    expiration_time: int | None,
+    user_agent: str | None,
+    subscription_limit: int,
+) -> SavedPushSubscription:
+    """Serialize quota check and insert in the database, across processes."""
+    subscription_id = uuid.uuid4().hex
+    params = {
+        "subscription_id": subscription_id,
+        "user_id": user_id,
+        "endpoint_hash": digest,
+        "endpoint": endpoint,
+        "p256dh": p256dh,
+        "auth": auth,
+        "expiration_time": expiration_time,
+        "user_agent": user_agent,
+    }
+    with engine.connect() as connection:
+        try:
+            if DIALECT_NAME == "sqlite":
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                connection.begin()
+
+            owner = connection.execute(
+                text("SELECT user_id FROM users WHERE user_id = :user_id" +
+                     (" FOR UPDATE" if DIALECT_NAME != "sqlite" else "")),
+                {"user_id": user_id},
+            ).scalar_one_or_none()
+            if owner is None:
+                raise ValueError(
+                    "Push subscription cannot be registered for this account"
+                )
+
+            existing_row = connection.execute(
+                text(
+                    "SELECT subscription_id, user_id, endpoint "
+                    "FROM push_subscriptions WHERE endpoint_hash = :endpoint_hash"
+                ),
+                {"endpoint_hash": digest},
+            ).mappings().first()
+            if existing_row is not None:
+                existing = dict(existing_row)
+                if existing["endpoint"] != endpoint:
+                    raise ValueError("Push endpoint hash collision")
+                if str(existing.get("user_id") or "") != user_id:
+                    raise ValueError(
+                        "Push subscription cannot be registered for this account"
+                    )
+                current_id = str(existing["subscription_id"])
+                result = connection.execute(
+                    text(
+                        "UPDATE push_subscriptions SET endpoint = :endpoint, "
+                        "p256dh = :p256dh, auth = :auth, "
+                        "expiration_time = :expiration_time, "
+                        "user_agent = :user_agent, failure_count = 0, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE subscription_id = :subscription_id "
+                        "AND user_id = :user_id"
+                    ),
+                    {**params, "subscription_id": current_id},
+                )
+                if int(result.rowcount or 0) != 1:
+                    raise ValueError(
+                        "Push subscription cannot be updated for this account"
+                    )
+                connection.commit()
+                return SavedPushSubscription(
+                    subscription_id=current_id,
+                    created=False,
+                )
+
+            current_count = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM push_subscriptions "
+                        "WHERE user_id = :user_id"
+                    ),
+                    {"user_id": user_id},
+                ).scalar_one()
+                or 0
+            )
+            if current_count >= subscription_limit:
+                raise ValueError(
+                    "Push subscription limit reached for this user"
+                )
+
+            connection.execute(
+                text(
+                    "INSERT INTO push_subscriptions "
+                    "(subscription_id, user_id, endpoint_hash, endpoint, "
+                    "p256dh, auth, expiration_time, user_agent) VALUES "
+                    "(:subscription_id, :user_id, :endpoint_hash, :endpoint, "
+                    ":p256dh, :auth, :expiration_time, :user_agent)"
+                ),
+                params,
+            )
+            connection.commit()
+            return SavedPushSubscription(
+                subscription_id=subscription_id,
+                created=True,
+            )
+        except Exception:
+            connection.rollback()
+            raise
 
 
 def save_push_subscription(
@@ -229,13 +351,15 @@ def save_push_subscription(
     safe_user_agent = (user_agent or "").strip()[:512] or None
     digest = _endpoint_hash(endpoint)
     existing = fetch_one(
-        "SELECT subscription_id, endpoint FROM push_subscriptions "
+        "SELECT subscription_id, user_id, endpoint FROM push_subscriptions "
         "WHERE endpoint_hash = :endpoint_hash",
         {"endpoint_hash": digest},
     )
     if existing:
         if existing["endpoint"] != endpoint:
             raise ValueError("Push endpoint hash collision")
+        if str(existing.get("user_id") or "") != user_id:
+            raise ValueError("Push subscription cannot be registered for this account")
         subscription_id = str(existing["subscription_id"])
         _update_subscription(
             subscription_id,
@@ -253,44 +377,29 @@ def save_push_subscription(
         1,
         min(int(settings.web_push_max_subscriptions_per_user), 100),
     )
-    current_count = int(
-        fetch_scalar(
-            "SELECT COUNT(*) FROM push_subscriptions WHERE user_id = :user_id",
-            {"user_id": user_id},
-        )
-        or 0
-    )
-    if current_count >= subscription_limit:
-        raise ValueError("Push subscription limit reached for this user")
-
-    subscription_id = uuid.uuid4().hex
     try:
-        execute(
-            "INSERT INTO push_subscriptions "
-            "(subscription_id, user_id, endpoint_hash, endpoint, p256dh, auth, "
-            "expiration_time, user_agent) VALUES "
-            "(:subscription_id, :user_id, :endpoint_hash, :endpoint, :p256dh, :auth, "
-            ":expiration_time, :user_agent)",
-            {
-                "subscription_id": subscription_id,
-                "user_id": user_id,
-                "endpoint_hash": digest,
-                "endpoint": endpoint,
-                "p256dh": p256dh,
-                "auth": auth,
-                "expiration_time": expiration_time,
-                "user_agent": safe_user_agent,
-            },
+        return _save_subscription_transactionally(
+            user_id,
+            endpoint,
+            digest,
+            p256dh,
+            auth,
+            expiration_time,
+            safe_user_agent,
+            subscription_limit,
         )
-        return SavedPushSubscription(subscription_id=subscription_id, created=True)
     except IntegrityError:
         existing = fetch_one(
-            "SELECT subscription_id, endpoint FROM push_subscriptions "
+            "SELECT subscription_id, user_id, endpoint FROM push_subscriptions "
             "WHERE endpoint_hash = :endpoint_hash",
             {"endpoint_hash": digest},
         )
         if not existing or existing["endpoint"] != endpoint:
             raise
+        if str(existing.get("user_id") or "") != user_id:
+            raise ValueError(
+                "Push subscription cannot be registered for this account"
+            )
         subscription_id = str(existing["subscription_id"])
         _update_subscription(
             subscription_id,
@@ -301,7 +410,10 @@ def save_push_subscription(
             expiration_time,
             safe_user_agent,
         )
-        return SavedPushSubscription(subscription_id=subscription_id, created=False)
+        return SavedPushSubscription(
+            subscription_id=subscription_id,
+            created=False,
+        )
 
 
 def delete_push_subscription(user_id: str, raw_endpoint: Any) -> bool:
@@ -404,10 +516,10 @@ def _mark_failure(subscription_id: str, user_id: str) -> None:
 def _safe_mark_failure(subscription_id: str, user_id: str) -> None:
     try:
         _mark_failure(subscription_id, user_id)
-    except Exception:
-        logger.exception(
-            "Could not record Web Push failure for subscription %s",
-            subscription_id,
+    except Exception as exc:
+        logger.warning(
+            "Could not record Web Push failure: %s",
+            type(exc).__name__,
         )
 
 
@@ -475,11 +587,11 @@ def send_trip_ready_push_notifications(
             try:
                 if _remove_subscription(subscription_id, user_id):
                     result["removed"] += 1
-            except Exception:
+            except Exception as exc:
                 result["failed"] += 1
-                logger.exception(
-                    "Could not remove expired Web Push subscription %s",
-                    subscription_id,
+                logger.warning(
+                    "Could not remove expired Web Push subscription: %s",
+                    type(exc).__name__,
                 )
             continue
 
@@ -545,11 +657,11 @@ def send_trip_ready_push_notifications(
                     try:
                         if _remove_subscription(subscription_id, user_id):
                             result["removed"] += 1
-                    except Exception:
+                    except Exception as removal_error:
                         result["failed"] += 1
-                        logger.exception(
-                            "Could not remove invalid Web Push subscription %s",
-                            subscription_id,
+                        logger.warning(
+                            "Could not remove invalid Web Push subscription: %s",
+                            type(removal_error).__name__,
                         )
                     break
                 retryable = (
@@ -589,10 +701,10 @@ def send_trip_ready_push_notifications(
                 result["delivered"] += 1
                 try:
                     _mark_success(subscription_id, user_id)
-                except Exception:
-                    logger.exception(
-                        "Could not record Web Push success for subscription %s",
-                        subscription_id,
+                except Exception as success_error:
+                    logger.warning(
+                        "Could not record Web Push success: %s",
+                        type(success_error).__name__,
                     )
                 break
         if budget_exhausted:
@@ -610,7 +722,7 @@ def notify_trip_plan_ready(
     try:
         return send_trip_ready_push_notifications(user_id, destination, plan_no)
     except WebPushConfigurationError as exc:
-        logger.info("Web Push skipped for plan %s: %s", plan_no, exc)
+        logger.info("Web Push skipped: %s", type(exc).__name__)
         return {
             "configured": False,
             "subscriptions": 0,
@@ -620,10 +732,10 @@ def notify_trip_plan_ready(
             "retry_attempts": 0,
             "skipped": 0,
         }
-    except Exception:
-        logger.exception(
-            "Best-effort Web Push notification failed for plan %s",
-            plan_no,
+    except Exception as exc:
+        logger.warning(
+            "Best-effort Web Push notification failed: %s",
+            type(exc).__name__,
         )
         return {
             "configured": False,
