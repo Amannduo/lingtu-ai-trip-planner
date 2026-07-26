@@ -38,6 +38,7 @@ from ...services.trip_generation_errors import (
 )
 from ...services.auth_service import AuthenticatedUser
 from ...services.destination_feasibility_service import get_destination_feasibility_service
+from ...services.contract_token_service import verify_contract_token
 from ...services.semantic_contract_service import (
     build_generation_contract,
     collect_hard_block_issues_for_contract,
@@ -65,7 +66,10 @@ class UntrustedTripEditError(ValueError):
     """Client attempted to forge server-owned plan facts or add unverified POIs."""
 
 
-def _validate_generation_request(request: TripRequest) -> TripRequest:
+def _validate_generation_request(
+    request: TripRequest,
+    current_user: AuthenticatedUser | None = None,
+) -> TripRequest:
     """Reject unusable generation inputs before agent work starts.
 
     Covers civil past dates, unresolved semantic hard-blocks, and auto-
@@ -88,7 +92,23 @@ def _validate_generation_request(request: TripRequest) -> TripRequest:
             detail="出行开始日期不能早于今天。",
         )
 
-    request, message_contract = build_generation_contract(request)
+    # A verified recommendation token contributes the session contract as
+    # merge base; any verification defect silently means "no token".
+    session_contract = None
+    raw_token = str(getattr(request, "recommendation_token", "") or "")
+    if raw_token:
+        session_contract = verify_contract_token(
+            raw_token,
+            subject=(
+                f"user:{current_user.user_id}"
+                if current_user is not None
+                else "anon"
+            ),
+        )
+
+    request, message_contract = build_generation_contract(
+        request, session_contract=session_contract
+    )
 
     settings = get_settings()
     if bool(getattr(settings, "semantic_contract_hard_block_enabled", True)):
@@ -548,7 +568,7 @@ async def plan_trip(
         # Reject past dates / hard semantic conflicts before rate-limit spend
         # or expensive agent initialization; the returned request carries the
         # server-built semantic contract for all downstream readers.
-        request = _validate_generation_request(request)
+        request = _validate_generation_request(request, current_user)
         # After auth + TripRequest validation: count only real generation creates.
         _enforce_trip_generation_rate_limit(http_request, current_user)
 
@@ -869,7 +889,7 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
-    request = _validate_generation_request(request)
+    request = _validate_generation_request(request, current_user)
     # After auth + TripRequest validation: shared create quota with /plan.
     _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)

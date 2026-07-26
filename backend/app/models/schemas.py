@@ -56,6 +56,14 @@ class TripRequest(BaseModel):
             "亦可在 free_text 写入 [用户已确认待核对约束]。"
         ),
     )
+    recommendation_token: Optional[str] = Field(
+        default=None,
+        max_length=20_000,
+        description=(
+            "推荐会话的服务端签名契约令牌（原样回传）；验签通过后其契约"
+            "进入合并矩阵，不代表表单已确认，验签失败静默走无令牌路径"
+        ),
+    )
     # Weekend / early-arrival semantics (optional, backward compatible).
     date_pattern: Optional[Literal["weekend", "explicit", "unknown"]] = Field(
         default=None,
@@ -753,6 +761,13 @@ class DestinationChatResponse(BaseModel):
     semantic_contract: Optional[SemanticTripContract] = Field(
         default=None,
         description="完整语义契约：字段来源、冲突与待确认状态",
+    )
+    contract_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "服务端签名的会话契约令牌；生成行程时经 recommendation_token"
+            "原样回传，跨 worker 无状态传递（Base64 仅编码不加密，不含原文）"
+        ),
     )
     recommendations: List[DestinationRecommendation] = Field(default=[], description="目的地推荐列表")
 

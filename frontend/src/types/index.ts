@@ -181,6 +181,8 @@ export interface TripFormData {
   weekend_style?: 'sat_sun' | 'fri_sun_optional' | null
   early_arrival_hint?: string | null
   departure_mode?: 'morning_first_day' | 'evening_before' | null
+  /** Server-signed session contract token, returned verbatim */
+  recommendation_token?: string | null
 }
 
 export interface EmailDeliveryResult {
@@ -311,6 +313,8 @@ export interface DestinationChatResponse {
   /** Apply-safe flat fields plus optional semantic_contract / conflicts / pending_fields */
   interpreted_context: Record<string, unknown>
   semantic_contract?: SemanticTripContract | null
+  /** Server-signed session contract token for the generation request */
+  contract_token?: string | null
   recommendations: DestinationRecommendation[]
 }
 

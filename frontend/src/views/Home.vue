@@ -858,6 +858,8 @@ const scheduleMeta = reactive({
 const travelersConfirmed = ref(false)
 const selectedScheduleOption = ref('default')
 const lastSemanticContract = ref<SemanticTripContract | null>(null)
+/** Server-signed session contract token, returned verbatim on generation. */
+const lastContractToken = ref<string | null>(null)
 /** User explicitly accepted remaining contract issues in the confirm modal. */
 const contractRiskAcknowledged = ref(false)
 /** Structured issues from the latest backend 422 hard-block. */
@@ -1245,6 +1247,7 @@ const sendAssistantMessage = async (content?: string) => {
       response.semantic_contract
       || (response.interpreted_context?.semantic_contract as SemanticTripContract | undefined)
       || null
+    lastContractToken.value = response.contract_token || null
     const blocking = response.interpreted_context?.blocking_conflicts
     serverBlockingConflicts.value = Array.isArray(blocking)
       ? blocking.map((item) => String(item))
@@ -1605,6 +1608,7 @@ const handleSubmit = async () => {
       delivery_email: emailOnCompletion.value ? recipient : null,
       semantic_contract: lastSemanticContract.value,
       semantic_risks_acknowledged: contractRiskAcknowledged.value,
+      recommendation_token: lastContractToken.value,
       date_pattern: scheduleMeta.date_pattern,
       weekend_style: scheduleMeta.weekend_style,
       early_arrival_hint: scheduleMeta.early_arrival_hint,

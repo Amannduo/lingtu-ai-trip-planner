@@ -1511,6 +1511,8 @@ def user_intent_text(text: str | None) -> str:
 
 def build_generation_contract(
     request: TripRequest,
+    *,
+    session_contract: SemanticTripContract | None = None,
 ) -> tuple[TripRequest, SemanticTripContract | None]:
     """Server-entry contract build: at most one NL extraction per request.
 
@@ -1519,13 +1521,21 @@ def build_generation_contract(
     ``message_contract`` is the free-text-only extraction the divergence
     gate needs, or ``None`` when the request has no user-authored text —
     in which case zero extractions run and the contract is form-only.
+
+    ``session_contract`` (a verified recommendation-token contract) merges
+    as the *base*: current form values and the latest user text win over
+    session history exactly per the field merge matrix — a token never
+    bypasses confirmation or the 422 gate.
     """
     service = get_semantic_contract_service()
     intent_text = user_intent_text(request.free_text_input)
     message_contract = (
         service.extract_from_text(intent_text) if intent_text.strip() else None
     )
-    return _attach_contract(request, message_contract), message_contract
+    attached = _attach_contract(
+        request, message_contract, session_contract=session_contract
+    )
+    return attached, message_contract
 
 
 def attach_contract_to_trip_request(request: TripRequest) -> TripRequest:
@@ -1540,6 +1550,8 @@ def attach_contract_to_trip_request(request: TripRequest) -> TripRequest:
 def _attach_contract(
     request: TripRequest,
     message_contract: SemanticTripContract | None,
+    *,
+    session_contract: SemanticTripContract | None = None,
 ) -> TripRequest:
     """Merge form + pre-extracted free-text contract onto the request.
 
@@ -1568,6 +1580,10 @@ def _attach_contract(
         "high",
         evidence="trip_request.city",
     )
+    if session_contract is not None:
+        # Session history is the base; the current form wins per the merge
+        # matrix (divergences surface as pending/conflicts, not silently).
+        form_contract = service.merge(session_contract, form_contract)
     if message_contract is not None:
         merged = service.merge(form_contract, message_contract)
     else:
