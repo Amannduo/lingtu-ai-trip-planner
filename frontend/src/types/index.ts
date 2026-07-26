@@ -36,6 +36,8 @@ export interface Meal {
   location?: Location
   description?: string
   estimated_cost?: number
+  poi_id?: string
+  coordinate_source?: string
 }
 
 export interface RouteSegment {
@@ -146,6 +148,8 @@ export interface TripPlan {
   city: string
   start_date: string
   end_date: string
+  /** primary | repaired | map_fallback — server generation path, not quality status */
+  generation_mode?: 'primary' | 'repaired' | 'map_fallback' | string
   days: DayPlan[]
   weather_info: WeatherInfo[]
   overall_suggestions: string
