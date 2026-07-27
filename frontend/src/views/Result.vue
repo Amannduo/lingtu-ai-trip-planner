@@ -596,6 +596,28 @@ type UserFacingQualityIssue = {
   action: string
 }
 
+const HIDDEN_TRAVELER_ISSUE_CODES = new Set([
+  'MODEL_OUTPUT_REPAIRED',
+  'FACT_COVERAGE_INCOMPLETE',
+  'WEB_AUDIT_MISSING',
+  'WEB_AUDIT_FAILED',
+  'WEB_AUDIT_WARNING',
+  'WEB_AUDIT_NO_REFERENCES',
+  'WEB_AUDIT_FORMAT_ONLY'
+])
+
+const INTERNAL_BUDGET_ISSUE_CODES = new Set([
+  'BUDGET_HOTEL_MULTIPLIER',
+  'BUDGET_HOTEL_NIGHTS_MISMATCH',
+  'BUDGET_HOTEL_ROOMS_MISMATCH',
+  'BUDGET_MEAL_MULTIPLIER',
+  'BUDGET_NEGATIVE_COMPONENT',
+  'BUDGET_SUM_MISMATCH',
+  'BUDGET_TICKET_MULTIPLIER',
+  'BUDGET_TRANSPORT_BREAKDOWN_MISMATCH',
+  'BUDGET_TRANSPORT_MULTIPLIER'
+])
+
 const normalizeTravelerCopy = (value: string): string =>
   value
     .replace(/地图\s*POI/gi, '地图地点')
@@ -604,6 +626,7 @@ const normalizeTravelerCopy = (value: string): string =>
     .replace(/事实验证/g, '信息确认')
     .replace(/语义核对/g, '逐项确认')
     .replace(/兜底估算/g, '参考估算')
+    .replace(/审核检查/g, '核查详情')
     .replace(/校验/g, '核对')
     .replace(/审核/g, '检查')
     .trim()
@@ -649,14 +672,14 @@ const presentQualityIssue = (
     category = '住宿预算'
     title = '当前住宿费用为参考估算'
     action = '预订前在酒店官方渠道或可信平台查看实际房价。'
-  } else if (normalizedCode === 'WEB_AUDIT_FORMAT_ONLY' || normalizedCode === 'WEB_AUDIT_ITEM') {
-    category = '信息时效'
-    title = '部分实时信息可能会有变化'
-    action = '出发前再次确认景区开放时间、酒店价格、车次和当地政策。'
-  } else if (normalizedCode === 'FACT_COVERAGE_INCOMPLETE') {
-    category = '信息时效'
-    title = '行程中还有部分信息需要临行确认'
-    action = '出发前查看对应地点的官方信息，以最新开放状态和价格为准。'
+  } else if (INTERNAL_BUDGET_ISSUE_CODES.has(normalizedCode)) {
+    category = '费用预算'
+    title = '预算明细需要重新计算'
+    action = '建议重新生成一次计划，并以实际预订价格为准。'
+  } else if (normalizedCode.startsWith('SEMANTIC_')) {
+    category = '需求确认'
+    title = '生成结果与已确认的旅行需求存在差异'
+    action = '返回首页核对目的地、日期、人数、预算和偏好后重新生成。'
   } else if (normalizedCode === 'UNVERIFIED_ROUTE') {
     category = '交通路线'
     title = normalizeTravelerCopy(message).replace('只有路线摘要，尚未取得完整折线', '的详细路线将在导航时生成')
@@ -675,11 +698,23 @@ const presentQualityIssue = (
 const qualityIssuesList = computed<UserFacingQualityIssue[]>(() => {
   if (!tripPlan.value) return []
   const items: UserFacingQualityIssue[] = []
+  const scheduleIssues: Array<{ severity: string; message: string }> = []
   if (tripPlan.value.quality && Array.isArray(tripPlan.value.quality.issues)) {
     for (const issue of tripPlan.value.quality.issues) {
       if (issue && issue.message) {
+        const code = issue.code || ''
+        if (HIDDEN_TRAVELER_ISSUE_CODES.has(code) || code.startsWith('WEB_AUDIT_')) {
+          continue
+        }
+        if (code === 'DAY_SCHEDULE_OVERLOAD' || code === 'DAY_SCHEDULE_IMPOSSIBLE') {
+          scheduleIssues.push({
+            severity: issue.severity || 'warning',
+            message: issue.message
+          })
+          continue
+        }
         items.push(presentQualityIssue(
-          issue.code || '',
+          code,
           issue.severity || 'warning',
           issue.message,
           issue.suggestion || ''
@@ -687,22 +722,35 @@ const qualityIssuesList = computed<UserFacingQualityIssue[]>(() => {
       }
     }
   }
-  if (tripPlan.value.agent_audit && Array.isArray(tripPlan.value.agent_audit.issues)) {
-    for (const issueText of tripPlan.value.agent_audit.issues) {
-      if (typeof issueText === 'string' && issueText.trim()) {
-        const presentedIssue = presentQualityIssue(
-          'WEB_AUDIT_ITEM',
-          'warning',
-          issueText.trim(),
-          '出发前请参考官网或官方渠道确认'
-        )
-        if (!items.some(i => i.title === presentedIssue.title)) {
-          items.push(presentedIssue)
-        }
-      }
-    }
+
+  if (scheduleIssues.length) {
+    const days = Array.from(new Set(
+      scheduleIssues
+        .map(issue => issue.message.match(/第(\d+)天/)?.[1])
+        .filter((day): day is string => Boolean(day))
+    )).sort((left, right) => Number(left) - Number(right))
+    const hasImpossibleDay = scheduleIssues.some(issue => issue.severity === 'error')
+    const dayLabel = days.length
+      ? `第${days.join('、')}天`
+      : `有 ${scheduleIssues.length} 天`
+    items.unshift({
+      code: 'DAY_SCHEDULE_SUMMARY',
+      severity: hasImpossibleDay ? 'error' : 'warning',
+      category: '行程节奏',
+      title: `${dayLabel}${hasImpossibleDay ? '的安排可能无法按时完成' : '安排较满'}`,
+      action: '优先保留最想去的景点，减少折返，并为用餐和休息预留时间。'
+    })
   }
-  return items
+
+  const seen = new Set<string>()
+  return items.filter(item => {
+    const key = `${item.category}\u0000${item.title}\u0000${item.action}`
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
 })
 const visibleQualityIssues = computed(() => {
   if (isQualityExpanded.value) return qualityIssuesList.value
