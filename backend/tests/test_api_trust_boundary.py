@@ -81,6 +81,30 @@ def _request() -> TripRequest:
     )
 
 
+def test_planning_endpoints_require_login() -> None:
+    request_payload = _request().model_dump(mode="json")
+    job_id = "a" * 32
+
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                "/api/recommend/chat",
+                json={
+                    "messages": [
+                        {"role": "user", "content": "周末从太原出发，想去附近避暑。"}
+                    ]
+                },
+            ),
+            client.post("/api/trip/plan", json=request_payload),
+            client.post("/api/trip/plan-jobs", json=request_payload),
+            client.get(f"/api/trip/plan-jobs/{job_id}/events"),
+            client.post(f"/api/trip/plan-jobs/{job_id}/cancel"),
+        ]
+
+    assert [response.status_code for response in responses] == [401, 401, 401, 401, 401]
+    assert all(response.json()["detail"] == "请先登录" for response in responses)
+
+
 def test_edit_restores_all_server_owned_narrative_and_route_facts() -> None:
     existing = _plan()
     edited = existing.model_copy(deep=True)
