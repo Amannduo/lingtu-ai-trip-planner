@@ -357,7 +357,9 @@ def test_enrichment_failure_isolated_and_visible_to_quality_gate() -> None:
         issue.code == "PIPELINE_ENRICHMENT_PARTIAL"
         for issue in result.quality.issues
     )
-    assert result.quality.publishable is False
+    # Reviewable model: partial enrichment stays deliverable with review.
+    assert result.quality.publishable is True
+    assert result.quality.review_required is True
 
 
 def test_budget_enrichment_failure_removes_model_budget_and_lowers_score() -> None:
@@ -377,7 +379,9 @@ def test_budget_enrichment_failure_removes_model_budget_and_lowers_score() -> No
     assert result.quality is not None
     assert result.quality.score < 100
     assert any(issue.code == "BUDGET_MISSING" for issue in result.quality.issues)
-    assert result.quality.publishable is False
+    # Reviewable model: budget missing is advisory, not a hard block.
+    assert result.quality.publishable is True
+    assert result.quality.review_required is True
 
 
 def test_fallback_builder_failure_returns_blocked_emergency_plan() -> None:

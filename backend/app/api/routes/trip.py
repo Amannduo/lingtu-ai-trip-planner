@@ -252,9 +252,11 @@ def _mark_legacy_weak_validation(quality) -> None:
                 suggestion="重新生成行程可获得完整质量校验。",
             )
         )
+    # Weak-context results must never present as review-free: force the
+    # review flag (saving stays allowed under the reviewable model).
+    quality.review_required = True
     if quality.quality_status == "publishable":
         quality.quality_status = "needs_review"
-        quality.publishable = False
 
 
 def can_save_user_draft(quality) -> bool:
@@ -604,9 +606,9 @@ async def plan_trip(
         try:
             if current_user is None:
                 print("[trip] anonymous request - generated plan will not be saved")
-            elif needs_review:
-                print("[trip] needs_review plan - not auto-persisted")
             else:
+                # Reviewable-delivery model: needs_review plans persist too,
+                # carrying their quality notices; only blocked is rejected.
                 plan_no = get_travel_plan_data_service().save_trip_plan(
                     request,
                     trip_plan,
@@ -630,7 +632,7 @@ async def plan_trip(
             )
 
         email_delivery = None
-        if request.email_on_completion and not needs_review:
+        if request.email_on_completion:
             email_delivery = await run_in_threadpool(
                 _email_delivery_for_plan,
                 request,
@@ -916,14 +918,28 @@ def create_trip_plan_job(
         needs_review = quality_status == "needs_review"
 
         plan_no = None
-        if current_user is not None and quality_status == "publishable":
+        if current_user is not None:
+            # Reviewable-delivery model: needs_review plans persist too,
+            # carrying their quality notices; only blocked was rejected.
             _begin_generation_finalization(progress)
             progress(
                 stage="finalizing",
                 progress=99,
-                message="正在安全保存并准备结果",
-                detail="质量检查已完成，正在保存行程。",
-                meta={},
+                message=(
+                    "行程已生成，需要确认以下事项"
+                    if needs_review
+                    else "正在安全保存并准备结果"
+                ),
+                detail=(
+                    f"方案评分 {getattr(quality, 'score', 0)}/100，"
+                    "已保存，部分事项建议出发前复核。"
+                    if needs_review
+                    else "质量检查已完成，正在保存行程。"
+                ),
+                meta={
+                    "quality_score": getattr(quality, "score", 0),
+                    "needs_review": needs_review,
+                },
             )
             _raise_if_generation_cancelled(progress)
             # Deliberately unguarded, unlike the sync path: the job contract is
@@ -937,21 +953,6 @@ def create_trip_plan_job(
                 user_role=current_user.role,
                 source="generated",
             )
-        elif current_user is not None and needs_review:
-            progress(
-                stage="finalizing",
-                progress=99,
-                message="行程已生成，需要确认以下事项",
-                detail=(
-                    f"方案评分 {getattr(quality, 'score', 0)}/100，"
-                    "部分信息需要你复核后再保存。"
-                ),
-                meta={
-                    "quality_score": getattr(quality, "score", 0),
-                    "needs_review": True,
-                },
-            )
-            _raise_if_generation_cancelled(progress)
         else:
             progress(
                 stage="finalizing",
@@ -967,7 +968,7 @@ def create_trip_plan_job(
         # thread; both helpers are failure-isolated so a broken SMTP or
         # push provider can never fail the job or lose the plan result.
         email_delivery = None
-        if request.email_on_completion and not needs_review:
+        if request.email_on_completion:
             email_delivery = _email_delivery_for_plan(
                 request, trip_plan, plan_no, current_user, client_ip
             )

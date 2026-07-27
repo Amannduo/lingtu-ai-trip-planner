@@ -1041,15 +1041,22 @@ class WebTravelGuideAgent:
         status = "passed"
         if issues:
             status = "warning"
-        if len((guide or "").strip()) < 120:
-            status = "failed"
+        # Short body is advisory only — never escalate web/search problems into a
+        # structural "failed" that would look like a hard quality block.
+        if len((guide or "").strip()) < 120 and status == "passed":
+            status = "warning"
+
+        # External search can ground sources but is not map-level semantic verification.
+        # Keep PR #1/#2 audit_level contract: references => format_only, else offline_fallback.
+        audit_level = "format_only" if references else "offline_fallback"
 
         return AgentAuditResult(
             status=status,
             source=source,
             checked_items=checked_items,
             issues=issues,
-            suggestions=suggestions
+            suggestions=suggestions,
+            audit_level=audit_level,
         )
 
     def _reservation_items(self, city: str, attraction_names: List[str]) -> List[str]:

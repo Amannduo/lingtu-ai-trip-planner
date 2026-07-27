@@ -290,8 +290,10 @@ def get_data_status(user_id: str, role: str) -> dict[str, Any]:
         if "synthetic" in str(item.get("source") or "").lower()
     )
 
-    # User-facing status stays light: only empty-range hints.
-    # Field completeness / synthetic-data caveats stay internal (quality metrics).
+    # User-facing status stays light: only empty/sparse-range hints.
+    # Field completeness and synthetic-data caveats stay in structured
+    # quality metrics rather than free-text warnings that can over-expose
+    # internal data composition details.
     warnings: list[str] = []
     if visible_plans == 0:
         warnings.append("当前还没有可分析的旅行计划，生成或导入行程后再试。")

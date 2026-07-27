@@ -1,110 +1,171 @@
 <template>
-  <div class="chart-shell">
-    <div v-if="chartTitle" class="chart-header">
-      <h4>{{ chartTitle }}</h4>
+  <div class="chart-shell" role="img" :aria-label="ariaLabel">
+    <div v-if="payload?.title" class="chart-header">
+      <h4>{{ payload.title }}</h4>
+      <p v-if="payload.note" class="chart-note">{{ payload.note }}</p>
     </div>
-    <div ref="chartEl" class="chart-canvas"></div>
-    <div v-if="loadError" class="chart-fallback">
-      图表组件加载失败，请刷新后重试
+
+    <div v-if="!payload" class="chart-fallback">
+      图表数据无效或为空，已改用下方表格（如有）。
     </div>
+    <template v-else>
+      <div ref="chartEl" class="chart-canvas"></div>
+      <div v-if="loadError" class="chart-fallback">
+        图表组件加载失败，请查看下方数据摘要。
+      </div>
+      <details class="chart-a11y">
+        <summary>查看数据摘要</summary>
+        <p class="chart-summary">{{ textSummary }}</p>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">{{ payload.x_label || '类别' }}</th>
+              <th
+                v-for="item in payload.series"
+                :key="item.name"
+                scope="col"
+              >
+                {{ item.name || payload.y_label || '数值' }}
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(category, index) in payload.categories" :key="`${category}-${index}`">
+              <th scope="row">{{ category }}</th>
+              <td v-for="item in payload.series" :key="`${item.name}-${index}`">
+                {{ formatNumber(item.values[index]) }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import {
+  normalizeAgentChart,
+  type AgentChartPayload
+} from '@/types/agentChart'
 
 const props = defineProps<{
-  option: Record<string, any>
+  /** Restricted typed payload — never a raw ECharts option object. */
+  chart: unknown
 }>()
 
 const chartEl = ref<HTMLDivElement | null>(null)
 const loadError = ref(false)
-let chart: any = null
+let chart: { setOption: (option: object, notMerge?: boolean) => void; resize: () => void; dispose: () => void } | null = null
 
-const chartTitle = computed(() => {
-  const title = props.option?.title
-  if (!title) return ''
-  if (typeof title === 'string') return title
-  if (typeof title?.text === 'string') return title.text
-  return ''
+const payload = computed(() => normalizeAgentChart(props.chart))
+
+const ariaLabel = computed(() => {
+  if (!payload.value) return '无效图表'
+  return payload.value.title || '数据分析图表'
 })
 
-/** Soft theme defaults so sparse backend options still look polished. */
-const polishOption = (raw: Record<string, any>) => {
-  const option = { ...raw }
+const textSummary = computed(() => {
+  const data = payload.value
+  if (!data) return '无可用图表数据。'
+  const seriesNames = data.series.map((item) => item.name).join('、')
+  return `${data.kind} 图，${data.categories.length} 个类别，系列：${seriesNames || '未命名'}。`
+})
 
-  // Title lives in the DOM header — free vertical space for the plot.
-  option.title = {
-    ...(typeof raw.title === 'object' ? raw.title : { text: raw.title }),
-    show: false
+const formatNumber = (value: number | undefined) => {
+  if (value === undefined || !Number.isFinite(value)) return '—'
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value)
+}
+
+const PALETTE = ['#0f766e', '#2563eb', '#14b8a6', '#6366f1', '#0ea5e9', '#059669']
+
+/**
+ * Map restricted payload → fixed ECharts option.
+ * No user formatters, no HTML tooltips, no rich-text objects from payload.
+ */
+const toEchartsOption = (data: AgentChartPayload) => {
+  // renderMode richText avoids HTML parsing of label strings in tooltips.
+  const safeTooltip = {
+    trigger: data.kind === 'pie' ? 'item' : 'axis',
+    renderMode: 'richText' as const,
+    // Never accept payload-controlled formatter / appendToBody HTML.
+    confine: true
   }
 
-  option.color = option.color || [
-    '#0f766e',
-    '#2563eb',
-    '#14b8a6',
-    '#6366f1',
-    '#0ea5e9',
-    '#059669'
-  ]
-  option.backgroundColor = option.backgroundColor || 'transparent'
-  option.textStyle = {
-    fontFamily: 'Segoe UI, PingFang SC, Microsoft YaHei, sans-serif',
-    color: '#334155',
-    ...(option.textStyle || {})
-  }
-
-  const isPie = Array.isArray(option.series)
-    && option.series.some((item: any) => item?.type === 'pie')
-
-  if (!isPie) {
-    option.grid = {
-      left: 20,
-      right: 20,
-      top: 36,
-      bottom: 32,
-      containLabel: true,
-      ...(option.grid || {})
+  if (data.kind === 'pie') {
+    const values = data.series[0]?.values || []
+    return {
+      color: PALETTE,
+      backgroundColor: 'transparent',
+      title: { show: false },
+      tooltip: safeTooltip,
+      legend: {
+        bottom: 0,
+        type: 'scroll',
+        // legend labels are plain strings from normalized payload only
+        data: data.categories
+      },
+      series: [
+        {
+          name: data.series[0]?.name || data.y_label || '占比',
+          type: 'pie',
+          radius: ['38%', '66%'],
+          label: { show: true },
+          data: data.categories.map((name, index) => ({
+            name,
+            value: values[index] ?? 0
+          }))
+        }
+      ]
     }
-    // Prefer roomy defaults even if backend sent a tight grid.
-    option.grid.top = Math.max(Number(option.grid.top) || 0, 36)
-    option.grid.bottom = Math.max(Number(option.grid.bottom) || 0, 28)
-  } else if (Array.isArray(option.series)) {
-    option.series = option.series.map((series: any) => {
-      if (series?.type !== 'pie') return series
-      return {
-        ...series,
-        radius: series.radius || ['44%', '70%'],
-        center: series.center || ['50%', '46%']
+  }
+
+  return {
+    color: PALETTE,
+    backgroundColor: 'transparent',
+    title: { show: false },
+    tooltip: safeTooltip,
+    legend: { top: 8, type: 'scroll' },
+    grid: { left: 24, right: 16, top: 40, bottom: 28, containLabel: true },
+    xAxis: {
+      type: 'category',
+      data: data.categories,
+      name: data.x_label || undefined,
+      axisLabel: {
+        rotate: data.categories.length > 6 ? 24 : 0,
+        hideOverlap: true
       }
-    })
+    },
+    yAxis: {
+      type: 'value',
+      name: data.y_label || undefined
+    },
+    series: data.series.map((item) => ({
+      name: item.name,
+      type: data.kind,
+      smooth: data.kind === 'line',
+      data: item.values,
+      barMaxWidth: 28
+    }))
   }
-
-  if (option.tooltip && typeof option.tooltip === 'object') {
-    option.tooltip = {
-      backgroundColor: 'rgba(15, 23, 42, 0.92)',
-      borderWidth: 0,
-      padding: [10, 12],
-      textStyle: { color: '#f8fafc', fontSize: 12 },
-      extraCssText: 'border-radius:10px;box-shadow:0 12px 28px rgba(15,23,42,0.18);',
-      ...option.tooltip
-    }
-  }
-  return option
 }
 
 const renderChart = async () => {
-  if (!chartEl.value || !props.option) return
+  const data = payload.value
+  if (!chartEl.value || !data) {
+    chart?.dispose()
+    chart = null
+    return
+  }
   try {
     const echarts = await import('echarts')
     await nextTick()
+    if (!chartEl.value) return
     if (!chart) {
-      chart = echarts.init(chartEl.value, undefined, {
-        renderer: 'canvas',
-        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2)
-      })
+      chart = echarts.init(chartEl.value)
     }
-    chart.setOption(polishOption(props.option), true)
+    chart.setOption(toEchartsOption(data), true)
     chart.resize()
     loadError.value = false
   } catch (error) {
@@ -122,7 +183,13 @@ onMounted(() => {
   window.addEventListener('resize', handleResize)
 })
 
-watch(() => props.option, renderChart, { deep: true })
+watch(
+  () => props.chart,
+  () => {
+    renderChart()
+  },
+  { deep: true }
+)
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
@@ -136,46 +203,71 @@ onBeforeUnmount(() => {
   position: relative;
   display: flex;
   flex-direction: column;
-  min-height: 420px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 16px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(248, 250, 252, 0.94));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  min-height: 320px;
+  border: 1px solid #dce8e4;
+  border-radius: 12px;
+  background: #ffffff;
   overflow: hidden;
 }
 
 .chart-header {
-  flex: 0 0 auto;
-  padding: 14px 16px 0;
+  padding: 12px 14px 0;
 }
 
 .chart-header h4 {
   margin: 0;
-  color: #0f172a;
   font-size: 14px;
-  font-weight: 800;
-  letter-spacing: -0.01em;
-  line-height: 1.4;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.chart-note {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #64748b;
 }
 
 .chart-canvas {
-  flex: 1 1 auto;
   width: 100%;
-  min-height: 360px;
-  height: 380px;
-  padding: 4px 8px 10px;
-  box-sizing: border-box;
+  min-height: 280px;
+  height: 300px;
 }
 
 .chart-fallback {
-  position: absolute;
-  inset: 0;
+  min-height: 120px;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 16px;
   color: #64748b;
   font-size: 13px;
-  background: rgba(248, 250, 252, 0.94);
+  text-align: center;
+}
+
+.chart-a11y {
+  margin: 0 12px 12px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.chart-a11y summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.chart-summary {
+  margin: 8px 0;
+}
+
+.chart-a11y table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.chart-a11y th,
+.chart-a11y td {
+  border: 1px solid #e2e8f0;
+  padding: 4px 6px;
+  text-align: left;
 }
 </style>

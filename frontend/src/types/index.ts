@@ -99,24 +99,7 @@ export interface AgentAuditResult {
   checked_items: string[]
   issues: string[]
   suggestions: string[]
-}
-
-export interface TripPlanQualityIssue {
-  code: string
-  severity: 'info' | 'warning' | 'error' | string
-  path: string
-  message: string
-  suggestion: string
-  auto_repaired: boolean
-}
-
-export interface TripPlanQualityResult {
-  status: 'passed' | 'warning' | 'failed' | string
-  score: number
-  checked_items: string[]
-  issues: TripPlanQualityIssue[]
-  verified_facts: number
-  generated_at: string
+  audit_level?: 'format_only' | 'semantic_verified' | 'offline_fallback' | string
 }
 
 export interface DayPlan {
@@ -139,6 +122,30 @@ export interface WeatherInfo {
   night_temp: number
   wind_direction: string
   wind_power: string
+}
+
+export interface TripPlanQualityIssue {
+  code: string
+  severity: 'info' | 'warning' | 'error' | string
+  path?: string
+  message: string
+  suggestion?: string
+  auto_repaired?: boolean
+}
+
+export interface TripPlanQualityResult {
+  status: 'passed' | 'warning' | 'failed' | 'review' | string
+  score: number
+  publishable: boolean
+  review_required?: boolean
+  /** blocked | needs_review | publishable — unified gate decision */
+  quality_status?: 'blocked' | 'needs_review' | 'publishable' | string
+  /** full | legacy_weak — validation context completeness on edits */
+  validation_mode?: 'full' | 'legacy_weak' | string
+  checked_items?: string[]
+  issues?: TripPlanQualityIssue[]
+  verified_facts?: number
+  generated_at?: string
 }
 
 export interface TripPlan {

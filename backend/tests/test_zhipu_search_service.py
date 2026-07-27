@@ -691,3 +691,269 @@ def test_audit_requires_inline_citation_when_zhipu_references_exist() -> None:
 
     assert audit.status == "warning"
     assert "正文未标注任何可对应本次联网结果的[来源N]引用。" in audit.issues
+
+
+# ---------------------------------------------------------------------------
+# Explicit coverage for configuration / HTTP failure matrix (mock only)
+# ---------------------------------------------------------------------------
+
+
+def test_is_configured_false_when_disabled_or_key_missing() -> None:
+    assert ZhipuSearchService(make_settings(zhipu_search_enabled=False)).is_configured is False
+    assert ZhipuSearchService(make_settings(zhipu_search_api_key="")).is_configured is False
+    assert ZhipuSearchService(make_settings(zhipu_search_api_key="   ")).is_configured is False
+    assert ZhipuSearchService(
+        make_settings(web_search_provider="other", zhipu_search_enabled=True)
+    ).is_configured is False
+    assert ZhipuSearchService(make_settings()).is_configured is True
+
+
+def test_search_raises_when_not_configured_and_never_calls_network() -> None:
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"search_result": []})
+
+    service = ZhipuSearchService(
+        make_settings(zhipu_search_enabled=False, zhipu_search_api_key=""),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ZhipuSearchError, match="not configured"):
+        service.search("西安")
+    assert called is False
+
+
+def test_empty_api_key_is_treated_as_unconfigured() -> None:
+    service = ZhipuSearchService(make_settings(zhipu_search_api_key=""))
+    with pytest.raises(ZhipuSearchError, match="not configured"):
+        service.search("西安")
+
+
+def test_empty_search_result_list_returns_empty() -> None:
+    service = ZhipuSearchService(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"search_result": []})
+        ),
+    )
+    assert service.search("西安") == []
+
+
+def test_missing_search_result_field_returns_empty() -> None:
+    service = ZhipuSearchService(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"ok": True})
+        ),
+    )
+    assert service.search("西安") == []
+
+
+def test_non_list_search_result_returns_empty() -> None:
+    service = ZhipuSearchService(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, json={"search_result": {"title": "not a list"}}
+            )
+        ),
+    )
+    assert service.search("西安") == []
+
+
+def test_malformed_items_are_skipped_not_trusted() -> None:
+    service = ZhipuSearchService(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "search_result": [
+                        "string-item",
+                        42,
+                        None,
+                        {"title": "无链接"},
+                        {
+                            "title": "合法",
+                            "content": "x" * 8000,
+                            "link": "https://example.com/ok",
+                        },
+                    ]
+                },
+            )
+        ),
+    )
+    results = service.search("西安")
+    assert len(results) == 1
+    assert results[0].title == "合法"
+    assert len(results[0].content) == 4000
+
+
+def test_max_results_count_is_clamped_in_request_payload() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={"search_result": []})
+
+    service = ZhipuSearchService(
+        make_settings(zhipu_search_max_results=999),
+        transport=httpx.MockTransport(handler),
+    )
+    service.search("西安")
+    assert captured["payload"]["count"] == 50
+
+
+def test_forbidden_error_is_sanitized() -> None:
+    secret = "must-not-leak-403"
+    service = ZhipuSearchService(
+        make_settings(zhipu_search_api_key=secret),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                403, json={"error": f"forbidden for {secret}"}
+            )
+        ),
+    )
+    with pytest.raises(ZhipuSearchError) as caught:
+        service.search("西安")
+    assert "authorization or permission failed" in str(caught.value)
+    assert secret not in str(caught.value)
+
+
+def test_http_500_retries_then_fails(monkeypatch) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, json={"error": "boom"})
+
+    monkeypatch.setattr(
+        "app.services.zhipu_search_service.time.sleep",
+        lambda _seconds: None,
+    )
+    service = ZhipuSearchService(
+        make_settings(zhipu_search_max_retries=1),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ZhipuSearchError, match="HTTP 500"):
+        service.search("西安")
+    assert calls == 2  # initial + one retry; never unbounded
+
+
+def test_timeout_is_sanitized_as_transport_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.zhipu_search_service.time.sleep",
+        lambda _seconds: None,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated timeout")
+
+    service = ZhipuSearchService(
+        make_settings(zhipu_search_max_retries=0),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ZhipuSearchError) as caught:
+        service.search("西安")
+    assert "request failed" in str(caught.value)
+    assert "simulated timeout" not in str(caught.value)
+
+
+def test_network_error_is_sanitized(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.zhipu_search_service.time.sleep",
+        lambda _seconds: None,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns boom")
+
+    service = ZhipuSearchService(
+        make_settings(zhipu_search_max_retries=0),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ZhipuSearchError) as caught:
+        service.search("西安")
+    assert "ConnectError" in str(caught.value)
+    assert "dns boom" not in str(caught.value)
+
+
+def test_invalid_json_body_raises_sanitized_error() -> None:
+    service = ZhipuSearchService(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"not-json{")
+        ),
+    )
+    with pytest.raises(ZhipuSearchError, match="invalid JSON"):
+        service.search("西安")
+
+
+def test_non_object_json_root_is_rejected() -> None:
+    service = ZhipuSearchService(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=["not", "an", "object"])
+        ),
+    )
+    with pytest.raises(ZhipuSearchError, match="invalid response"):
+        service.search("西安")
+
+
+def test_guide_unconfigured_search_degrades_without_blocking() -> None:
+    class UnconfiguredSearch:
+        is_configured = False
+        engine = "search_pro"
+        settings = make_settings(zhipu_search_enabled=False)
+
+        def search_many(self, *_args, **_kwargs):
+            raise AssertionError("search must not be called when unconfigured")
+
+        def to_references(self, *_args, **_kwargs):
+            raise AssertionError("to_references must not be called")
+
+    agent = build_guide_agent(UnconfiguredSearch())  # type: ignore[arg-type]
+    guide, references, audit = agent.generate(make_request(), make_plan())
+
+    assert references == []
+    assert "本地降级" in guide or "未启用" in guide or "未完整配置" in guide
+    assert audit.source == "local_fallback"
+    assert audit.status == "warning"
+    assert audit.audit_level == "offline_fallback"
+    assert audit.status != "failed"
+
+
+def test_guide_empty_search_results_stay_advisory_not_map_verified() -> None:
+    class EmptySearch(FakeSearchService):
+        def search_many(self, queries, **_kwargs):
+            self.queries = list(queries)
+            return []
+
+        def to_references(self, results):
+            return []
+
+    agent = build_guide_agent(EmptySearch())
+    guide, references, audit = agent.generate(make_request(), make_plan())
+
+    assert references == []
+    assert audit.source == "local_fallback"
+    assert audit.audit_level == "offline_fallback"
+    assert audit.audit_level != "semantic_verified"
+    assert "地图" not in " ".join(audit.issues)
+    assert any("未返回可核验" in issue or "本地降级" in issue for issue in audit.issues)
+
+
+def test_successful_search_audit_is_format_only_never_semantic_verified() -> None:
+    agent = build_guide_agent(FakeSearchService())
+    guide, references, audit = agent.generate(make_request(), make_plan())
+
+    assert references
+    assert audit.source.startswith("zhipu_")
+    assert audit.audit_level == "format_only"
+    assert audit.audit_level != "semantic_verified"
+    # Web search references must remain advisory, not map-verified facts.
+    assert "verified_map" not in guide.lower()
+    assert "地图已验证" not in guide
