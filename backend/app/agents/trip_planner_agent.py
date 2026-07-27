@@ -20,6 +20,7 @@ from ..services.trip_pacing_contract import (
     prefers_gentle_pacing,
     user_named_overflow_note,
 )
+from ..services.trip_schedule_service import calculate_day_schedule
 from ..models.schemas import (
     TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo,
     Location, Hotel, RouteSegment, POIInfo, AgentAuditResult
@@ -845,6 +846,7 @@ class MultiAgentTripPlanner:
         attraction.description = ""
         attraction.visit_duration = 0
         attraction.ticket_price = 0
+        attraction.ticket_price_status = "unknown"
 
     def _finalize_generated_content(self, request: TripRequest, trip_plan: TripPlan) -> TripPlan:
         gentle_pacing = self._needs_gentle_pacing(request)
@@ -1717,11 +1719,78 @@ class MultiAgentTripPlanner:
                         routes.append(segment)
                         total_routes += 1
                 day.routes = routes
+            self._trim_impossible_day_schedules(request, trip_plan)
             logger.info(f"[planner] route planning ready: segments={total_routes}, attempted={attempted_routes}")
         except Exception as e:
             logger.info(f"[planner] route planning failed: {type(e).__name__}")
 
         return trip_plan
+
+    def _trim_impossible_day_schedules(
+        self,
+        request: TripRequest,
+        trip_plan: TripPlan,
+    ) -> None:
+        """Remove trailing optional stops after real route durations are known."""
+        adjusted_days: List[int] = []
+        total_days = len(trip_plan.days)
+        for day_index, day in enumerate(trip_plan.days):
+            original_count = len(day.attractions or [])
+            while len(day.attractions or []) > 1:
+                schedule = calculate_day_schedule(
+                    request,
+                    day,
+                    day_index,
+                    total_days,
+                )
+                if schedule.total_minutes <= schedule.impossible_limit:
+                    break
+                day.attractions = list(day.attractions[:-1])
+                day.routes = list(day.routes[: max(0, len(day.attractions) - 1)])
+                adjusted_days.append(day_index + 1)
+
+            # A single grounded stop should not be deleted and leave an empty
+            # day. If its generic suggested duration alone makes the edge day
+            # impossible, shorten that suggestion to the executable remainder.
+            if len(day.attractions or []) == 1:
+                schedule = calculate_day_schedule(
+                    request,
+                    day,
+                    day_index,
+                    total_days,
+                )
+                if schedule.total_minutes > schedule.impossible_limit:
+                    attraction = day.attractions[0]
+                    excess = math.ceil(
+                        schedule.total_minutes - schedule.impossible_limit
+                    )
+                    adjusted_duration = max(
+                        60,
+                        int(attraction.visit_duration or 0) - excess - 15,
+                    )
+                    if adjusted_duration < int(attraction.visit_duration or 0):
+                        attraction.visit_duration = adjusted_duration
+                        adjusted_days.append(day_index + 1)
+
+            if len(day.attractions or []) < original_count:
+                names = "、".join(
+                    item.name for item in (day.attractions or []) if item.name
+                )
+                day.description = (
+                    f"第{day.day_index + 1}天围绕{names}展开，"
+                    "已按路线和往返耗时精简为可执行安排。"
+                )
+
+        if adjusted_days:
+            unique_days = "、".join(str(item) for item in sorted(set(adjusted_days)))
+            note = (
+                f"已根据实际路线耗时自动精简第{unique_days}天安排，"
+                "避免景点、换乘、用餐休息、酒店接驳和城际往返重复挤占正常作息。"
+            )
+            if note not in (trip_plan.overall_suggestions or ""):
+                trip_plan.overall_suggestions = (
+                    f"{(trip_plan.overall_suggestions or '').rstrip()} {note}"
+                ).strip()
 
     def _plan_route_segment(
         self,

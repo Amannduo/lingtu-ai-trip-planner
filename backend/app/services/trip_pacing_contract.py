@@ -70,6 +70,9 @@ FREE_TEXT_GENTLE_PHRASES: Tuple[str, ...] = (
     "慢节奏",
     "缓节奏",
     "松弛一点",
+    "避个暑",
+    "轻松避暑",
+    "休闲避暑",
 )
 
 FREE_TEXT_PARENT_ELDER_PHRASES: Tuple[str, ...] = (

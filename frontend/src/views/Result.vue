@@ -700,9 +700,12 @@ const displayWebGuide = computed(() => {
 })
 const renderedWebGuide = computed(() => renderMarkdown(displayWebGuide.value))
 const totalBudgetText = computed(() => {
-  const total = tripPlan.value?.budget?.total
+  const budget = tripPlan.value?.budget
+  const total = budget?.known_total ?? budget?.total
   if (typeof total !== 'number') return '待估算'
-  return isServerBackedPlan.value ? `¥${total}` : `缓存参考 ¥${total}`
+  const pendingCount = budget?.pending_ticket_items?.length ?? 0
+  const suffix = pendingCount > 0 ? ` + ${pendingCount}项门票待核实` : ''
+  return isServerBackedPlan.value ? `已知 ¥${total}${suffix}` : `缓存参考 ¥${total}${suffix}`
 })
 const weatherSectionTitle = computed(() =>
   isServerBackedPlan.value ? '天气信息' : '天气信息（浏览器缓存，需重新核验）'
@@ -985,6 +988,15 @@ const normalizeTripPlan = (raw: any): TripPlan | null => {
         total_meals: Math.max(0, boundedNumber(raw.budget.total_meals)),
         total_transportation: Math.max(0, boundedNumber(raw.budget.total_transportation)),
         total: Math.max(0, boundedNumber(raw.budget.total)),
+        known_total: Math.max(
+          0,
+          boundedNumber(raw.budget.known_total ?? raw.budget.total)
+        ),
+        pending_ticket_items: (
+          Array.isArray(raw.budget.pending_ticket_items)
+            ? raw.budget.pending_ticket_items
+            : []
+        ).map((item: unknown) => String(item)).filter(Boolean).slice(0, 50),
         hotel_nights: Math.max(0, boundedNumber(raw.budget.hotel_nights)),
         hotel_rooms: Math.max(0, boundedNumber(raw.budget.hotel_rooms, 1)),
         hotel_unit_price: Math.max(0, boundedNumber(raw.budget.hotel_unit_price)),

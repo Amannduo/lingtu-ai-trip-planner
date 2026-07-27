@@ -18,6 +18,7 @@ from .destination_feasibility_service import (
     poi_destination_status,
 )
 from .trip_pacing_contract import prefers_gentle_pacing
+from .trip_schedule_service import calculate_day_schedule
 
 
 # Structural hard blockers (shared with PR trust-hardening intent).
@@ -512,33 +513,26 @@ class TripPlanQualityService:
                         "调整景点分组或更换交通方式。",
                     )
 
-            route_minutes = sum(
-                max(0, int(route.duration or 0)) / 60
-                for route in routes[:expected_routes]
+            schedule = calculate_day_schedule(
+                request,
+                day,
+                day_index,
+                len(plan.days),
             )
-            intercity_reserve = 240 if cross_city and is_edge_day else 0
-            meal_and_rest_minutes = 150 if relaxed_pace else 120
-            scheduled_minutes = (
-                total_visit_minutes
-                + route_minutes
-                + intercity_reserve
-                + meal_and_rest_minutes
-            )
-            overload_limit = 480 if relaxed_pace else 600
-            impossible_limit = 660 if relaxed_pace else 840
-            if scheduled_minutes > impossible_limit:
+            scheduled_minutes = schedule.total_minutes
+            if scheduled_minutes > schedule.impossible_limit:
                 add(
                     "DAY_SCHEDULE_IMPOSSIBLE",
                     "error",
                     f"days[{day_index}]",
                     (
                         f"第{day_index + 1}天景点、路线、用餐休息"
-                        f"和城际预留合计约{round(scheduled_minutes / 60, 1)}"
+                        f"、酒店接驳和城际预留合计约{round(scheduled_minutes / 60, 1)}"
                         "小时，已无法在正常作息内执行。"
                     ),
                     "删减景点、缩短路线或拆分到其他日期。",
                 )
-            elif scheduled_minutes > overload_limit:
+            elif scheduled_minutes > schedule.overload_limit:
                 add(
                     "DAY_SCHEDULE_OVERLOAD",
                     "warning",
@@ -600,16 +594,25 @@ class TripPlanQualityService:
             for day in plan.days
             for attraction in (day.attractions or [])
         ]
-        if all_attractions and not any(
-            int(attraction.ticket_price or 0) > 0
+        pending_ticket_items = [
+            attraction.name
             for attraction in all_attractions
-        ):
+            if (
+                int(attraction.ticket_price or 0) <= 0
+                and attraction.ticket_price_status != "free"
+            )
+        ]
+        if pending_ticket_items:
             add(
                 "TICKET_PRICE_UNAVAILABLE",
                 "warning",
-                "days.attractions.ticket_price",
-                "全部景点暂按0元计入预算，但当前没有取得可核验票价；这不代表景点已确认免费。",
-                "出发前通过景区官方渠道核对免费政策、预约要求和实际票价。",
+                "days.attractions.ticket_price_status",
+                (
+                    "以下景点门票价格待核实，未知票价未计入已知费用："
+                    + "、".join(pending_ticket_items[:5])
+                    + "。这不代表景点已确认免费。"
+                ),
+                "出发前通过景区官方渠道核对票价、免费政策和预约要求。",
             )
         weak_attractions = [
             attraction.name
@@ -888,6 +891,7 @@ class TripPlanQualityService:
                 "total_meals": budget.total_meals,
                 "total_transportation": budget.total_transportation,
                 "total": budget.total,
+                "known_total": budget.known_total,
                 "hotel_nights": budget.hotel_nights,
                 "hotel_rooms": budget.hotel_rooms,
                 "hotel_unit_price": budget.hotel_unit_price,
@@ -921,15 +925,26 @@ class TripPlanQualityService:
                     f"预算分项合计¥{calculated}与总计¥{budget.total}不一致。",
                     "重新计算预算汇总。",
                 )
+            if budget.known_total != budget.total:
+                add(
+                    "BUDGET_SUM_MISMATCH",
+                    "warning",
+                    "budget.known_total",
+                    (
+                        f"已知费用合计¥{budget.known_total}"
+                        f"与预算分项合计¥{budget.total}不一致。"
+                    ),
+                    "重新计算已知费用汇总；待核实票价不得混入该数值。",
+                )
             if (
                 request.budget is not None
-                and budget.total > request.budget * 1.1
+                and budget.known_total > request.budget * 1.1
             ):
                 add(
                     "BUDGET_EXCEEDED",
                     "warning",
                     "budget.total",
-                    f"预计总费用¥{budget.total}超过用户预算¥{request.budget}。",
+                    f"已知费用合计¥{budget.known_total}超过用户预算¥{request.budget}。",
                     "优先降低酒店、城际交通或高价门票支出。",
                 )
 

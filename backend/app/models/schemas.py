@@ -407,6 +407,10 @@ class Attraction(BaseModel):
     image_url: Optional[str] = Field(default=None, description="图片URL")
     coordinate_source: str = Field(default="", description="坐标来源")
     ticket_price: int = Field(default=0, ge=0, le=1_000_000, description="单人门票参考价(元)")
+    ticket_price_status: Literal["unknown", "verified", "free"] = Field(
+        default="unknown",
+        description="门票状态：未知、已核验价格或已确认免费",
+    )
     verification: Optional[VerificationMeta] = Field(
         default=None,
         description="POI提供商返回的行政区数据，用于目的地校验，不参与前端展示",
@@ -512,6 +516,12 @@ class Budget(BaseModel):
     total_meals: int = Field(default=0, description="餐饮总费用")
     total_transportation: int = Field(default=0, description="交通总费用")
     total: int = Field(default=0, description="总费用")
+    known_total: int = Field(default=0, description="已知费用合计，不含待核实票价")
+    pending_ticket_items: List[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="门票价格待核实的景点",
+    )
     hotel_nights: int = Field(default=0, description="酒店晚数")
     hotel_rooms: int = Field(default=1, description="酒店间数")
     hotel_unit_price: int = Field(default=0, description="酒店单晚参考价")
@@ -522,6 +532,14 @@ class Budget(BaseModel):
     hotel_reference: Optional[str] = Field(default=None, description="酒店参考结果")
     transport_reference: Optional[str] = Field(default=None, description="交通参考结果")
     budget_notes: List[str] = Field(default_factory=list, max_length=50, description="预算备注")
+
+    @model_validator(mode="after")
+    def backfill_known_total(self):
+        # Backward compatibility for persisted plans created before
+        # ``known_total`` existed.
+        if self.known_total == 0 and self.total > 0:
+            self.known_total = self.total
+        return self
 
 
 class WebReference(BaseModel):

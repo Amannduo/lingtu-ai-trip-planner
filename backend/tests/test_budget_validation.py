@@ -353,9 +353,10 @@ def test_zero_ticket_prices_are_transparent_and_prevent_perfect_score() -> None:
     )
 
     notes = " ".join(plan.budget.budget_notes)
-    assert "暂按0元计入" in notes
-    assert "不代表已确认免费" in notes
-    assert "不代表景点已确认免费" in ticket_issue.message
+    assert "已知费用合计" in notes
+    assert "未知票价未计入已知费用" in notes
+    assert "不代表景点免费" in notes
+    assert "门票价格待核实" in ticket_issue.message
     assert quality.score <= 96
 
 def test_legacy_flyai_package_is_pinned_without_rewriting_custom_commands(

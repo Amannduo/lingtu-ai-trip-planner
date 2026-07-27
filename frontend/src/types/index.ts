@@ -27,6 +27,7 @@ export interface Attraction {
   poi_id?: string
   coordinate_source?: string
   ticket_price?: number
+  ticket_price_status?: 'unknown' | 'verified' | 'free'
 }
 
 export interface Meal {
@@ -73,6 +74,8 @@ export interface Budget {
   total_meals: number
   total_transportation: number
   total: number
+  known_total: number
+  pending_ticket_items: string[]
   hotel_nights: number
   hotel_rooms: number
   hotel_unit_price: number

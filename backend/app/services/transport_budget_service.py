@@ -85,18 +85,19 @@ class TransportBudgetService:
         # ticket_price / meal estimated_cost are per-person unit estimates
         # (model output and planner defaults); scale by travelers for party total.
         attraction_total = self._sum_attraction_costs(trip_plan, request.travelers)
+        pending_ticket_items = self._pending_ticket_items(trip_plan)
         meal_total = self._sum_meal_costs(trip_plan, request.travelers)
-        has_attractions = any(day.attractions for day in trip_plan.days)
         budget_notes: List[str] = [f"餐饮按{request.travelers}人计算。"]
         if attraction_total > 0:
             budget_notes.append(
                 f"已填写的景点门票参考价按{request.travelers}人计算，"
                 "实际票价和优惠政策仍需通过景区官方渠道复核。"
             )
-        elif has_attractions:
+        if pending_ticket_items:
             budget_notes.append(
-                "景点门票当前暂按0元计入；0仅表示未取得可核验的结构化票价，"
-                "不代表已确认免费，出发前需核对官方票价、免费政策和预约要求。"
+                "当前仅展示已知费用合计；以下景点门票待核实："
+                + "、".join(pending_ticket_items)
+                + "。未知票价未计入已知费用，也不代表景点免费。"
             )
 
         if meal_total <= 0:
@@ -126,6 +127,8 @@ class TransportBudgetService:
             total_meals=meal_total,
             total_transportation=total_transportation,
             total=total,
+            known_total=total,
+            pending_ticket_items=pending_ticket_items,
             hotel_nights=hotel_nights,
             hotel_rooms=hotel_rooms,
             hotel_unit_price=hotel_quote.unit_price,
@@ -1338,6 +1341,20 @@ class TransportBudgetService:
             for attraction in day.attractions:
                 single_person_total += max(0, int(attraction.ticket_price or 0))
         return single_person_total * max(1, travelers)
+
+    @staticmethod
+    def _pending_ticket_items(trip_plan: TripPlan) -> List[str]:
+        pending: List[str] = []
+        for day in trip_plan.days:
+            for attraction in day.attractions:
+                if (
+                    int(attraction.ticket_price or 0) <= 0
+                    and attraction.ticket_price_status != "free"
+                    and attraction.name
+                    and attraction.name not in pending
+                ):
+                    pending.append(attraction.name)
+        return pending
 
     def _sum_meal_costs(self, trip_plan: TripPlan, travelers: int = 1) -> int:
         single_person_total = 0
