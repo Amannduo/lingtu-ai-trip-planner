@@ -40,6 +40,15 @@ from app.services.trip_plan_quality_service import TripPlanQualityService
 from app.services.transport_budget_service import TransportBudgetService
 
 
+def authenticated_test_user() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id="trip-quality-user",
+        username="trip-quality-user",
+        email=None,
+        role="user",
+    )
+
+
 def make_request(city: str = "北京") -> TripRequest:
     return TripRequest(
         city=city,
@@ -630,33 +639,36 @@ def test_plan_job_api_stream_requires_token_and_returns_events(monkeypatch) -> N
         lambda: FakePlanner(),
     )
 
-    payload = make_request().model_dump(mode="json")
-    with TestClient(app, base_url="https://testserver") as client:
-        created = client.post("/api/trip/plan-jobs", json=payload)
-        assert created.status_code == 200
-        stream_url = created.json()["stream_url"]
-        job_id = created.json()["job_id"]
-        leaked_token = service._jobs[job_id].access_token
-        assert "token=" not in stream_url
-        assert "httponly" in created.headers["set-cookie"].lower()
-        assert "samesite=strict" in created.headers["set-cookie"].lower()
-        assert "secure" in created.headers["set-cookie"].lower()
+    app.dependency_overrides[get_current_user] = authenticated_test_user
+    try:
+        payload = make_request().model_dump(mode="json")
+        with TestClient(app, base_url="https://testserver") as client:
+            created = client.post("/api/trip/plan-jobs", json=payload)
+            assert created.status_code == 200
+            stream_url = created.json()["stream_url"]
+            job_id = created.json()["job_id"]
+            leaked_token = service._jobs[job_id].access_token
+            assert "token=" not in stream_url
+            assert "httponly" in created.headers["set-cookie"].lower()
+            assert "samesite=strict" in created.headers["set-cookie"].lower()
+            assert "secure" in created.headers["set-cookie"].lower()
 
-        with TestClient(app) as isolated_client:
-            assert isolated_client.get(stream_url).status_code == 404
-            assert isolated_client.get(stream_url + "?token=wrong").status_code == 404
-            assert isolated_client.get(stream_url + f"?token={leaked_token}").status_code == 404
+            with TestClient(app) as isolated_client:
+                assert isolated_client.get(stream_url).status_code == 404
+                assert isolated_client.get(stream_url + "?token=wrong").status_code == 404
+                assert isolated_client.get(stream_url + f"?token={leaked_token}").status_code == 404
 
-        streamed = client.get(stream_url)
-        assert streamed.status_code == 200
-        assert streamed.headers["content-type"].startswith("text/event-stream")
-        assert "event: stage" in streamed.text
-        assert "event: result" in streamed.text
-        assert "找到 1 个可靠地点" in streamed.text
-        assert '"stage":"finalizing"' in streamed.text
-        assert '"progress":99' in streamed.text
-
-    service.shutdown()
+            streamed = client.get(stream_url)
+            assert streamed.status_code == 200
+            assert streamed.headers["content-type"].startswith("text/event-stream")
+            assert "event: stage" in streamed.text
+            assert "event: result" in streamed.text
+            assert "找到 1 个可靠地点" in streamed.text
+            assert '"stage":"finalizing"' in streamed.text
+            assert '"progress":99' in streamed.text
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        service.shutdown()
 
 
 def test_unpublishable_plan_never_leases_or_triggers_delivery(monkeypatch) -> None:
@@ -754,16 +766,19 @@ def test_plan_job_cookie_honors_forced_secure_setting(monkeypatch) -> None:
         lambda: SimpleNamespace(auth_cookie_secure=True),
     )
 
-    payload = make_request().model_dump(mode="json")
-    with TestClient(app, base_url="http://testserver") as client:
-        created = client.post("/api/trip/plan-jobs", json=payload)
-        assert created.status_code == 200
-        set_cookie = created.headers["set-cookie"].lower()
-        assert "secure" in set_cookie
-        assert "httponly" in set_cookie
-        assert "samesite=strict" in set_cookie
-
-    service.shutdown()
+    app.dependency_overrides[get_current_user] = authenticated_test_user
+    try:
+        payload = make_request().model_dump(mode="json")
+        with TestClient(app, base_url="http://testserver") as client:
+            created = client.post("/api/trip/plan-jobs", json=payload)
+            assert created.status_code == 200
+            set_cookie = created.headers["set-cookie"].lower()
+            assert "secure" in set_cookie
+            assert "httponly" in set_cookie
+            assert "samesite=strict" in set_cookie
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        service.shutdown()
 
 
 def test_update_recomputes_quality_and_restores_trusted_facts(monkeypatch) -> None:
@@ -1183,8 +1198,12 @@ def test_past_trip_is_rejected_before_planner_call(monkeypatch, path) -> None:
         }
     ).model_dump(mode="json")
 
-    with TestClient(app) as client:
-        response = client.post(path, json=payload)
+    app.dependency_overrides[get_current_user] = authenticated_test_user
+    try:
+        with TestClient(app) as client:
+            response = client.post(path, json=payload)
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == 422
     assert "不能早于今天" in str(response.json().get("detail", ""))
