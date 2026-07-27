@@ -63,18 +63,6 @@ FORBIDDEN_NESTED_KEYS = frozenset(
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
-# Brand palette aligned with the frontend (teal / slate / soft accents).
-PALETTE = [
-    "#0f766e",
-    "#2563eb",
-    "#14b8a6",
-    "#6366f1",
-    "#0ea5e9",
-    "#059669",
-    "#8b5cf6",
-    "#0284c7",
-]
-
 
 def _clean_text(value: Any, max_len: int) -> str:
     """Strip controls and neutralize angle brackets for pure-text display."""
@@ -229,7 +217,6 @@ def build_chart(intent: str, table: list[dict], title: str = "") -> dict | None:
     if any(token in lowered for token in ("select ", " from ", "password", "api_key", "traceback")):
         chart_title = "旅行计划数据分析"
 
-    # Grouped bar chart when period comparison is present.
     if "周期" in first and "目的地" in first:
         categories = list(
             dict.fromkeys(_clean_text(row.get("目的地", ""), MAX_CATEGORY_LEN) for row in table)

@@ -1427,7 +1427,7 @@ class TripPlanQualityService:
             review_required = False
             status = "passed"
 
-        return TripPlanQualityResult(
+        result = TripPlanQualityResult(
             status=status,
             score=score,
             constraint_score=constraint_score,
@@ -1441,9 +1441,9 @@ class TripPlanQualityService:
             verified_facts=verified_facts,
             generated_at=datetime.now().isoformat(timespec="seconds"),
         )
-        # Unified gate triple (publishable + quality_status): single source.
-        refresh_quality_gate(result, generation_mode=plan.generation_mode)
-        return result
+        # ``quality_status`` is a derived compatibility field. Refresh it from
+        # the authoritative publishable/review pair before returning.
+        return refresh_quality_gate(result, generation_mode=plan.generation_mode)
 
     def _normalized_label(self, value: str) -> str:
         return re.sub(r"[\W_]+", "", value or "").casefold()

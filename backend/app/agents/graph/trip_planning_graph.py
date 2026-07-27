@@ -920,7 +920,6 @@ class TripPlanningAgentGraph:
                 plan.quality.review_required,
                 len(plan.quality.issues),
                 plan.quality.status,
-                
             )
         except TripGenerationCancelledError:
             raise

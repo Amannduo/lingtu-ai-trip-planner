@@ -129,12 +129,12 @@ async def login(request: LoginRequest, response: Response, http_request: Request
 
 
 @router.get("/me", response_model=AuthResponse)
-def me(user: AuthenticatedUser = Depends(get_current_user)):
+async def me(user: AuthenticatedUser = Depends(get_current_user)):
     return AuthResponse(user=_public_user(user))
 
 
 @router.patch("/me", response_model=AuthResponse)
-def update_me(
+async def update_me(
     request: UpdateEmailRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):

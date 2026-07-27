@@ -664,48 +664,6 @@ class AmapService:
             print(f"Open-Meteo geocode failed: {type(exc).__name__}")
         return None
 
-    def _resolve_weather_location(self, city: str) -> Optional[Location]:
-        """Resolve a forecast coordinate without making Open-Meteo depend on AMap."""
-        try:
-            amap_location = _parse_location(self._geocode_location(city, city))
-            if amap_location is not None:
-                return amap_location
-        except Exception as exc:
-            # httpx exceptions may include a request URL containing the AMap
-            # key, so only the exception class is safe to log.
-            print(f"AMap weather geocode failed: {type(exc).__name__}")
-
-        try:
-            response = self._client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={
-                    "name": city,
-                    "count": 5,
-                    "language": "zh",
-                    "format": "json",
-                    "countryCode": "CN",
-                },
-                timeout=get_settings().amap_route_timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            results = data.get("results") if isinstance(data, dict) else None
-            if not isinstance(results, list):
-                return None
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    longitude = float(item.get("longitude"))
-                    latitude = float(item.get("latitude"))
-                except (TypeError, ValueError):
-                    continue
-                if 73.0 <= longitude <= 136.0 and 3.0 <= latitude <= 54.0:
-                    return Location(longitude=longitude, latitude=latitude)
-        except Exception as exc:
-            print(f"Open-Meteo geocode failed: {type(exc).__name__}")
-        return None
-
     def _date_range(self, start_date: str, end_date: str) -> List[str]:
         from datetime import datetime, timedelta
 

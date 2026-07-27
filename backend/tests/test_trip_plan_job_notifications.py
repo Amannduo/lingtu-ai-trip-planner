@@ -63,7 +63,7 @@ def _ok_plan() -> TripPlan:
             status="passed",
             score=90,
             publishable=True,
-            review_required=False,
+            quality_status="publishable",
         ),
     )
 
@@ -207,9 +207,11 @@ def test_notification_failures_never_fail_the_job(job_client, monkeypatch) -> No
     save.assert_called_once()
 
 
-def test_needs_review_plan_skips_email_but_saves_and_pushes(
+def test_needs_review_plan_delivers_with_review_notices(
     job_client, monkeypatch
 ) -> None:
+    """Reviewable-delivery model: a needs_review plan persists and both
+    notification channels fire, with the review flag surfaced in the result."""
     client, _service, save, email, notify = job_client
     plan = _ok_plan()
     plan.quality = TripPlanQualityResult(
@@ -217,6 +219,7 @@ def test_needs_review_plan_skips_email_but_saves_and_pushes(
         score=60,
         publishable=True,
         review_required=True,
+        quality_status="needs_review",
     )
     _use_planner(
         monkeypatch,
@@ -239,7 +242,7 @@ def test_needs_review_plan_skips_email_but_saves_and_pushes(
     assert result["data"]["needs_review"] is True
     assert result["data"]["plan_no"] == "P-NOTIFY-1"
     save.assert_called_once()
-    email.assert_not_called()
+    email.assert_called_once()
     notify.assert_called_once_with("user-notify", "杭州", "P-NOTIFY-1")
 
 
@@ -251,7 +254,7 @@ def test_sse_quality_error_event_carries_structured_issues(
         status="failed",
         score=40,
         publishable=False,
-        review_required=True,
+        quality_status="blocked",
         issues=[
             TripPlanQualityIssue(
                 code="EMPTY_DAY",

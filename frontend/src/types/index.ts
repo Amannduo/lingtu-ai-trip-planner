@@ -141,6 +141,10 @@ export interface TripPlanQualityResult {
   score: number
   publishable: boolean
   review_required?: boolean
+  /** blocked | needs_review | publishable — unified gate decision */
+  quality_status?: 'blocked' | 'needs_review' | 'publishable' | string
+  /** full | legacy_weak — validation context completeness on edits */
+  validation_mode?: 'full' | 'legacy_weak' | string
   checked_items?: string[]
   issues?: TripPlanQualityIssue[]
   verified_facts?: number

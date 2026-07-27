@@ -135,7 +135,6 @@ async def request_validation_error_handler(
         },
     )
 
-
 def _rate_limit_rule(method: str, path: str) -> tuple[str, int, int] | None:
     """Middleware rate rules for coarse public endpoints.
 

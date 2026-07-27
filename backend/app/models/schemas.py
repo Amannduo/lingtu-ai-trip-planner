@@ -615,7 +615,6 @@ class TripPlanQualityResult(BaseModel):
     generated_at: str = Field(default="")
 
 
-
 class TripPlan(BaseModel):
     """旅行计划"""
     city: str = Field(..., description="目的地城市")
@@ -662,7 +661,6 @@ class TripPlanResponse(BaseModel):
         default="",
         description="blocked | needs_review | publishable",
     )
-
 
 
 class POIInfo(BaseModel):
