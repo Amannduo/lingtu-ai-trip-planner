@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.agents.trip_planner_agent import MultiAgentTripPlanner
+from app.api.auth import get_current_user
 from app.api.main import app
 from app.api.routes.trip import _validate_generation_request
 from app.models.schemas import (
@@ -25,6 +26,7 @@ from app.models.schemas import (
     WebReference,
 )
 from app.services.amap_service import AmapService
+from app.services.auth_service import AuthenticatedUser
 from app.services.request_rate_limit_service import RequestRateLimitService
 from app.services.travel_plan_data_service import TravelPlanDataService
 from app.tools.file_analysis_tool import (
@@ -131,8 +133,17 @@ def test_past_dates_never_reach_planner_factory(monkeypatch, endpoint: str) -> N
         travel_days=1,
     ).model_dump(mode="json")
 
-    with TestClient(app) as client:
-        response = client.post(endpoint, json=payload)
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        user_id="hardening-user",
+        username="hardening-user",
+        email=None,
+        role="user",
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(endpoint, json=payload)
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == 422
     assert planner_calls == 0

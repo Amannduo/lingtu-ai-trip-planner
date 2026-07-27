@@ -17,13 +17,24 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.auth import get_current_user
 from app.api.main import app
+from app.services.auth_service import AuthenticatedUser
 
 
 @pytest.fixture
 def client():
-    with TestClient(app) as c:
-        yield c
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        user_id="error-contract-user",
+        username="error-contract-user",
+        email=None,
+        role="user",
+    )
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 def _plan_payload(**overrides) -> dict:

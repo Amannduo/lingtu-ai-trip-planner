@@ -4,6 +4,8 @@
 
 灵途是一个面向真实旅行场景的开源行程规划应用。它结合 FastAPI、Vue 3、多智能体工作流和高德地图数据，生成包含景点、路线、天气、餐饮、酒店与预算的多日旅行计划，并支持历史记录、地图手册、PDF 导出、邮件投递和浏览器后台通知。
 
+当前版本要求用户登录后使用 AI 推荐和行程生成功能。生成的计划会保存到当前账号的历史记录，且只能由该账号读取或编辑。
+
 ## 功能特性
 
 - 根据目的地、日期、预算、交通、住宿和兴趣偏好生成多日行程
@@ -21,6 +23,7 @@
 - [English documentation](./README.en.md)
 - [AI 工具操作指南](./docs/ai-operator-guide.md)
 - [系统架构说明](./docs/architecture.md)
+- [生产部署指南](./docs/deployment.md)
 - [火山引擎联网攻略代理说明](./docs/volcengine-web-travel-guide-agent.md)
 
 ## 技术栈
@@ -251,7 +254,9 @@ npm run build
 | POST | `/api/auth/login` | 用户名或邮箱登录 |
 | GET/PATCH | `/api/auth/me` | 读取账号或修改绑定邮箱 |
 | POST | `/api/auth/logout` | 清除登录 Cookie |
-| POST | `/api/trip/plan` | 生成、保存并可选邮件发送旅行计划 |
+| POST | `/api/recommend/chat` | 登录后使用自然语言推荐目的地 |
+| POST | `/api/trip/plan` | 登录后生成、保存并可选邮件发送旅行计划 |
+| POST | `/api/trip/plan-jobs` | 登录后创建带进度的生成任务 |
 | GET | `/api/push/vapid-public-key` | 获取 Web Push VAPID 公钥 |
 | POST | `/api/push/subscriptions` | 保存或更新当前用户的浏览器订阅 |
 | DELETE | `/api/push/subscriptions` | 取消当前用户的浏览器订阅 |
@@ -261,7 +266,7 @@ npm run build
 | POST | `/api/agent/chat` | 多智能体自然语言分析 |
 | POST | `/api/agent/analyze-file` | 分析旅行相关文档 |
 
-受保护接口只使用后端会话中的用户身份；需要额外权限的分析能力默认面向自托管运营场景。
+AI 推荐、行程生成、历史计划和生成任务接口均要求登录。受保护接口只使用后端会话中的用户身份；需要额外权限的分析能力默认面向自托管运营场景。
 
 ## 项目结构
 
