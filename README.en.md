@@ -6,6 +6,10 @@ Lingtu is an open-source travel planning application for real-world trip scenari
 
 The current version requires an authenticated account for AI destination recommendations and itinerary generation. Generated plans are stored in that account's private history.
 
+## Interface Preview
+
+![Lingtu AI Trip Planner home page](./docs/images/home-desktop.png)
+
 ## Features
 
 - Generate multi-day itineraries from destination, date range, budget, transport, lodging, and interests
