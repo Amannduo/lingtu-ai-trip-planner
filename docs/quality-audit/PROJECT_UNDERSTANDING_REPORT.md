@@ -18,10 +18,10 @@
 
 用户最主要使用流程：
 
-1. 打开首页填写旅行表单（可匿名）
+1. 打开首页注册或登录，然后填写旅行表单
 2. 可选：对话式目的地推荐
 3. 提交生成（同步 `/api/trip/plan` 或异步 `/api/trip/plan-jobs` + SSE）
-4. 结果页查看行程、地图、预算；登录用户可落库与再编辑
+4. 结果页查看行程、地图、预算；生成结果自动落库并可再编辑
 5. 可选：导出 PDF、发邮件、开启 Web Push
 
 ---
@@ -85,12 +85,12 @@
 | 项 | 内容 |
 | --- | --- |
 | 输入 | 城市、日期、天数、人数、预算、交通、住宿、偏好、自由文本、语义契约确认标志 |
-| 中间执行 | Pydantic 校验 → 语义硬拦截 → 限流 → Agent/Graph 规划 → 高德 enrichment → 质量评估 → 可选落库 → 邮件/Push |
+| 中间执行 | 登录校验 → Pydantic 校验 → 语义硬拦截 → 限流 → Agent/Graph 规划 → 高德 enrichment → 质量评估 → 落库 → 邮件/Push |
 | 输出 | `TripPlanResponse`（景点/日程/预算/天气/quality 等） |
-| 数据保存 | 登录用户：`travel_plans`；匿名：仅前端本地缓存 |
+| 数据保存 | 生成结果保存到当前登录用户的 `travel_plans` |
 | 失败处理 | 422 质量/语义拒绝；429 限流/容量；500 生成失败（日志含异常） |
 | 状态转换 | 请求中 → 成功/失败；异步 job：queued/running/completed/failed/cancelled |
-| 权限 | 生成可匿名；保存/邮件需登录 |
+| 权限 | 推荐、生成、保存、历史和邮件均需登录 |
 | 不可逆 | 真实 SMTP/Push 一旦发出不可撤回；生成消耗 LLM/地图额度 |
 
 ### 流程 C：异步 plan-jobs + SSE
@@ -98,7 +98,7 @@
 | 项 | 内容 |
 | --- | --- |
 | 步骤 | `POST /plan-jobs` → cookie 绑定 job token → `GET .../events` SSE → 可选 cancel |
-| 所有权 | `user:{id}` 或 `anonymous:{ip}` + job cookie |
+| 所有权 | 登录用户 `user:{id}` + job cookie |
 | 风险 | 任务泄漏、超时后晚到结果落库、SSE 断连恢复、容量耗尽 |
 
 ### 流程 D：历史查看与编辑

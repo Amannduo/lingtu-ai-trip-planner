@@ -25,7 +25,7 @@ The system boundary is straightforward:
 
 1. the frontend collects trip preferences and sends them to the backend
 2. the backend gathers map, weather, hotel, and model-driven planning data
-3. the backend returns a normalized trip plan and optionally persists it
+3. the backend returns a normalized trip plan and persists it for the authenticated user
 4. the frontend renders the plan, poster, exports, and push subscription state
 
 ## Backend Modules
@@ -75,7 +75,7 @@ Important backend services include:
 - `api.ts`: typed API access and response normalization
 - `auth.ts`: local account state and session-related helpers
 - `pushNotifications.ts`: Service Worker registration, permission state, subscribe/unsubscribe flow
-- `tripCache.ts`: short-term browser persistence and recovery for anonymous or interrupted flows
+- `tripCache.ts`: short-term browser persistence and recovery for interrupted authenticated flows
 
 ### Poster rendering
 
@@ -108,11 +108,11 @@ A typical trip request follows this path:
 2. backend validates request schema
 3. backend queries supporting services such as map, weather, transport, hotel, and LLM planning
 4. backend assembles a normalized plan object
-5. if authenticated, backend persists summary and detail records
+5. backend persists summary and detail records for the authenticated user
 6. backend optionally sends email and Web Push as non-critical post-save side effects
 7. frontend caches the plan locally and renders the result page
 
-Anonymous generation is viewable locally but is not stored in authenticated history.
+AI recommendation and trip generation endpoints require authentication. The backend rejects anonymous requests before expensive planning work begins, and every persisted plan is bound to the authenticated user.
 
 ## Map and Route Integrity
 

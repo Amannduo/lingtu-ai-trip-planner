@@ -4,6 +4,8 @@
 
 Lingtu is an open-source travel planning application for real-world trip scenarios. It combines FastAPI, Vue 3, multi-agent orchestration, and AMap services to generate multi-day itineraries with attractions, routes, weather, dining, hotels, budget estimates, printable posters, email delivery, and push notifications.
 
+The current version requires an authenticated account for AI destination recommendations and itinerary generation. Generated plans are stored in that account's private history.
+
 ## Features
 
 - Generate multi-day itineraries from destination, date range, budget, transport, lodging, and interests
@@ -19,6 +21,7 @@ Lingtu is an open-source travel planning application for real-world trip scenari
 - [简体中文说明](./README.zh-CN.md)
 - [AI Operator Guide](./docs/ai-operator-guide.md)
 - [Architecture](./docs/architecture.md)
+- [Production deployment](./docs/deployment.md)
 - [Volcengine Web Travel Guide Agent](./docs/volcengine-web-travel-guide-agent.md)
 
 ## Quick Start
@@ -88,6 +91,7 @@ Endpoints:
 
 - Passwords are stored as Argon2 hashes
 - Login state is stored in `HttpOnly` cookies
+- AI recommendations, generation jobs, itinerary generation, and history endpoints require authentication
 - Backend authorization is derived from the server-side session, not from frontend role fields
 - Higher-privilege roles are meant for self-hosted operational scenarios and should be protected through server-side invite configuration
 
