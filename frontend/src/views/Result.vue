@@ -93,12 +93,12 @@
       <div v-if="topQualityIssues.length" class="readiness-focus">
         <div class="focus-head">
           <span>出发前优先确认</span>
-          <button type="button" @click="scrollToSection({ key: 'quality-gate' })">查看全部</button>
+          <button type="button" @click="scrollToSection({ key: 'travel-reminders' })">查看全部</button>
         </div>
         <ul>
-          <li v-for="issue in topQualityIssues" :key="issue.code + issue.path">
+          <li v-for="issue in topQualityIssues" :key="issue.code + issue.title">
             <i :class="'is-' + issue.severity"></i>
-            <span>{{ issue.message }}</span>
+            <span>{{ issue.title }}</span>
           </li>
         </ul>
       </div>
@@ -115,6 +115,9 @@
       <div class="side-nav">
         <a-affix :offset-top="80">
           <a-menu mode="inline" :selected-keys="[activeSection]" @click="scrollToSection">
+            <a-menu-item key="travel-reminders" v-if="qualityIssuesList.length">
+              <span>🔔 出发前提醒</span>
+            </a-menu-item>
             <a-menu-item key="overview">
               <span>📋 行程概览</span>
             </a-menu-item>
@@ -135,34 +138,37 @@
             <a-menu-item key="web-meta" v-if="normalizedWebReferences.length">
               <span>🔎 资料来源</span>
             </a-menu-item>
-            <a-menu-item key="quality-gate" v-if="isServerBackedPlan && tripPlan.quality">
-              <span>方案质量</span>
-            </a-menu-item>
-            <a-menu-item key="agent-audit" v-if="isServerBackedPlan && tripPlan.agent_audit">
-              <span>来源审核</span>
-            </a-menu-item>
           </a-menu>
         </a-affix>
       </div>
 
       <!-- 主内容区 -->
       <div class="main-content">
-        <!-- 智能审查与提示卡片 -->
-        <a-card v-if="qualityIssuesList.length > 0" class="quality-advisory-card" :bordered="false">
-          <div class="quality-advisory-header">
-            <div class="quality-advisory-title">
-              <span class="advisory-icon">💡</span>
-              <span class="advisory-text-title">智能审查与提示</span>
-              <a-tag :color="advisoryTagColor" class="advisory-status-tag">
-                {{ advisoryStatusText }}
-              </a-tag>
-              <span class="advisory-count-badge">共 {{ qualityIssuesList.length }} 项需关注</span>
+        <!-- 面向旅行者的出发前提醒 -->
+        <a-card
+          id="travel-reminders"
+          v-if="qualityIssuesList.length > 0"
+          class="quality-advisory-card"
+          :bordered="false"
+        >
+            <div class="quality-advisory-header">
+              <div class="quality-advisory-title">
+                <span class="advisory-icon">💡</span>
+                <div class="advisory-heading-copy">
+                  <span class="advisory-text-title">出发前提醒</span>
+                  <span class="advisory-count-badge">{{ qualityIssuesList.length }} 项信息建议提前确认</span>
+                </div>
+              </div>
+              <a-button
+                v-if="qualityIssuesList.length > 3"
+                type="link"
+                size="small"
+                @click="toggleQualityExpand"
+              >
+                {{ isQualityExpanded ? '收起提醒' : `查看全部（${qualityIssuesList.length}）` }}
+              </a-button>
             </div>
-            <a-button type="link" size="small" @click="toggleQualityExpand">
-              {{ isQualityExpanded ? '收起' : '展开' }} {{ qualityIssuesList.length > 3 ? `(全部 ${qualityIssuesList.length} 项)` : '' }}
-            </a-button>
-          </div>
-          <div class="quality-advisory-body">
+            <div class="quality-advisory-body">
             <div
               v-for="(item, idx) in visibleQualityIssues"
               :key="idx"
@@ -170,14 +176,12 @@
               :class="item.severity || 'warning'"
             >
               <div class="issue-main">
-                <a-tag :color="item.severity === 'info' ? 'blue' : 'orange'" class="issue-badge">
-                  {{ item.severity === 'info' ? '提示' : '建议确认' }}
-                </a-tag>
-                <span class="issue-message">{{ item.message }}</span>
-                <span v-if="item.code" class="issue-code">({{ item.code }})</span>
+                <span class="issue-category">{{ item.category }}</span>
+                <span class="issue-message">{{ item.title }}</span>
               </div>
-              <div v-if="item.suggestion" class="issue-suggestion">
-                💡 {{ item.suggestion }}
+              <div v-if="item.action" class="issue-suggestion">
+                <span>建议</span>
+                {{ item.action }}
               </div>
             </div>
           </div>
@@ -462,66 +466,6 @@
           </div>
         </a-card>
 
-        <a-card
-          id="quality-gate"
-          v-if="isServerBackedPlan && tripPlan.quality"
-          title="方案质量检查"
-          :bordered="false"
-          class="agent-audit-card quality-card"
-        >
-          <a-alert
-            :type="qualityAlertType"
-            :message="qualityStatusText"
-            :description="qualityDescription"
-            show-icon
-          />
-          <div class="audit-grid">
-            <div>
-              <div class="audit-heading">确定性检查</div>
-              <ul class="audit-list">
-                <li v-for="item in tripPlan.quality.checked_items" :key="item">{{ item }}</li>
-              </ul>
-            </div>
-            <div v-if="(tripPlan.quality?.issues || []).length">
-              <div class="audit-heading">需要留意</div>
-              <ul class="audit-list">
-                <li v-for="issue in (tripPlan.quality?.issues || []).slice(0, 8)" :key="issue.code + ':' + issue.path">
-                  {{ issue.message }}<span v-if="issue.suggestion"> · {{ issue.suggestion }}</span>
-                </li>
-              </ul>
-            </div>
-          </div>
-        </a-card>
-
-        <a-card
-          id="agent-audit"
-          v-if="isServerBackedPlan && tripPlan.agent_audit"
-          title="✅ 审核检查"
-          :bordered="false"
-          class="agent-audit-card"
-        >
-          <a-alert
-            :type="auditAlertType"
-            :message="auditStatusText"
-            :description="`来源: ${tripPlan.agent_audit.source || 'unknown'}`"
-            show-icon
-          />
-          <div class="audit-grid">
-            <div>
-              <div class="audit-heading">已检查</div>
-              <ul class="audit-list">
-                <li v-for="item in tripPlan.agent_audit.checked_items" :key="item">{{ item }}</li>
-              </ul>
-            </div>
-            <div v-if="tripPlan.agent_audit.issues.length || tripPlan.agent_audit.suggestions.length">
-              <div class="audit-heading">发现与建议</div>
-              <ul class="audit-list">
-                <li v-for="issue in tripPlan.agent_audit.issues" :key="issue">{{ issue }}</li>
-                <li v-for="suggestion in tripPlan.agent_audit.suggestions" :key="suggestion">{{ suggestion }}</li>
-              </ul>
-            </div>
-          </div>
-        </a-card>
       </div>
     </div>
 
@@ -644,31 +588,116 @@ const mapSummaryAttractions = computed(() => {
     .slice(0, 8)
 })
 const normalizedWebReferences = computed(() => tripPlan.value?.web_references ?? [])
-const qualityIssuesList = computed(() => {
+type UserFacingQualityIssue = {
+  code: string
+  severity: string
+  category: string
+  title: string
+  action: string
+}
+
+const normalizeTravelerCopy = (value: string): string =>
+  value
+    .replace(/地图\s*POI/gi, '地图地点')
+    .replace(/\bPOI\b/gi, '地点')
+    .replace(/语义事实验证/g, '信息确认')
+    .replace(/事实验证/g, '信息确认')
+    .replace(/语义核对/g, '逐项确认')
+    .replace(/兜底估算/g, '参考估算')
+    .replace(/校验/g, '核对')
+    .replace(/审核/g, '检查')
+    .trim()
+
+const issueCategory = (code: string): string => {
+  if (/DAY_|SCHEDULE|PACE|VISIT_TIME|ATTRACTION_TYPE|TOO_MANY/.test(code)) return '行程节奏'
+  if (/TICKET/.test(code)) return '门票预约'
+  if (/HOTEL|ACCOMMODATION/.test(code)) return '住宿'
+  if (/BUDGET|PRICE/.test(code)) return '费用预算'
+  if (/ROUTE|TRANSPORT/.test(code)) return '交通路线'
+  if (/WEATHER/.test(code)) return '天气'
+  if (/MEAL|RESTAURANT/.test(code)) return '餐饮'
+  if (/WEB_|FACT_|REFERENCE/.test(code)) return '信息时效'
+  if (/POI|COORDINATE|CITY|DESTINATION/.test(code)) return '地点信息'
+  return '出行准备'
+}
+
+const presentQualityIssue = (
+  code: string,
+  severity: string,
+  message: string,
+  suggestion: string
+): UserFacingQualityIssue => {
+  const normalizedCode = code || 'TRAVEL_REMINDER'
+  let category = issueCategory(normalizedCode)
+  let title = normalizeTravelerCopy(message)
+  let action = normalizeTravelerCopy(suggestion)
+
+  if (normalizedCode === 'DAY_SCHEDULE_OVERLOAD' || normalizedCode === 'DAY_SCHEDULE_IMPOSSIBLE') {
+    const day = message.match(/第(\d+)天/)?.[1]
+    const hours = message.match(/约([\d.]+)小时/)?.[1]
+    category = '行程节奏'
+    title = `${day ? `第${day}天` : '当天'}安排较满${hours ? `，预计活动约 ${hours} 小时` : ''}`
+    action = '优先保留最想去的景点，减少折返，并为用餐和休息预留时间。'
+  } else if (normalizedCode === 'TICKET_PRICE_UNAVAILABLE') {
+    const attractionNames = message.match(/：([^。]+)/)?.[1]
+    category = '门票预约'
+    title = attractionNames
+      ? `${attractionNames}的门票价格尚未计入预算`
+      : '部分景点门票价格尚未计入预算'
+    action = '出发前通过景区官方渠道确认票价、优惠政策和预约要求。'
+  } else if (normalizedCode === 'HOTEL_PRICE_UNVERIFIED') {
+    category = '住宿预算'
+    title = '当前住宿费用为参考估算'
+    action = '预订前在酒店官方渠道或可信平台查看实际房价。'
+  } else if (normalizedCode === 'WEB_AUDIT_FORMAT_ONLY' || normalizedCode === 'WEB_AUDIT_ITEM') {
+    category = '信息时效'
+    title = '部分实时信息可能会有变化'
+    action = '出发前再次确认景区开放时间、酒店价格、车次和当地政策。'
+  } else if (normalizedCode === 'FACT_COVERAGE_INCOMPLETE') {
+    category = '信息时效'
+    title = '行程中还有部分信息需要临行确认'
+    action = '出发前查看对应地点的官方信息，以最新开放状态和价格为准。'
+  } else if (normalizedCode === 'UNVERIFIED_ROUTE') {
+    category = '交通路线'
+    title = normalizeTravelerCopy(message).replace('只有路线摘要，尚未取得完整折线', '的详细路线将在导航时生成')
+    action = '实际出行时打开地图导航，并以实时路况为准。'
+  }
+
+  return {
+    code: normalizedCode,
+    severity: severity || 'warning',
+    category,
+    title,
+    action
+  }
+}
+
+const qualityIssuesList = computed<UserFacingQualityIssue[]>(() => {
   if (!tripPlan.value) return []
-  const items: Array<{ code?: string; severity?: string; message: string; suggestion?: string }> = []
+  const items: UserFacingQualityIssue[] = []
   if (tripPlan.value.quality && Array.isArray(tripPlan.value.quality.issues)) {
     for (const issue of tripPlan.value.quality.issues) {
       if (issue && issue.message) {
-        items.push({
-          code: issue.code || '',
-          severity: issue.severity || 'warning',
-          message: issue.message,
-          suggestion: issue.suggestion || ''
-        })
+        items.push(presentQualityIssue(
+          issue.code || '',
+          issue.severity || 'warning',
+          issue.message,
+          issue.suggestion || ''
+        ))
       }
     }
   }
   if (tripPlan.value.agent_audit && Array.isArray(tripPlan.value.agent_audit.issues)) {
     for (const issueText of tripPlan.value.agent_audit.issues) {
       if (typeof issueText === 'string' && issueText.trim()) {
-        if (!items.some(i => i.message === issueText.trim())) {
-          items.push({
-            code: 'WEB_AUDIT_ITEM',
-            severity: 'warning',
-            message: issueText.trim(),
-            suggestion: '出发前请参考官网或官方渠道确认'
-          })
+        const presentedIssue = presentQualityIssue(
+          'WEB_AUDIT_ITEM',
+          'warning',
+          issueText.trim(),
+          '出发前请参考官网或官方渠道确认'
+        )
+        if (!items.some(i => i.title === presentedIssue.title)) {
+          items.push(presentedIssue)
         }
       }
     }
@@ -678,15 +707,6 @@ const qualityIssuesList = computed(() => {
 const visibleQualityIssues = computed(() => {
   if (isQualityExpanded.value) return qualityIssuesList.value
   return qualityIssuesList.value.slice(0, 3)
-})
-const advisoryStatusText = computed(() => {
-  if (tripPlan.value?.quality?.status === 'passed') return '已通过事实核对'
-  if (tripPlan.value?.agent_audit?.audit_level === 'offline_fallback') return '动态数据未复核'
-  return '建议确认'
-})
-const advisoryTagColor = computed(() => {
-  if (tripPlan.value?.quality?.status === 'passed') return 'green'
-  return 'orange'
 })
 function toggleQualityExpand() {
   isQualityExpanded.value = !isQualityExpanded.value
@@ -714,37 +734,6 @@ const weatherReviewText = computed(() => {
   if (!tripPlan.value) return '暂未获取到可展示的天气信息。'
   return `${tripPlan.value.city}${tripPlan.value.start_date} 至 ${tripPlan.value.end_date} 的逐日天气暂未获取到可靠预报。当前天气源可能只覆盖近期预报，请在出发前3-7天复核每日天气、温差和降雨。`
 })
-const qualityAlertType = computed(() => {
-  const status = tripPlan.value?.quality?.status
-  if (status === 'passed') return 'success'
-  if (status === 'failed') return 'error'
-  return 'warning'
-})
-const qualityStatusText = computed(() => {
-  const status = tripPlan.value?.quality?.status
-  if (status === 'passed') return '自动检查未发现已知结构性错误'
-  if (status === 'failed') return '方案存在关键问题，已阻止自动保存'
-  return '方案可用，但出发前建议复核提醒项'
-})
-const qualityDescription = computed(() => {
-  const quality = tripPlan.value?.quality
-  if (!quality) return '尚未执行当前版本的自动检查。'
-  return `已验证 ${quality.verified_facts} 项事实 · 自动检查评分 ${quality.score}/100。评分只反映已覆盖规则，不代表票务、开放状态、天气和价格的绝对保证。`
-})
-
-const auditAlertType = computed(() => {
-  const status = tripPlan.value?.agent_audit?.status
-  if (status === 'passed') return 'success'
-  if (status === 'failed') return 'error'
-  return 'warning'
-})
-const auditStatusText = computed(() => {
-  const status = tripPlan.value?.agent_audit?.status
-  if (status === 'passed') return '审核通过'
-  if (status === 'failed') return '审核未通过'
-  return '需要复核'
-})
-
 const escapeHtml = (value: string): string => {
   return value
     .replace(/&/g, '&amp;')
@@ -1116,6 +1105,10 @@ const activatePlan = async (
   currentPlanNo.value = planNo || null
   planSource.value = source
   tripPlan.value = normalized
+  activeSection.value = (
+    normalized.quality?.issues?.length
+    || normalized.agent_audit?.issues?.length
+  ) ? 'travel-reminders' : 'overview'
   saveTripCache(normalized, currentPlanNo.value, cacheRetention.value)
   saveTripSession(normalized)
   if (!normalized.map_context?.length) {
@@ -2035,7 +2028,9 @@ const qualityIssues = computed(() =>
   tripPlan.value?.quality?.issues || []
 )
 const topQualityIssues = computed(() =>
-  qualityIssues.value.filter((issue: any) => issue.severity === 'warning' || issue.severity === 'error').slice(0, 3)
+  qualityIssuesList.value
+    .filter(issue => issue.severity === 'warning' || issue.severity === 'error')
+    .slice(0, 3)
 )
 const isRouteServerVerified = (route: any) =>
   !!route?.source && route.source !== 'client-estimate'
@@ -2151,6 +2146,210 @@ const isRouteServerVerified = (route: any) =>
   color: #172033;
   font-size: 22px;
   line-height: 1.2;
+}
+
+/* 行程状态摘要 */
+.trip-readiness {
+  --readiness-accent: #0f766e;
+  --readiness-soft: #edf8f6;
+  max-width: 1400px;
+  margin: 0 auto 22px;
+  padding: 20px 22px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(220px, 0.55fr) minmax(300px, 0.8fr);
+  align-items: stretch;
+  gap: 18px;
+  border: 1px solid #dce8e4;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.055);
+}
+
+.trip-readiness.is-warn {
+  --readiness-accent: #b45309;
+  --readiness-soft: #fff8eb;
+}
+
+.trip-readiness.is-fail {
+  --readiness-accent: #b42318;
+  --readiness-soft: #fff3f1;
+}
+
+.trip-readiness.is-neutral {
+  --readiness-accent: #475467;
+  --readiness-soft: #f4f6f7;
+}
+
+.readiness-copy {
+  min-width: 0;
+  padding: 2px 6px 2px 0;
+}
+
+.readiness-kicker {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--readiness-accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.readiness-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.readiness-title-row h2 {
+  margin: 0;
+  color: #172033;
+  font-size: 22px;
+  line-height: 1.3;
+  font-weight: 750;
+}
+
+.readiness-badge {
+  padding: 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--readiness-accent) 25%, white);
+  border-radius: 999px;
+  color: var(--readiness-accent);
+  background: var(--readiness-soft);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.readiness-copy p {
+  margin: 9px 0 0;
+  color: #475467;
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.readiness-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid #e3ebe8;
+  border-radius: 10px;
+  background: #f8fbfa;
+  overflow: hidden;
+}
+
+.readiness-metrics > div {
+  min-width: 0;
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.readiness-metrics > div + div {
+  border-left: 1px solid #e3ebe8;
+}
+
+.readiness-metrics span {
+  margin-bottom: 5px;
+  color: #667085;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.readiness-metrics strong {
+  color: #172033;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.readiness-focus,
+.readiness-clear,
+.readiness-unchecked {
+  min-width: 0;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--readiness-accent) 16%, white);
+  border-radius: 10px;
+  background: var(--readiness-soft);
+}
+
+.focus-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.focus-head button {
+  padding: 0;
+  border: 0;
+  color: var(--readiness-accent);
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.focus-head button:hover {
+  text-decoration: underline;
+}
+
+.readiness-focus ul {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  list-style: none;
+}
+
+.readiness-focus li {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #475467;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.readiness-focus li i {
+  width: 6px;
+  height: 6px;
+  margin-top: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #d97706;
+}
+
+.readiness-focus li i.is-error {
+  background: #d92d20;
+}
+
+.readiness-clear,
+.readiness-unchecked {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #475467;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.readiness-clear > span,
+.readiness-unchecked > span {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--readiness-accent);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 /* 内容布局 */
@@ -2941,6 +3140,18 @@ const isRouteServerVerified = (route: any) =>
   }
 }
 
+@media (max-width: 1100px) {
+  .trip-readiness {
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 0.45fr);
+  }
+
+  .readiness-focus,
+  .readiness-clear,
+  .readiness-unchecked {
+    grid-column: 1 / -1;
+  }
+}
+
 /* 响应式设计 */
 @media (max-width: 768px) {
   .result-container {
@@ -3010,6 +3221,27 @@ const isRouteServerVerified = (route: any) =>
   .metric-item strong {
     font-size: 17px;
     overflow-wrap: anywhere;
+  }
+
+  .trip-readiness {
+    margin-bottom: 16px;
+    padding: 16px;
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .readiness-title-row h2 {
+    font-size: 20px;
+  }
+
+  .readiness-copy {
+    padding: 0;
+  }
+
+  .readiness-focus,
+  .readiness-clear,
+  .readiness-unchecked {
+    grid-column: auto;
   }
 
   .content-wrapper {
@@ -3166,68 +3398,178 @@ const isRouteServerVerified = (route: any) =>
   }
 }
 .quality-advisory-card {
-  margin-bottom: 16px;
-  border-radius: 8px;
-  background: #fffbe6;
-  border: 1px solid #ffe58f;
+  margin-bottom: 20px;
+  border: 1px solid #dce8e4;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.055);
+  overflow: hidden;
 }
+
+.quality-advisory-card :deep(.ant-card-body) {
+  padding: 0;
+}
+
 .quality-advisory-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 12px;
+  gap: 16px;
+  min-height: 58px;
+  padding: 13px 18px;
+  border-bottom: 1px solid #e6ecea;
+  background: linear-gradient(90deg, #f3faf8 0%, #ffffff 58%);
 }
+
 .quality-advisory-title {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  color: #172033;
+}
+
+.advisory-icon {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 8px;
+  color: #0f766e;
+  background: #e4f4f1;
+  font-size: 0;
+}
+
+.advisory-icon::before {
+  content: "i";
+  font-size: 14px;
+  font-weight: 800;
+  font-family: Georgia, serif;
+}
+
+.advisory-heading-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.advisory-text-title {
   font-size: 16px;
-  font-weight: 600;
-  color: #d46b08;
+  font-weight: 700;
+  white-space: nowrap;
 }
-.advisory-status-tag {
-  font-weight: normal;
-}
+
 .advisory-count-badge {
   font-size: 12px;
-  color: #8c8c8c;
-  font-weight: normal;
+  color: #667085;
+  font-weight: 400;
+  white-space: nowrap;
 }
+
+.quality-advisory-header :deep(.ant-btn-link) {
+  height: 30px;
+  padding-inline: 8px;
+  color: #0f766e;
+  font-weight: 600;
+}
+
 .quality-advisory-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+  padding: 14px 18px 18px;
+  display: grid;
+  gap: 9px;
+  background: #fbfcfc;
 }
+
 .quality-issue-item {
-  padding: 10px 12px;
+  position: relative;
+  padding: 12px 14px 12px 16px;
   background: #ffffff;
-  border-radius: 6px;
-  border-left: 4px solid #fa8c16;
+  border: 1px solid #e5eae8;
+  border-radius: 9px;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.025);
 }
+
+.quality-issue-item::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: #d97706;
+}
+
 .quality-issue-item.info {
-  border-left-color: #1890ff;
+  background: #fbfdff;
 }
+
+.quality-issue-item.info::before {
+  background: #2e7da8;
+}
+
 .issue-main {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
 }
-.issue-badge {
-  font-size: 12px;
+
+.issue-category {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #9a4f08;
+  background: #fff5e8;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.45;
 }
+
+.quality-issue-item.info .issue-category {
+  color: #245d7a;
+  background: #eaf5fb;
+}
+
 .issue-message {
-  font-weight: 500;
-  color: #262626;
-}
-.issue-code {
-  font-size: 12px;
-  color: #8c8c8c;
-}
-.issue-suggestion {
-  margin-top: 4px;
+  color: #344054;
   font-size: 13px;
-  color: #595959;
-  padding-left: 4px;
+  font-weight: 600;
+  line-height: 1.55;
+}
+
+.issue-suggestion {
+  margin-top: 6px;
+  padding-left: 1px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.issue-suggestion > span {
+  margin-right: 5px;
+  color: #475467;
+  font-weight: 600;
+}
+
+@media (max-width: 768px) {
+  .quality-advisory-header {
+    align-items: flex-start;
+    padding: 13px 14px;
+  }
+
+  .quality-advisory-title {
+    flex-wrap: wrap;
+  }
+
+  .advisory-count-badge {
+    width: 100%;
+    white-space: normal;
+  }
+
+  .quality-advisory-body {
+    padding: 12px;
+  }
 }
 </style>
