@@ -233,15 +233,14 @@ def test_different_users_same_ip_do_not_share(fast_planner, rate_settings) -> No
     app.dependency_overrides.pop(get_optional_current_user, None)
 
 
-def test_anonymous_ip_fallback_shares_bucket(fast_planner, rate_settings) -> None:
-    app.dependency_overrides[get_optional_current_user] = lambda: None
-    try:
-        with TestClient(app) as client:
-            for _ in range(3):
-                assert client.post("/api/trip/plan", json=_payload()).status_code == 200
-            assert client.post("/api/trip/plan", json=_payload()).status_code == 429
-    finally:
-        app.dependency_overrides.pop(get_optional_current_user, None)
+def test_anonymous_generation_is_rejected_before_rate_limit(
+    fast_planner, rate_settings
+) -> None:
+    with TestClient(app) as client:
+        response = client.post("/api/trip/plan", json=_payload())
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "请先登录"
 
 
 def test_plan_and_plan_jobs_share_quota(fast_planner, rate_settings, monkeypatch) -> None:

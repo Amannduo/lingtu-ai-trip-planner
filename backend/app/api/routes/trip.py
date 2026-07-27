@@ -59,7 +59,7 @@ from ...services.trip_generation_job_service import (
     run_with_generation_capacity,
 )
 from ...services.request_rate_limit_service import get_request_rate_limit_service
-from ..auth import get_current_user, get_optional_current_user
+from ..auth import get_current_user
 
 
 class UntrustedTripEditError(ValueError):
@@ -558,7 +558,7 @@ async def plan_trip(
     request: TripRequest,
     background_tasks: BackgroundTasks,
     http_request: HttpRequest,
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """
     生成旅行计划
@@ -892,7 +892,7 @@ def create_trip_plan_job(
     request: TripRequest,
     http_request: HttpRequest,
     response: Response,
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     request = _validate_generation_request(request, current_user)
     # After auth + TripRequest validation: shared create quota with /plan.
@@ -1025,7 +1025,7 @@ def stream_trip_plan_job(
     http_request: HttpRequest,
     job_id: str = Path(..., pattern=r"^[a-f0-9]{32}$"),
     after: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     service = get_trip_generation_job_service()
     cookie_token = http_request.cookies.get(_job_cookie_name(job_id), "")
@@ -1074,7 +1074,7 @@ def stream_trip_plan_job(
 def cancel_trip_plan_job(
     http_request: HttpRequest,
     job_id: str = Path(..., pattern=r"^[a-f0-9]{32}$"),
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     service = get_trip_generation_job_service()
     cookie_token = http_request.cookies.get(_job_cookie_name(job_id), "")

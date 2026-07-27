@@ -456,8 +456,15 @@
               <BulbOutlined />
             </div>
             <div class="intent-summary__body">
-              <span class="intent-summary__kicker">AI 理解</span>
-              <p>{{ latestAssistantReply }}</p>
+              <div v-if="latestUserRequest" class="intent-summary__section is-original">
+                <span class="intent-summary__kicker">你的描述</span>
+                <p>{{ latestUserRequest }}</p>
+              </div>
+              <div v-if="latestUserRequest" class="intent-summary__divider" aria-hidden="true"></div>
+              <div class="intent-summary__section">
+                <span class="intent-summary__kicker">AI 理解</span>
+                <p>{{ latestAssistantReply }}</p>
+              </div>
             </div>
           </div>
 
@@ -638,6 +645,9 @@ let assistantRequestVersion = 0
 let historyDetailRequestVersion = 0
 let generationRequestVersion = 0
 const currentOwnerId = () => currentUser.value?.user_id || null
+const requestLogin = () => {
+  window.dispatchEvent(new CustomEvent('lingtu-request-login'))
+}
 const emailOnCompletion = ref(false)
 const pushBusy = ref(false)
 const pushSupported = isPushSupported()
@@ -1132,6 +1142,12 @@ const latestAssistantReply = computed(() => {
     .find(item => item.role === 'assistant')?.content || ''
 })
 
+const latestUserRequest = computed(() =>
+  [...assistantMessages.value]
+    .reverse()
+    .find(item => item.role === 'user')?.content || ''
+)
+
 const APPLY_SAFE_CONTEXT_KEYS = new Set([
   'origin_city',
   'budget',
@@ -1200,6 +1216,10 @@ const applyInterpretedContext = (context: Record<string, unknown>) => {
 }
 
 const sendAssistantMessage = async (content?: string) => {
+  if (!currentUser.value) {
+    requestLogin()
+    return
+  }
   const text = (content ?? assistantInput.value).trim()
   if (!text) {
     message.warning('先说说你想要的旅行感觉')
@@ -1212,9 +1232,11 @@ const sendAssistantMessage = async (content?: string) => {
     assistantRequestVersion === requestVersion
     && currentOwnerId() === requestedUserId
   )
+  if (content !== undefined) {
+    assistantInput.value = text
+  }
   assistantMessages.value.push({ role: 'user', content: text })
   const requestMessages = assistantMessages.value.map(item => ({ ...item }))
-  assistantInput.value = ''
   recommendations.value = []
   selectedCity.value = ''
   selectedDestinationSource.value = 'manual'
@@ -1514,6 +1536,10 @@ const confirmContractRisksIfNeeded = (): Promise<boolean> => {
 }
 
 const handleSubmit = async () => {
+  if (!currentUser.value) {
+    requestLogin()
+    return
+  }
   if (!formData.city.trim()) {
     message.warning('先告诉 AI 你的旅行想法，或直接填写一个目的地')
     return
@@ -3063,6 +3089,24 @@ const handleSubmit = async () => {
 .intent-summary__body {
   min-width: 0;
   flex: 1;
+}
+
+.intent-summary__section {
+  min-width: 0;
+}
+
+.intent-summary__section.is-original .intent-summary__kicker {
+  color: #667085;
+}
+
+.intent-summary__section.is-original p {
+  color: #344054;
+}
+
+.intent-summary__divider {
+  height: 1px;
+  margin: 10px 0;
+  background: rgba(15, 118, 110, 0.12);
 }
 
 .intent-summary__kicker {

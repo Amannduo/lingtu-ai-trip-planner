@@ -7,13 +7,13 @@ from ...agents.destination_recommender_agent import get_destination_recommender_
 from ...models.schemas import DestinationChatRequest, DestinationChatResponse
 from ...services.auth_service import AuthenticatedUser
 from ...services.contract_token_service import issue_contract_token
-from ..auth import get_optional_current_user
+from ..auth import get_current_user
 
 router = APIRouter(prefix="/recommend", tags=["目的地推荐"])
 
 
-def token_subject(current_user: AuthenticatedUser | None) -> str:
-    return f"user:{current_user.user_id}" if current_user is not None else "anon"
+def token_subject(current_user: AuthenticatedUser) -> str:
+    return f"user:{current_user.user_id}"
 
 
 @router.post(
@@ -24,7 +24,7 @@ def token_subject(current_user: AuthenticatedUser | None) -> str:
 )
 async def recommend_destination(
     request: DestinationChatRequest,
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """目的地推荐对话"""
     try:

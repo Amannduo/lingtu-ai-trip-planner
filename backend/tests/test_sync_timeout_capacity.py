@@ -80,7 +80,12 @@ def test_sync_timeout_releases_capacity_after_worker_observes_cancel(
         "app.api.routes.trip.get_trip_planner_agent",
         lambda: BlockingPlanner(),
     )
-    app.dependency_overrides[get_optional_current_user] = lambda: None
+    app.dependency_overrides[get_optional_current_user] = lambda: AuthenticatedUser(
+        user_id="timeout-test",
+        username="timeout-test",
+        email="timeout-test@example.com",
+        role="user",
+    )
 
     baseline_held = generation_capacity_snapshot()["held"]
     try:
@@ -113,7 +118,12 @@ def test_sync_capacity_exhaustion_returns_429_like_job_path(monkeypatch) -> None
         "app.api.routes.trip.run_with_generation_capacity",
         refuse_capacity,
     )
-    app.dependency_overrides[get_optional_current_user] = lambda: None
+    app.dependency_overrides[get_optional_current_user] = lambda: AuthenticatedUser(
+        user_id="capacity-test",
+        username="capacity-test",
+        email="capacity-test@example.com",
+        role="user",
+    )
     try:
         with TestClient(app) as client:
             response = client.post("/api/trip/plan", json=_request_payload())

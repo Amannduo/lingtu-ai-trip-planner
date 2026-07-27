@@ -31,6 +31,7 @@ from app.models.schemas import (
     TripPlanQualityResult,
     TripRequest,
 )
+from app.services.auth_service import AuthenticatedUser
 from app.services.semantic_contract_service import (
     SemanticContractService,
     attach_contract_to_trip_request,
@@ -101,7 +102,12 @@ def plan_client(monkeypatch):
             plan_trip=lambda _r, progress_callback=None, **_k: plan
         ),
     )
-    app.dependency_overrides[get_optional_current_user] = lambda: None
+    app.dependency_overrides[get_optional_current_user] = lambda: AuthenticatedUser(
+        user_id="contract-test",
+        username="contract-test",
+        email="contract-test@example.com",
+        role="user",
+    )
     try:
         with TestClient(app) as client:
             yield client

@@ -23,6 +23,7 @@ from app.models.schemas import (
     TripPlan,
     TripPlanQualityResult,
 )
+from app.services.auth_service import AuthenticatedUser
 from app.services.contract_token_service import (
     TOKEN_TTL_SECONDS,
     issue_contract_token,
@@ -220,9 +221,14 @@ def test_token_contract_merges_into_generation_contract(monkeypatch) -> None:
         "app.api.routes.trip.get_trip_planner_agent",
         lambda: SimpleNamespace(plan_trip=capture_plan_trip),
     )
-    app.dependency_overrides[get_optional_current_user] = lambda: None
+    app.dependency_overrides[get_optional_current_user] = lambda: AuthenticatedUser(
+        user_id="token-test",
+        username="token-test",
+        email="token-test@example.com",
+        role="user",
+    )
     try:
-        token = issue_contract_token(_contract(), subject="anon")
+        token = issue_contract_token(_contract(), subject="user:token-test")
         assert token
         with TestClient(app) as client:
             response = client.post(
@@ -250,7 +256,12 @@ def test_invalid_token_degrades_to_no_token_path(monkeypatch) -> None:
         "app.api.routes.trip.get_trip_planner_agent",
         lambda: SimpleNamespace(plan_trip=capture_plan_trip),
     )
-    app.dependency_overrides[get_optional_current_user] = lambda: None
+    app.dependency_overrides[get_optional_current_user] = lambda: AuthenticatedUser(
+        user_id="token-test",
+        username="token-test",
+        email="token-test@example.com",
+        role="user",
+    )
     try:
         with TestClient(app) as client:
             response = client.post(
