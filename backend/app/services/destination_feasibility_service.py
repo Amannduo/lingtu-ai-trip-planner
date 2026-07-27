@@ -172,9 +172,6 @@ class DestinationFeasibilityService:
 
         normalized = canonical.strip()
         if not normalized:
-            # "吉林市" strips to the empty string (province prefix + bare 市).
-            # Returning "" would silently disable every identity check that
-            # guards on truthiness, so keep the plain city normalization.
             normalized = self.normalize_city(original).strip()
         self._NORM_CACHE[cache_key] = normalized
         return normalized

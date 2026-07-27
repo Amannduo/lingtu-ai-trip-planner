@@ -104,7 +104,16 @@
             </span>
           </div>
 
-          <AgentChart v-if="item.chart" :option="item.chart" class="message-chart" />
+          <a-alert
+            v-for="warning in item.analysis?.warnings || []"
+            :key="warning"
+            type="warning"
+            show-icon
+            :message="warning"
+            class="message-warning"
+          />
+
+          <AgentChart v-if="item.chart" :chart="item.chart" class="message-chart" />
 
           <a-table
             v-if="item.table?.length"
@@ -170,9 +179,11 @@ import {
   fetchAgentDataStatus,
   type AgentAnalysisMeta,
   type AgentCapabilities,
+  type AgentChartPayload,
   type AgentDataStatus,
   type AgentPermission
 } from '@/services/agentAnalytics'
+import { normalizeAgentChart } from '@/types/agentChart'
 
 type ChatItem = {
   id: number
@@ -182,7 +193,7 @@ type ChatItem = {
   agent?: string
   tool?: string
   table?: Record<string, unknown>[]
-  chart?: Record<string, unknown> | null
+  chart?: AgentChartPayload | null
   permission?: AgentPermission
   analysis?: AgentAnalysisMeta
 }
@@ -406,7 +417,7 @@ async function send() {
       agent: response.agent,
       tool: response.tool,
       table: response.table,
-      chart: response.chart,
+      chart: normalizeAgentChart(response.chart),
       permission: response.permission,
       analysis: response.extra?.analysis
         ? {

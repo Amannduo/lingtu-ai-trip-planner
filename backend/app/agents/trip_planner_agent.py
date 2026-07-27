@@ -14,6 +14,12 @@ from ..services.llm_service import get_llm
 from ..services.semantic_contract_service import decided_constraint_text
 from ..services.transport_budget_service import get_transport_budget_service
 from ..services.amap_service import get_amap_service
+from ..services.trip_pacing_contract import (
+    cap_day_attractions,
+    gentle_pacing_note,
+    prefers_gentle_pacing,
+    user_named_overflow_note,
+)
 from ..models.schemas import (
     TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo,
     Location, Hotel, RouteSegment, POIInfo, AgentAuditResult
@@ -855,10 +861,7 @@ class MultiAgentTripPlanner:
             )
         }
         if gentle_pacing:
-            pacing_note = (
-                "已按父母/老人同行或轻松出游需求降低行程密度，"
-                "每天最多保留2个主景点，并为休息和临时调整预留时间。"
-            )
+            pacing_note = gentle_pacing_note(request)
             if pacing_note not in trip_plan.overall_suggestions:
                 trip_plan.overall_suggestions = (
                     f"{trip_plan.overall_suggestions.rstrip()} {pacing_note}"
@@ -895,9 +898,19 @@ class MultiAgentTripPlanner:
             if intercity and is_last:
                 attraction_cap = min(attraction_cap, 2)
             if len(day.attractions) > attraction_cap:
-                day.attractions = day.attractions[:attraction_cap]
-            if gentle_pacing and len(day.attractions) > 2:
-                day.attractions = day.attractions[:2]
+                # Prefer free_text-named attractions over naive prefix truncation.
+                day.attractions, named_overflow = cap_day_attractions(
+                    request,
+                    day.attractions,
+                    attraction_cap,
+                )
+                if named_overflow:
+                    overflow_note = user_named_overflow_note()
+                    if overflow_note not in (trip_plan.overall_suggestions or ""):
+                        trip_plan.overall_suggestions = (
+                            f"{(trip_plan.overall_suggestions or '').rstrip()} "
+                            f"{overflow_note}"
+                        ).strip()
             durations = [
                 max(0, int(attraction.visit_duration or 0))
                 for attraction in day.attractions
@@ -954,25 +967,13 @@ class MultiAgentTripPlanner:
         return False
 
     def _needs_gentle_pacing(self, request: TripRequest) -> bool:
-        # Structured channel first (S4a): the server-built contract's pace
-        # binding is the authoritative decided value.
-        contract = getattr(request, "semantic_contract", None)
-        pace = getattr(contract, "pace", None) if contract is not None else None
-        if pace is not None and pace.is_known():
-            return str(pace.value or "") == "轻松"
-        # Machine-block / preference keyword channel — kept as the compat
-        # fallback until the token handoff (S4b/S4c) fully replaces it.
-        text = (
-            f"{decided_constraint_text(request.free_text_input)} "
-            f"{' '.join(request.preferences)}"
-        )
-        return any(
-            keyword in text
-            for keyword in (
-                "父母", "爸妈", "老人", "长辈", "不想太累",
-                "轻松", "慢一点", "休闲", "避暑",
-            )
-        )
+        """True only for explicit gentle / family / elder pacing signals.
+
+        Markers are shared with TripPlanQualityService via trip_pacing_contract
+        so finalize density caps and quality thresholds cannot drift.
+        Does not infer medical needs or force theme-park content.
+        """
+        return prefers_gentle_pacing(request)
 
     def _normalized_visit_duration(self, attraction: Attraction, force_suggested: bool = False) -> int:
         current = max(0, int(attraction.visit_duration or 0))
@@ -1477,7 +1478,7 @@ class MultiAgentTripPlanner:
 7. 如果用户设置了总预算,酒店、餐饮、交通和门票估算应尽量控制在该预算内,并在budget.total中体现
 8. weather_info只能填写天气来源中与{request.start_date}至{request.end_date}日期完全匹配的数据；如果天气来源日期不匹配,weather_info返回空数组,并在overall_suggestions提示出发前复核天气
 9. 如果出发地与目的地不同，首日和末日必须为城际往返预留时间，不得按两个完整游玩日排满
-10. 如果额外要求含父母、老人、轻松、休闲或避暑，每天最多安排2个主景点，避免高强度徒步、连续爬坡和频繁换乘
+10. 如果额外要求或偏好含父母、老人、亲子、儿童、轻松、缓节奏、少走路、不赶行程、休闲或避暑，每天最多安排2个主景点，避免高强度徒步、连续爬坡和频繁换乘；不要默认安排主题乐园，也不要编造儿童票价/身高限制
 11. 景点类型必须多样化，商业街区或步行街不超过全部景点的三分之一，且不得选择住宅、汽车服务、产业园或带门店后缀的弱旅游POI
 12. 博物馆、美术馆和展馆合计最多3个，公园和绿道合计最多4个；优先选择知名景区、城市地标和与用户偏好强相关的地点，避免用小型附属设施凑数
 13. days 数组长度必须恰好为 {request.travel_days}，禁止多生成或少生成天数

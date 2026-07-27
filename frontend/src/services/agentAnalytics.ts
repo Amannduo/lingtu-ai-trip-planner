@@ -1,4 +1,7 @@
 import apiClient from '@/services/api'
+import type { AgentChartPayload } from '@/types/agentChart'
+
+export type { AgentChartPayload, AgentChartKind, AgentChartSeries } from '@/types/agentChart'
 
 export interface AgentPermission {
   role: string
@@ -33,7 +36,7 @@ export interface AgentChatResponseV1 {
   agent: string
   tool: string
   table: Record<string, unknown>[]
-  chart: Record<string, unknown> | null
+  chart: AgentChartPayload | null
   result: string
   permission: AgentPermission
   sensitive: Record<string, unknown>

@@ -246,7 +246,7 @@ def test_refresh_quality_gate_matrix(
     quality = TripPlanQualityResult(score=score, issues=issues)
 
     refresh_quality_gate(
-        quality, generation_mode=mode, force_unpublishable=force
+        quality, generation_mode=mode, force_review=force
     )
 
     assert quality.quality_status == expected_status

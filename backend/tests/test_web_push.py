@@ -421,3 +421,161 @@ def test_best_effort_notification_never_raises(monkeypatch) -> None:
     assert result["failed"] == 1
     assert result["delivered"] == 0
     assert result["skipped"] == 0
+
+
+def test_push_subscription_cannot_be_reassigned_across_users(monkeypatch) -> None:
+    """Different users must not overwrite an endpoint owned by another user."""
+    from app.services import web_push_service
+
+    endpoint = "https://push.example.test/subscriptions/unguessable"
+    captured: dict[str, object] = {"updated": False}
+
+    monkeypatch.setattr(web_push_service, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_push_service,
+        "_validate_endpoint",
+        lambda raw_endpoint, **_kwargs: str(raw_endpoint),
+    )
+
+    def fake_fetch_one(sql, _params):
+        captured["sql"] = sql
+        return {
+            "subscription_id": "subscription-a",
+            "user_id": "user-a",
+            "endpoint": endpoint,
+        }
+
+    monkeypatch.setattr(web_push_service, "fetch_one", fake_fetch_one)
+
+    def forbidden_update(*_args, **_kwargs):
+        captured["updated"] = True
+        raise AssertionError("cross-user subscription must not be updated")
+
+    monkeypatch.setattr(web_push_service, "_update_subscription", forbidden_update)
+
+    with pytest.raises(ValueError, match="cannot be registered"):
+        web_push_service.save_push_subscription(
+            "user-b",
+            {
+                "endpoint": endpoint,
+                "expirationTime": None,
+                "keys": {"p256dh": "new-key", "auth": "new-auth"},
+            },
+        )
+
+    assert "user_id" in str(captured["sql"])
+    assert captured["updated"] is False
+
+
+def test_push_subscription_insert_race_cannot_reassign_another_user(monkeypatch) -> None:
+    from app.services import web_push_service
+
+    endpoint = "https://push.example.test/subscriptions/race"
+    rows = iter(
+        [
+            None,
+            {
+                "subscription_id": "subscription-a",
+                "user_id": "user-a",
+                "endpoint": endpoint,
+            },
+        ]
+    )
+    updated = {"value": False}
+
+    monkeypatch.setattr(web_push_service, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_push_service,
+        "_validate_endpoint",
+        lambda raw_endpoint, **_kwargs: str(raw_endpoint),
+    )
+    monkeypatch.setattr(web_push_service, "fetch_one", lambda *_args: next(rows))
+    monkeypatch.setattr(web_push_service, "fetch_scalar", lambda *_args: 0)
+
+    def lose_insert_race(*_args, **_kwargs):
+        raise web_push_service.IntegrityError(
+            "INSERT push_subscriptions",
+            {},
+            RuntimeError("simulated unique endpoint race"),
+        )
+
+    # Race path goes through transactional insert; force IntegrityError path via save
+    # by stubbing transactional helper to raise IntegrityError then use outer except.
+    monkeypatch.setattr(
+        web_push_service,
+        "_save_subscription_transactionally",
+        lose_insert_race,
+    )
+
+    def forbidden_update(*_args, **_kwargs):
+        updated["value"] = True
+        raise AssertionError("race must not reassign another user's subscription")
+
+    monkeypatch.setattr(web_push_service, "_update_subscription", forbidden_update)
+
+    with pytest.raises(ValueError, match="cannot be registered"):
+        web_push_service.save_push_subscription(
+            "user-b",
+            {
+                "endpoint": endpoint,
+                "expirationTime": None,
+                "keys": {"p256dh": "new-key", "auth": "new-auth"},
+            },
+        )
+
+    assert updated["value"] is False
+
+
+def test_vapid_public_key_endpoint_does_not_leak_private_material(monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "web_push_vapid_public_key", "public-only")
+    monkeypatch.setattr(settings, "web_push_vapid_private_key", "SECRET-PRIVATE-KEY")
+    monkeypatch.setattr(settings, "web_push_vapid_subject", "mailto:test@example.com")
+
+    with TestClient(app) as client:
+        response = client.get("/api/push/vapid-public-key")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["public_key"] == "public-only"
+    assert "SECRET-PRIVATE-KEY" not in response.text
+    assert "private" not in response.text.lower()
+
+
+def test_payload_contains_only_safe_trip_fields(monkeypatch) -> None:
+    """Trip-ready payload must not embed tokens or external URLs."""
+    captured = {}
+
+    def fake_send(user_id, destination, plan_no):
+        # Reproduce the payload shape used by send_trip_ready_push_notifications
+        from urllib.parse import quote
+        import json as _json
+
+        payload = _json.loads(
+            _json.dumps(
+                {
+                    "title": "行程已生成",
+                    "body": f"{destination}旅行计划已生成，点击查看详情。",
+                    "tag": f"trip-{plan_no}",
+                    "data": {
+                        "url": f"/result?plan={quote(plan_no, safe='')}",
+                        "plan_no": plan_no,
+                        "destination": destination,
+                    },
+                }
+            )
+        )
+        captured["payload"] = payload
+        return {"configured": True, "delivered": 0, "failed": 0}
+
+    monkeypatch.setattr(
+        "app.services.web_push_service.send_trip_ready_push_notifications",
+        fake_send,
+    )
+    notify_trip_plan_ready("user-1", "杭州", "P-SAFE")
+    payload = captured["payload"]
+    blob = json.dumps(payload)
+    assert "token" not in blob.lower()
+    assert "api_key" not in blob.lower()
+    assert "vapid" not in blob.lower()
+    assert payload["data"]["url"].startswith("/result?")
+    assert "://" not in payload["data"]["url"]

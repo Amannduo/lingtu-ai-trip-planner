@@ -911,22 +911,26 @@ class TripPlanningAgentGraph:
             refresh_quality_gate(
                 plan.quality,
                 generation_mode=plan.generation_mode,
-                force_unpublishable=bool(enrichment_errors),
-            )
-            blocking_codes = sorted(
-                issue.code for issue in plan.quality.issues
-                if issue.severity == "error"
+                force_review=bool(enrichment_errors),
             )
             logger.info(
                 "[trip_graph] quality evaluation complete: "
-                "score=%d, threshold=75, publishable=%s, "
-                "blocking_codes=%s, total_issues=%d, status=%s",
+                "score=%d, publishable=%s, review_required=%s, "
+                "total_issues=%d, status=%s",
                 plan.quality.score,
                 plan.quality.publishable,
-                blocking_codes if blocking_codes else "none",
+                plan.quality.review_required,
                 len(plan.quality.issues),
                 plan.quality.status,
+                
             )
+            if has_blocking:
+                plan.quality.publishable = False
+                plan.quality.review_required = True
+                plan.quality.status = "failed"
+            elif not plan.quality.publishable:
+                # Keep service decision; ensure review flag for non-clean plans.
+                plan.quality.review_required = True
         except TripGenerationCancelledError:
             raise
         except Exception as exc:

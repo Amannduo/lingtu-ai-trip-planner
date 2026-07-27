@@ -515,6 +515,21 @@ def _notify_push_safely(user_id: str, city: str, plan_no: str) -> None:
         )
 
 
+def _derived_quality_status(plan: TripPlan) -> str:
+    """Internal compatibility label only — not a second source of truth.
+
+    blocking → blocked
+    publishable + review_required → needs_review
+    publishable + not review_required → publishable
+    """
+    quality = getattr(plan, "quality", None)
+    if quality is None or not _plan_is_publishable(plan):
+        return "blocked"
+    if bool(getattr(quality, "review_required", False)):
+        return "needs_review"
+    return "publishable"
+
+
 def _job_owner(current_user: AuthenticatedUser | None, http_request: HttpRequest) -> str:
     if current_user is not None:
         return f"user:{current_user.user_id}"
@@ -566,9 +581,8 @@ async def plan_trip(
     """
     try:
         # Reject past dates / hard semantic conflicts before rate-limit spend
-        # or expensive agent initialization; the returned request carries the
-        # server-built semantic contract for all downstream readers.
-        request = _validate_generation_request(request, current_user)
+        # or expensive agent initialization.
+        _validate_generation_request(request)
         # After auth + TripRequest validation: count only real generation creates.
         _enforce_trip_generation_rate_limit(http_request, current_user)
 
@@ -591,14 +605,17 @@ async def plan_trip(
 
         print("✅ 旅行计划生成成功,准备返回响应\n")
 
-        quality_status = _resolve_quality_status(trip_plan)
-        needs_review = quality_status == "needs_review"
-        if quality_status == "blocked":
-            # Agent gate should already reject blocked plans; keep a hard stop.
+        # Reviewable model: reject only non-publishable/blocking plans.
+        if not _plan_is_publishable(trip_plan):
             raise TripPlanQualityRejectedError(
                 quality=getattr(trip_plan, "quality", None),
                 plan=trip_plan,
             )
+        quality = getattr(trip_plan, "quality", None)
+        review_required = (
+            bool(getattr(quality, "review_required", False)) if quality else False
+        )
+        needs_review = review_required
 
         plan_no = None
         try:
@@ -607,6 +624,7 @@ async def plan_trip(
             elif needs_review:
                 print("[trip] needs_review plan - not auto-persisted")
             else:
+                # warning + clean both may persist; blocking already rejected
                 plan_no = get_travel_plan_data_service().save_trip_plan(
                     request,
                     trip_plan,
@@ -629,6 +647,8 @@ async def plan_trip(
                 plan_no,
             )
 
+        quality_status = _derived_quality_status(trip_plan)
+
         email_delivery = None
         if request.email_on_completion and not needs_review:
             email_delivery = await run_in_threadpool(
@@ -644,7 +664,7 @@ async def plan_trip(
             success=True,
             message=(
                 "行程已生成，以下事项需要你确认"
-                if needs_review
+                if review_required
                 else "旅行计划生成成功"
             ),
             data=trip_plan,
@@ -814,24 +834,11 @@ async def update_trip_history(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     request_ctx = None
-    validation_mode = "legacy_weak"
-    get_request_ctx = getattr(service, "get_trip_request_with_context", None)
-    if callable(get_request_ctx):
-        request_ctx, validation_mode = get_request_ctx(
-            plan_no, current_user.user_id
-        )
-    else:
-        # Duck-typed services without the snapshot interface keep the
-        # pre-snapshot behavior; legacy_weak is only asserted when the
-        # real service explicitly reports a degraded context.
-        get_request = getattr(service, "get_trip_request", None)
-        if callable(get_request):
-            request_ctx = get_request(plan_no, current_user.user_id)
-            validation_mode = "full"
+    get_request = getattr(service, "get_trip_request", None)
+    if callable(get_request):
+        request_ctx = get_request(plan_no, current_user.user_id)
     if request_ctx is not None:
         plan.quality = get_trip_plan_quality_service().evaluate(request_ctx, plan)
-        if validation_mode == "legacy_weak":
-            _mark_legacy_weak_validation(plan.quality)
         if not can_save_user_draft(plan.quality):
             raise HTTPException(
                 status_code=422,
@@ -889,7 +896,7 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
-    request = _validate_generation_request(request, current_user)
+    _validate_generation_request(request)
     # After auth + TripRequest validation: shared create quota with /plan.
     _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)
@@ -913,17 +920,35 @@ def create_trip_plan_job(
             )
 
         quality = getattr(trip_plan, "quality", None)
-        needs_review = quality_status == "needs_review"
+        review_required = (
+            bool(getattr(quality, "review_required", False)) if quality else False
+        )
+        needs_review = review_required
 
         plan_no = None
-        if current_user is not None and quality_status == "publishable":
+        if current_user is not None:
+            # Publishable includes reviewable warnings — still persist.
             _begin_generation_finalization(progress)
             progress(
                 stage="finalizing",
                 progress=99,
-                message="正在安全保存并准备结果",
-                detail="质量检查已完成，正在保存行程。",
-                meta={},
+                message=(
+                    "正在安全保存并准备结果"
+                    if not review_required
+                    else "质量提示已生成，正在保存行程"
+                ),
+                detail=(
+                    "质量检查已完成，正在保存行程。"
+                    if not review_required
+                    else (
+                        f"方案评分 {getattr(quality, 'score', 0)}/100，"
+                        "可交付但仍需复核。"
+                    )
+                ),
+                meta={
+                    "review_required": review_required,
+                    "quality_score": getattr(quality, "score", 0) if quality else 0,
+                },
             )
             _raise_if_generation_cancelled(progress)
             # Deliberately unguarded, unlike the sync path: the job contract is
@@ -979,7 +1004,7 @@ def create_trip_plan_job(
                 success=True,
                 message=(
                     "行程已生成，以下事项需要你确认"
-                    if needs_review
+                    if review_required
                     else "旅行计划生成成功"
                 ),
                 data=trip_plan,

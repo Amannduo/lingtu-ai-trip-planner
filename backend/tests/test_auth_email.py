@@ -46,6 +46,7 @@ def test_email_registration_login_and_update() -> None:
             old_token = client.cookies.get(cookie_name)
             assert old_token
             assert client.post("/api/auth/logout").status_code == 200
+            # Logout revokes every access token for this user (all sessions).
             client.cookies.set(cookie_name, old_token)
             assert client.get("/api/auth/me").status_code == 401
             client.cookies.delete(cookie_name)
@@ -89,18 +90,21 @@ def test_trip_email_dry_run(monkeypatch) -> None:
 def test_plan_route_uses_bound_email(monkeypatch) -> None:
     class FakePlanner:
         @staticmethod
-        def plan_trip(_request, progress_callback=None):
+        def plan_trip(_request, progress_callback=None, **_kwargs):
+            from app.models.schemas import TripPlanQualityResult
+
             return TripPlan(
                 city="苏州",
                 start_date="2026-09-01",
                 end_date="2026-09-01",
                 days=[],
+                overall_suggestions="按预约时间抵达景点。",
                 quality=TripPlanQualityResult(
                     status="passed",
                     score=90,
                     publishable=True,
+                    review_required=False,
                 ),
-                overall_suggestions="按预约时间抵达景点。",
             )
 
     monkeypatch.setenv("SEND_REAL_EMAILS", "false")
@@ -273,7 +277,9 @@ def test_invalid_smtp_config_is_reported_without_raising(monkeypatch) -> None:
 def test_unexpected_email_failure_does_not_fail_saved_trip(monkeypatch) -> None:
     class FakePlanner:
         @staticmethod
-        def plan_trip(_request, progress_callback=None):
+        def plan_trip(_request, progress_callback=None, **_kwargs):
+            from app.models.schemas import TripPlanQualityResult
+
             return TripPlan(
                 city="南京",
                 start_date="2026-10-01",
@@ -283,8 +289,8 @@ def test_unexpected_email_failure_does_not_fail_saved_trip(monkeypatch) -> None:
                     status="passed",
                     score=90,
                     publishable=True,
+                    review_required=False,
                 ),
-                overall_suggestions="提前预约需要的景点。",
             )
 
     def fail_delivery(*_args, **_kwargs):

@@ -277,6 +277,7 @@ def test_hotel_more_than_eight_kilometers_from_itinerary_warns() -> None:
 
 
 def test_meals_and_tickets_are_multiplied_by_travelers() -> None:
+    """Per-person meal/ticket unit prices must scale by travelers for party total."""
     request = _request(travelers=2)
     attraction = _attraction("故宫博物院")
     attraction.ticket_price = 50
@@ -288,9 +289,30 @@ def test_meals_and_tickets_are_multiplied_by_travelers() -> None:
     ]
     plan = _plan(request, [day])
     service = TransportBudgetService.__new__(TransportBudgetService)
+    service.flyai_enabled = False
+    service.settings = type("S", (), {"flyai_enabled": False, "flyai_api_key": "", "flyai_cli_command": ""})()
 
+    # 10+20+30 = 60 per person → 120 for 2; ticket 50 → 100 for 2
     assert service._sum_meal_costs(plan, request.travelers) == 120
     assert service._sum_attraction_costs(plan, request.travelers) == 100
+    # Single traveler path stays unscaled
+    assert service._sum_meal_costs(plan, 1) == 60
+    assert service._sum_attraction_costs(plan, 1) == 50
+
+    # Public path: estimate_budget must apply the same traveler scaling
+    budget = service.estimate_budget(request, plan)
+    assert budget.total_meals == 120
+    assert budget.total_attractions == 100
+    assert budget.total == (
+        budget.total_attractions
+        + budget.total_hotels
+        + budget.total_meals
+        + budget.total_transportation
+    )
+
+    solo = service.estimate_budget(request.model_copy(update={"travelers": 1}), plan)
+    assert solo.total_meals == 60
+    assert solo.total_attractions == 50
 
 
 def test_poi_diversifier_filters_weak_places_and_caps_streets() -> None:
@@ -456,8 +478,10 @@ def test_model_restaurant_coordinates_require_server_poi_proof() -> None:
     assert all(not meal.poi_id for meal in finalized.days[0].meals)
 
 def test_intercity_fallback_unit_is_single_person_roundtrip() -> None:
+    """Heuristic intercity unit is single-person roundtrip; total = unit * travelers."""
     service = TransportBudgetService.__new__(TransportBudgetService)
     service.flyai_enabled = False
+    service.settings = type("S", (), {"flyai_enabled": False, "flyai_api_key": "", "flyai_cli_command": ""})()
     request = _request(travelers=2).model_copy(
         update={
             "origin_city": "西安",
@@ -469,8 +493,23 @@ def test_intercity_fallback_unit_is_single_person_roundtrip() -> None:
     quote = service._estimate_intercity_transport(request)
 
     assert quote.source == "heuristic_transport"
+    # transport_unit_price contract: 单人往返参考价 — not one-way * 2
     assert quote.unit_price == 600
+    assert quote.total_price == quote.unit_price * request.travelers
     assert quote.total_price == 1200
+
+    # Public Budget fields must preserve the same unit/total contract
+    day = _day(request.start_date, 0, [_attraction("宽窄巷子", longitude=104.05)])
+    plan = _plan(request, [day])
+    budget = service.estimate_budget(request, plan)
+    assert budget.transport_unit_price == 600
+    assert budget.intercity_transportation == 1200
+    assert budget.intercity_transportation == budget.transport_unit_price * request.travelers
+    assert "兜底" in (budget.budget_source or "") or "估算" in (budget.budget_source or "")
+
+    solo = service.estimate_budget(request.model_copy(update={"travelers": 1}), plan)
+    assert solo.transport_unit_price == 600
+    assert solo.intercity_transportation == 600
 
 
 

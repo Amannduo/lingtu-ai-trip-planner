@@ -82,22 +82,11 @@ class TransportBudgetService:
             hotel_quote = hotel_future.result()
             intercity_quote = intercity_future.result()
 
-        attraction_total = self._sum_attraction_costs(
-            trip_plan, request.travelers
-        )
+        # ticket_price / meal estimated_cost are per-person unit estimates
+        # (model output and planner defaults); scale by travelers for party total.
+        attraction_total = self._sum_attraction_costs(trip_plan, request.travelers)
         meal_total = self._sum_meal_costs(trip_plan, request.travelers)
-        has_attractions = any(day.attractions for day in trip_plan.days)
-        budget_notes: List[str] = [f"餐饮按{request.travelers}人计算。"]
-        if attraction_total > 0:
-            budget_notes.append(
-                f"已填写的景点门票参考价按{request.travelers}人计算，"
-                "实际票价和优惠政策仍需通过景区官方渠道复核。"
-            )
-        elif has_attractions:
-            budget_notes.append(
-                "景点门票当前暂按0元计入；0仅表示未取得可核验的结构化票价，"
-                "不代表已确认免费，出发前需核对官方票价、免费政策和预约要求。"
-            )
+        budget_notes: List[str] = []
 
         if meal_total <= 0:
             meal_total = self._estimate_meal_cost(request)
@@ -387,17 +376,19 @@ class TransportBudgetService:
             chosen.notes = self._unique_notes(chosen.notes)
             return chosen
 
+        # unit_price is single-person ROUNDTRIP (matches FlyAI path and Budget.transport_unit_price).
+        # Do not multiply by an extra *2 — that double-counted the return leg.
         fallback_unit = 600
-        logger.info(
+        total_price = fallback_unit * max(1, request.travelers)
+        print(
             "[budget] intercity fallback: "
-            f"roundtrip_unit={fallback_unit}, travelers={request.travelers}, "
-            f"total={fallback_unit * request.travelers}"
+            f"roundtrip_unit={fallback_unit}, travelers={request.travelers}, total={total_price}"
         )
         return QuoteResult(
             unit_price=fallback_unit,
-            total_price=fallback_unit * request.travelers,
+            total_price=total_price,
             reference=f"{request.origin_city} 往返 {request.city} 交通兜底估算",
-            notes=["未获取到 FlyAI 城际交通价格，已按单人往返 600 元进行城际交通综合兜底估算。"],
+            notes=["未获取到 FlyAI 城际交通价格，已按单人往返 600 元兜底估算。"],
             source="heuristic_transport"
         )
 
@@ -1331,22 +1322,14 @@ class TransportBudgetService:
                     return attraction.name
         return None
 
-    def _sum_attraction_costs(
-        self,
-        trip_plan: TripPlan,
-        travelers: int = 1,
-    ) -> int:
+    def _sum_attraction_costs(self, trip_plan: TripPlan, travelers: int = 1) -> int:
         single_person_total = 0
         for day in trip_plan.days:
             for attraction in day.attractions:
                 single_person_total += max(0, int(attraction.ticket_price or 0))
         return single_person_total * max(1, travelers)
 
-    def _sum_meal_costs(
-        self,
-        trip_plan: TripPlan,
-        travelers: int = 1,
-    ) -> int:
+    def _sum_meal_costs(self, trip_plan: TripPlan, travelers: int = 1) -> int:
         single_person_total = 0
         for day in trip_plan.days:
             for meal in day.meals:

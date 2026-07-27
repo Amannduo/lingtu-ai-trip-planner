@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import threading
 
 from fastapi.testclient import TestClient

@@ -5,24 +5,27 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request as HttpRequest, UploadFile
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationError, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from ...agents.graph.travel_agent_graph import get_travel_agent_graph
 from ...services.auth_service import AuthenticatedUser
 from ...tools.analytics_context_tool import get_data_status, get_role_capabilities
+from ...tools.chart_tool import sanitize_chart_payload
 from ..auth import get_current_user
 
 router = APIRouter(prefix="/agent", tags=["多智能体数据分析"])
 
 
 class AgentCapacityError(RuntimeError):
-    pass
+    """Process-local analytics concurrency limit reached."""
 
 
+# Best-effort per-process capacity. Not a cluster-wide quota; each worker
+# counts independently. Prevents unbounded concurrent LLM/file work.
 _chat_slots = threading.BoundedSemaphore(6)
 _file_analysis_slots = threading.BoundedSemaphore(2)
 
@@ -47,13 +50,57 @@ class PermissionResult(BaseModel):
     reason: str = ""
 
 
+class ChartSeriesModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(default="", max_length=64)
+    values: list[float] = Field(default_factory=list, max_length=50)
+
+    @field_validator("values")
+    @classmethod
+    def _finite_values(cls, value: list[float]) -> list[float]:
+        import math
+
+        cleaned: list[float] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValueError("chart values must be finite numbers")
+            number = float(item)
+            if not math.isfinite(number):
+                raise ValueError("chart values must be finite numbers")
+            cleaned.append(number)
+        return cleaned
+
+
+class ChartPayloadModel(BaseModel):
+    """Restricted chart schema exposed to the frontend (not a chart-library option)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["bar", "line", "pie"]
+    title: str = Field(default="", max_length=120)
+    x_label: str = Field(default="", max_length=64)
+    y_label: str = Field(default="", max_length=64)
+    categories: list[str] = Field(default_factory=list, max_length=50)
+    series: list[ChartSeriesModel] = Field(default_factory=list, max_length=8)
+    truncated: bool = False
+    note: str = Field(default="", max_length=200)
+
+    @field_validator("categories", mode="before")
+    @classmethod
+    def _clean_categories(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item)[:100] for item in value[:50]]
+
+
 class AgentChatResponse(BaseModel):
     success: bool
     intent: str = ""
     agent: str = ""
     tool: str = ""
     table: list[dict[str, Any]] = Field(default_factory=list)
-    chart: Optional[dict[str, Any]] = None
+    chart: Optional[ChartPayloadModel] = None
     result: str = ""
     permission: PermissionResult
     sensitive: dict[str, Any] = Field(default_factory=dict)
@@ -93,7 +140,7 @@ async def agent_chat(
 ):
     try:
         graph = get_travel_agent_graph()
-        return await run_in_threadpool(
+        payload = await run_in_threadpool(
             _run_with_capacity,
             _chat_slots,
             lambda: graph.run(
@@ -104,12 +151,25 @@ async def agent_chat(
                 http_request.client.host if http_request.client else "unknown",
             ),
         )
+        if isinstance(payload, dict):
+            # Strip any non-conforming chart object before response validation.
+            # Invalid chart must never take down text/table responses.
+            safe = dict(payload)
+            safe["chart"] = sanitize_chart_payload(payload.get("chart"))
+            try:
+                return AgentChatResponse.model_validate(safe)
+            except ValidationError:
+                safe["chart"] = None
+                return AgentChatResponse.model_validate(safe)
+        return payload
     except AgentCapacityError as exc:
         raise HTTPException(
             status_code=429,
             detail="当前智能分析任务较多，请稍后再试。",
         ) from exc
     except PermissionError as exc:
+        # Do not echo internal permission-tool reason strings that may reveal
+        # role hierarchy details beyond the fixed client-safe message.
         raise HTTPException(
             status_code=403,
             detail="当前账号无权执行该分析请求。",
@@ -127,6 +187,7 @@ async def analyze_file(
 ):
     safe_filename = (file.filename or "")[:255]
     suffix = os.path.splitext(safe_filename)[1].lower()[:16]
+    # Legacy .xls is rejected: only modern Office Open XML is supported.
     allowed = {".txt", ".md", ".pdf", ".docx", ".xlsx"}
     if suffix not in allowed:
         raise HTTPException(status_code=400, detail="不支持的文件类型。")
@@ -160,6 +221,7 @@ async def analyze_file(
                 result_summary=result.get("summary", ""),
             )
         except Exception:
+            # Analytics/query logging is best-effort and must not fail the upload.
             pass
         return result
     except HTTPException:
@@ -170,7 +232,10 @@ async def analyze_file(
             detail="当前文件分析任务较多，请稍后再试。",
         ) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="文件内容或压缩结构不符合安全限制。") from exc
+        raise HTTPException(
+            status_code=400,
+            detail="文件内容或压缩结构不符合安全限制。",
+        ) from exc
     except Exception as exc:
         print(f"[agent] file analysis failed: {type(exc).__name__}")
         raise HTTPException(status_code=500, detail="文件分析暂时不可用。") from exc
