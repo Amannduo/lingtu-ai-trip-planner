@@ -109,14 +109,7 @@ _MAX_VALIDATION_ISSUES = 20
 async def request_validation_error_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Unified error vocabulary for request-validation failures.
-
-    Compatible transition (S5 phase 1): the FastAPI default
-    ``{"detail": [{loc, msg, type}, ...]}`` payload is preserved for
-    existing consumers, while top-level ``message`` + ``issues`` add the
-    same structured shape the semantic hard-block, quality rejection and
-    SSE error paths already expose.
-    """
+    """Preserve FastAPI detail while adding the unified error vocabulary."""
     errors = jsonable_encoder(exc.errors())
     issues: list[dict] = []
     for error in errors[:_MAX_VALIDATION_ISSUES]:

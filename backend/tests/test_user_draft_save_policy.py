@@ -29,14 +29,14 @@ def quality(
     score: int = 60,
     issues: list[TripPlanQualityIssue] | None = None,
     publishable: bool = False,
-    quality_status: str = "needs_review",
+    review_required: bool = True,
 ) -> TripPlanQualityResult:
     return TripPlanQualityResult(
         status=status,
         score=score,
         issues=issues or [],
         publishable=publishable,
-        quality_status=quality_status,
+        review_required=review_required,
     )
 
 
@@ -61,7 +61,12 @@ def plan_with(result: TripPlanQualityResult) -> TripPlan:
 
 
 def test_needs_review_plan_is_savable_as_a_draft() -> None:
-    result = quality(status="warning", score=60, quality_status="needs_review")
+    result = quality(
+        status="warning",
+        score=60,
+        publishable=True,
+        review_required=True,
+    )
     assert can_save_user_draft(result) is True
 
 
@@ -82,7 +87,7 @@ def test_saving_a_draft_does_not_imply_publishable() -> None:
         score=60,
         issues=[issue("warning", "HOTEL_GAP")],
         publishable=False,
-        quality_status="needs_review",
+        review_required=True,
     )
     assert can_save_user_draft(result) is True
     # The publish decision has exactly one owner, and it says no.
@@ -91,7 +96,10 @@ def test_saving_a_draft_does_not_imply_publishable() -> None:
 
 def test_publishable_plan_is_also_savable() -> None:
     result = quality(
-        status="passed", score=95, publishable=True, quality_status="publishable"
+        status="passed",
+        score=95,
+        publishable=True,
+        review_required=False,
     )
     assert can_save_user_draft(result) is True
     assert resolve_plan_quality_status(plan_with(result)) == "publishable"
@@ -103,12 +111,18 @@ def test_publishable_plan_is_also_savable() -> None:
 @pytest.mark.parametrize(
     "result",
     [
-        quality(status="failed", score=0, quality_status="blocked"),
-        # Coherent triple, as refresh_quality_gate would produce it.
+        quality(
+            status="failed",
+            score=0,
+            publishable=False,
+            review_required=True,
+        ),
+        # Coherent authoritative pair, as refresh_quality_gate would produce it.
         quality(
             status="failed",
             issues=[issue("error", "POI_DESTINATION_MISMATCH")],
-            quality_status="blocked",
+            publishable=False,
+            review_required=True,
         ),
     ],
     ids=["failed-evaluation", "error-severity-issue"],

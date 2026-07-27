@@ -206,9 +206,7 @@ class TripPlanningAgentGraph:
         quality = getattr(plan, "quality", None) if plan is not None else None
         if quality is None:
             return (-1, -1, -1)
-        not_blocked = int(
-            str(getattr(quality, "quality_status", "blocked")) != "blocked"
-        )
+        not_blocked = int(bool(getattr(quality, "publishable", False)))
         no_errors = int(
             not any(issue.severity == "error" for issue in quality.issues)
         )
@@ -911,19 +909,15 @@ class TripPlanningAgentGraph:
             refresh_quality_gate(
                 plan.quality,
                 generation_mode=plan.generation_mode,
-                force_unpublishable=bool(enrichment_errors),
-            )
-            blocking_codes = sorted(
-                issue.code for issue in plan.quality.issues
-                if issue.severity == "error"
+                force_review=bool(enrichment_errors),
             )
             logger.info(
                 "[trip_graph] quality evaluation complete: "
-                "score=%d, threshold=75, publishable=%s, "
-                "blocking_codes=%s, total_issues=%d, status=%s",
+                "score=%d, publishable=%s, review_required=%s, "
+                "total_issues=%d, status=%s",
                 plan.quality.score,
                 plan.quality.publishable,
-                blocking_codes if blocking_codes else "none",
+                plan.quality.review_required,
                 len(plan.quality.issues),
                 plan.quality.status,
             )
@@ -934,6 +928,8 @@ class TripPlanningAgentGraph:
             plan.quality = TripPlanQualityResult(
                 status="failed",
                 score=0,
+                publishable=False,
+                review_required=True,
                 checked_items=["质量门执行状态"],
                 issues=[
                     TripPlanQualityIssue(
@@ -998,11 +994,19 @@ class TripPlanningAgentGraph:
         if quality is None:
             return "end"
 
-        quality_status = getattr(quality, "quality_status", "blocked")
+        publishable = bool(getattr(quality, "publishable", False))
+        review_required = bool(getattr(quality, "review_required", False))
+        quality_status = (
+            "needs_review"
+            if publishable and review_required
+            else "publishable"
+            if publishable
+            else "blocked"
+        )
         repair_count = int(state.get("repair_count", 0))
         max_repairs = self._MAX_QUALITY_REPAIRS
 
-        if quality_status != "needs_review":
+        if not (publishable and review_required):
             logger.info(
                 "[trip_graph] quality gate: status=%s, score=%d, "
                 "repair_count=%d — skipping repair",

@@ -128,7 +128,7 @@ def test_select_final_plan_prefers_deliverable_over_higher_scoring_blocked() -> 
         status="failed",
         score=59,
         publishable=False,
-        quality_status="blocked",
+        review_required=True,
         issues=[
             TripPlanQualityIssue(
                 code="EMPTY_DAY",
@@ -142,8 +142,8 @@ def test_select_final_plan_prefers_deliverable_over_higher_scoring_blocked() -> 
     deliverable.quality = TripPlanQualityResult(
         status="warning",
         score=55,
-        publishable=False,
-        quality_status="needs_review",
+        publishable=True,
+        review_required=True,
     )
 
     state = {
@@ -241,8 +241,8 @@ class _NeedsReviewQualityStub:
         return TripPlanQualityResult(
             status="warning",
             score=self.scores[idx],
-            publishable=False,
-            quality_status="needs_review",
+            publishable=True,
+            review_required=True,
             issues=[
                 TripPlanQualityIssue(
                     code="DAY_SCHEDULE_OVERLOAD",
@@ -273,7 +273,8 @@ def test_budget_refresh_failure_keeps_budget_and_demotes(monkeypatch) -> None:
     assert result.budget.total == 100
     # … and the degradation demotes the plan instead of blocking it.
     assert result.quality is not None
-    assert result.quality.quality_status == "needs_review"
+    assert result.quality.publishable is True
+    assert result.quality.review_required is True
     assert any(
         issue.code == "PIPELINE_ENRICHMENT_PARTIAL"
         for issue in result.quality.issues

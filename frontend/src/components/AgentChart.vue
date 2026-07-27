@@ -151,6 +151,8 @@ const toEchartsOption = (data: AgentChartPayload) => {
   }
 }
 
+
+
 const renderChart = async () => {
   const data = payload.value
   if (!chartEl.value || !data) {
@@ -163,7 +165,10 @@ const renderChart = async () => {
     await nextTick()
     if (!chartEl.value) return
     if (!chart) {
-      chart = echarts.init(chartEl.value)
+      chart = echarts.init(chartEl.value, undefined, {
+        renderer: 'canvas',
+        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2)
+      })
     }
     chart.setOption(toEchartsOption(data), true)
     chart.resize()
@@ -228,6 +233,7 @@ onBeforeUnmount(() => {
 }
 
 .chart-canvas {
+  flex: 1 1 auto;
   width: 100%;
   min-height: 280px;
   height: 300px;

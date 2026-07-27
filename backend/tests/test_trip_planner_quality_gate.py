@@ -82,7 +82,7 @@ def test_plan_trip_returns_publishable_plan() -> None:
     plan.quality = TripPlanQualityService().evaluate(request, plan)
     # Day-count alone may still fail empty-day; force publishable for gate unit test.
     plan.quality.publishable = True
-    plan.quality.quality_status = "publishable"
+    plan.quality.review_required = False
     plan.quality.status = "passed"
 
     planner = MultiAgentTripPlanner.__new__(MultiAgentTripPlanner)

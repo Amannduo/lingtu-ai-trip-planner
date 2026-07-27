@@ -18,6 +18,7 @@ from .destination_feasibility_service import (
     poi_destination_status,
 )
 from .trip_pacing_contract import prefers_gentle_pacing
+from .trip_schedule_service import calculate_day_schedule
 
 
 # Structural hard blockers (shared with PR trust-hardening intent).
@@ -52,6 +53,28 @@ class TripPlanQualityService:
     """Validate facts and cross-field constraints before a plan is persisted."""
 
     FORECAST_WINDOW_DAYS = 16
+    # Issue codes that always block automatic persistence/delivery,
+    # regardless of the numeric score.
+    BLOCKING_CODES = frozenset({
+        "CITY_MISMATCH",
+        "SHORT_TRIP_DESTINATION_UNREACHABLE",
+        "PLAN_DATE_RANGE_MISMATCH",
+        "INVALID_DATE_RANGE",
+        "PAST_TRIP_DATE",
+        "DAY_COUNT_MISMATCH",
+        "DAY_DATE_MISMATCH",
+        "EMPTY_DAY",
+        "DAY_SCHEDULE_IMPOSSIBLE",
+        "BUDGET_MISSING",
+        "HOTEL_GAP",
+        "UNVERIFIED_HOTEL",
+        "HOTEL_REFERENCE_MISMATCH",
+        "HOTEL_PLAN_BUDGET_PRICE_MISMATCH",
+        "TRANSPORT_MODE_MISMATCH",
+        "TRANSPORT_REFERENCE_MISMATCH",
+        "POI_DESTINATION_MISMATCH",
+        "INVALID_COORDINATE",
+    })
     ISSUE_PENALTIES = {
         "FALLBACK_PLAN": 30,
         "MODEL_OUTPUT_REPAIRED": 8,
@@ -310,11 +333,18 @@ class TripPlanQualityService:
             minimum_attractions = (
                 1 if relaxed_pace or is_edge_day else 2
             )
-            minimum_visit_minutes = (
-                120 if relaxed_pace and is_edge_day
-                else 180 if relaxed_pace or is_edge_day
-                else 240
-            )
+            # Edge days with cross-city travel have less available time.
+            # Reserve 240 min for intercity, 120 for meals/rest → ~360 min
+            # consumed before any sightseeing.  120 min of actual visiting
+            # is reasonable for a travel day.
+            if cross_city and is_edge_day:
+                minimum_visit_minutes = 90
+            elif relaxed_pace and is_edge_day:
+                minimum_visit_minutes = 120
+            elif relaxed_pace or is_edge_day:
+                minimum_visit_minutes = 180
+            else:
+                minimum_visit_minutes = 210
             if not attractions:
                 add(
                     "EMPTY_DAY",
@@ -483,33 +513,26 @@ class TripPlanQualityService:
                         "调整景点分组或更换交通方式。",
                     )
 
-            route_minutes = sum(
-                max(0, int(route.duration or 0)) / 60
-                for route in routes[:expected_routes]
+            schedule = calculate_day_schedule(
+                request,
+                day,
+                day_index,
+                len(plan.days),
             )
-            intercity_reserve = 240 if cross_city and is_edge_day else 0
-            meal_and_rest_minutes = 150 if relaxed_pace else 120
-            scheduled_minutes = (
-                total_visit_minutes
-                + route_minutes
-                + intercity_reserve
-                + meal_and_rest_minutes
-            )
-            overload_limit = 480 if relaxed_pace else 600
-            impossible_limit = 660 if relaxed_pace else 840
-            if scheduled_minutes > impossible_limit:
+            scheduled_minutes = schedule.total_minutes
+            if scheduled_minutes > schedule.impossible_limit:
                 add(
                     "DAY_SCHEDULE_IMPOSSIBLE",
                     "error",
                     f"days[{day_index}]",
                     (
                         f"第{day_index + 1}天景点、路线、用餐休息"
-                        f"和城际预留合计约{round(scheduled_minutes / 60, 1)}"
+                        f"、酒店接驳和城际预留合计约{round(scheduled_minutes / 60, 1)}"
                         "小时，已无法在正常作息内执行。"
                     ),
                     "删减景点、缩短路线或拆分到其他日期。",
                 )
-            elif scheduled_minutes > overload_limit:
+            elif scheduled_minutes > schedule.overload_limit:
                 add(
                     "DAY_SCHEDULE_OVERLOAD",
                     "warning",
@@ -571,16 +594,25 @@ class TripPlanQualityService:
             for day in plan.days
             for attraction in (day.attractions or [])
         ]
-        if all_attractions and not any(
-            int(attraction.ticket_price or 0) > 0
+        pending_ticket_items = [
+            attraction.name
             for attraction in all_attractions
-        ):
+            if (
+                int(attraction.ticket_price or 0) <= 0
+                and attraction.ticket_price_status != "free"
+            )
+        ]
+        if pending_ticket_items:
             add(
                 "TICKET_PRICE_UNAVAILABLE",
                 "warning",
-                "days.attractions.ticket_price",
-                "全部景点暂按0元计入预算，但当前没有取得可核验票价；这不代表景点已确认免费。",
-                "出发前通过景区官方渠道核对免费政策、预约要求和实际票价。",
+                "days.attractions.ticket_price_status",
+                (
+                    "以下景点门票价格待核实，未知票价未计入已知费用："
+                    + "、".join(pending_ticket_items[:5])
+                    + "。这不代表景点已确认免费。"
+                ),
+                "出发前通过景区官方渠道核对票价、免费政策和预约要求。",
             )
         weak_attractions = [
             attraction.name
@@ -617,16 +649,26 @@ class TripPlanQualityService:
                     "leisure": "休闲娱乐",
                     "other": "同类或未明确分类地点",
                 }
-                add(
-                    "ATTRACTION_TYPE_CONCENTRATION",
-                    "warning",
-                    "days",
-                    (
-                        f"景点类型过于集中：{labels.get(dominant_category, dominant_category)}"
-                        f"占{round(dominant_ratio * 100)}%。"
-                    ),
-                    "增加文博、自然、公园或地标类景点，避免连续多天重复相同体验。",
+                dominant_label = labels.get(dominant_category, dominant_category)
+                # When the user explicitly prefers the dominant category,
+                # concentration is intentional — don't penalise.
+                user_prefers_dominant = any(
+                    marker in " ".join(request.preferences or [])
+                    for marker in self._category_preference_markers(
+                        dominant_category
+                    )
                 )
+                if not user_prefers_dominant:
+                    add(
+                        "ATTRACTION_TYPE_CONCENTRATION",
+                        "warning",
+                        "days",
+                        (
+                            f"景点类型过于集中：{dominant_label}"
+                            f"占{round(dominant_ratio * 100)}%。"
+                        ),
+                        "增加文博、自然、公园或地标类景点，避免连续多天重复相同体验。",
+                    )
 
         user_prefs = [p.casefold() for p in (request.preferences or [])]
         free_text = (request.free_text_input or "").casefold()
@@ -849,6 +891,7 @@ class TripPlanQualityService:
                 "total_meals": budget.total_meals,
                 "total_transportation": budget.total_transportation,
                 "total": budget.total,
+                "known_total": budget.known_total,
                 "hotel_nights": budget.hotel_nights,
                 "hotel_rooms": budget.hotel_rooms,
                 "hotel_unit_price": budget.hotel_unit_price,
@@ -882,15 +925,26 @@ class TripPlanQualityService:
                     f"预算分项合计¥{calculated}与总计¥{budget.total}不一致。",
                     "重新计算预算汇总。",
                 )
+            if budget.known_total != budget.total:
+                add(
+                    "BUDGET_SUM_MISMATCH",
+                    "warning",
+                    "budget.known_total",
+                    (
+                        f"已知费用合计¥{budget.known_total}"
+                        f"与预算分项合计¥{budget.total}不一致。"
+                    ),
+                    "重新计算已知费用汇总；待核实票价不得混入该数值。",
+                )
             if (
                 request.budget is not None
-                and budget.total > request.budget * 1.1
+                and budget.known_total > request.budget * 1.1
             ):
                 add(
                     "BUDGET_EXCEEDED",
                     "warning",
                     "budget.total",
-                    f"预计总费用¥{budget.total}超过用户预算¥{request.budget}。",
+                    f"已知费用合计¥{budget.known_total}超过用户预算¥{request.budget}。",
                     "优先降低酒店、城际交通或高价门票支出。",
                 )
 
@@ -1283,6 +1337,7 @@ class TripPlanQualityService:
                 "DAY_DATE_MISMATCH",
                 "EMPTY_DAY",
                 "INVALID_COORDINATE",
+                "POI_DESTINATION_MISMATCH",
                 "BUDGET_NEGATIVE_COMPONENT",
                 "BUDGET_SUM_MISMATCH",
             },
@@ -1372,16 +1427,7 @@ class TripPlanQualityService:
             review_required = False
             status = "passed"
 
-        # Unified tri-state read by graph/planner/routes (P0 vocabulary):
-        # blocked ⟺ not publishable; needs_review ⟺ publishable + review.
-        if has_blocking:
-            quality_status = "blocked"
-        elif review_required:
-            quality_status = "needs_review"
-        else:
-            quality_status = "publishable"
-
-        return TripPlanQualityResult(
+        result = TripPlanQualityResult(
             status=status,
             score=score,
             constraint_score=constraint_score,
@@ -1390,12 +1436,14 @@ class TripPlanQualityService:
             readiness_score=readiness_score,
             publishable=publishable,
             review_required=review_required,
-            quality_status=quality_status,
             checked_items=list(self.CHECKED_ITEMS),
             issues=issues,
             verified_facts=verified_facts,
             generated_at=datetime.now().isoformat(timespec="seconds"),
         )
+        # ``quality_status`` is a derived compatibility field. Refresh it from
+        # the authoritative publishable/review pair before returning.
+        return refresh_quality_gate(result, generation_mode=plan.generation_mode)
 
     def _normalized_label(self, value: str) -> str:
         return re.sub(r"[\W_]+", "", value or "").casefold()
@@ -1407,23 +1455,27 @@ class TripPlanQualityService:
     ) -> bool:
         feasibility = get_destination_feasibility_service()
 
-        def aliases(value: str) -> set[str]:
-            # Include the shared location normalization (province prefixes,
-            # station suffixes) so 山西太原 matches 太原站 in leg details.
-            return {
-                normalized
-                for normalized in (
-                    self._normalized_label(value),
-                    self._normalized_label(feasibility.normalize_city(value)),
-                    self._normalized_label(
-                        feasibility.normalize_location_for_matching(value)
-                    ),
-                )
-                if normalized
-            }
+        def location_aliases(value: str) -> set[str]:
+            """Return a set of normalized forms for a location name.
 
-        origin_aliases = aliases(request.origin_city or "")
-        destination_aliases = aliases(request.city or "")
+            Includes the raw normalized label, the feasibility-service
+            city normalization, and the shared location-name normalization
+            that strips province prefixes and station suffixes.  This
+            allows ``山西太原`` to match ``太原站`` and ``石家庄`` to
+            match ``石家庄站``.
+            """
+            candidates: set[str] = {
+                self._normalized_label(value),
+                self._normalized_label(feasibility.normalize_city(value)),
+                self._normalized_label(
+                    feasibility.normalize_location_for_matching(value)
+                ),
+            }
+            candidates.discard("")
+            return candidates
+
+        origin_aliases = location_aliases(request.origin_city or "")
+        destination_aliases = location_aliases(request.city or "")
         legs = [
             re.sub(r"\s+", "", item)
             for item in re.split(r"[;；]", reference or "")
@@ -1447,33 +1499,22 @@ class TripPlanQualityService:
             detail_parts = re.split(r"[:：]", leg, maxsplit=1)
             if not has_direction or expected_date not in leg or len(detail_parts) != 2:
                 return False
-            detail = self._normalized_label(detail_parts[1])
+            detail_norm = self._normalized_label(detail_parts[1])
             return (
                 expected_date in detail_parts[1]
-                and any(value in detail for value in starts)
-                and any(value in detail for value in ends)
+                and any(value in detail_norm for value in starts)
+                and any(value in detail_norm for value in ends)
             )
 
-        return (
-            any(
-                leg_matches(
-                    leg,
-                    origin_aliases,
-                    destination_aliases,
-                    request.start_date,
-                )
-                for leg in legs
-            )
-            and any(
-                leg_matches(
-                    leg,
-                    destination_aliases,
-                    origin_aliases,
-                    request.end_date,
-                )
-                for leg in legs
-            )
+        outbound_ok = any(
+            leg_matches(leg, origin_aliases, destination_aliases, request.start_date)
+            for leg in legs
         )
+        inbound_ok = any(
+            leg_matches(leg, destination_aliases, origin_aliases, request.end_date)
+            for leg in legs
+        )
+        return outbound_ok and inbound_ok
 
     def _dimension_score(
         self,
@@ -1563,8 +1604,13 @@ class TripPlanQualityService:
                 and not contract.origin_city.pending_confirmation
                 and request.origin_city
             ):
-                left = feasibility.normalize_city(str(contract.origin_city.value))
-                right = feasibility.normalize_city(request.origin_city)
+                # "山西太原" (utterance) and "太原" (form) are the same origin.
+                left = feasibility.normalize_location_for_matching(
+                    str(contract.origin_city.value)
+                )
+                right = feasibility.normalize_location_for_matching(
+                    request.origin_city
+                )
                 if left and right and left != right:
                     add(
                         "SEMANTIC_ORIGIN_MISMATCH",
@@ -1583,9 +1629,11 @@ class TripPlanQualityService:
                 in {"user_explicit", "form_confirmed"}
                 and not contract.destination_city.pending_confirmation
             ):
-                left = feasibility.normalize_city(str(contract.destination_city.value))
-                right = feasibility.normalize_city(request.city)
-                plan_city = feasibility.normalize_city(plan.city)
+                left = feasibility.normalize_location_for_matching(
+                    str(contract.destination_city.value)
+                )
+                right = feasibility.normalize_location_for_matching(request.city)
+                plan_city = feasibility.normalize_location_for_matching(plan.city)
                 if left and right and left != right:
                     add(
                         "SEMANTIC_DESTINATION_MISMATCH",
@@ -1811,6 +1859,46 @@ class TripPlanQualityService:
             return "leisure"
         return "other"
 
+    def _attraction_matches_destination(
+        self, request: TripRequest, attraction,
+    ) -> str:
+        """Return ``"matched"``, ``"mismatched"``, or ``"unknown"``.
+
+        Reads structured verification metadata from the Attraction,
+        falling back to address text parsing when no structured fields
+        are available.
+        """
+        verification = getattr(attraction, "verification", None)
+        cityname = getattr(verification, "cityname", "") or ""
+        citycode = getattr(verification, "citycode", "") or ""
+        adname = getattr(verification, "adname", "") or ""
+        adcode = getattr(verification, "adcode", "") or ""
+        return poi_destination_status(
+            destination_city=request.city,
+            cityname=cityname,
+            citycode=citycode,
+            adname=adname,
+            adcode=adcode,
+            address=getattr(attraction, "address", "") or "",
+            name=getattr(attraction, "name", "") or "",
+        )
+
+    @staticmethod
+    def _category_preference_markers(category: str) -> list[str]:
+        """Return user preference keywords that align with *category*.
+
+        When the user has stated a preference matching the dominant
+        attraction category, concentration is intentional and should
+        not be penalised.
+        """
+        mapping: dict[str, list[str]] = {
+            "culture": ["历史文化", "文化", "历史", "古迹", "博物馆", "古镇", "人文"],
+            "nature": ["自然风光", "自然", "山水", "户外", "风景"],
+            "leisure": ["休闲", "娱乐", "亲子", "度假"],
+            "street": ["逛街", "购物", "城市"],
+        }
+        return mapping.get(category, [])
+
     def _looks_like_non_tourism_poi(self, name: str, category: str) -> bool:
         text = f"{name or ''} {category or ''}"
         rejected = (
@@ -1839,30 +1927,6 @@ class TripPlanQualityService:
         return bool(
             re.search(r"(?:分店|门店|旗舰店|体验店)$", name or "")
             or re.search(r"[（(][^）)]*店[）)]$", name or "")
-        )
-
-    def _attraction_matches_destination(
-        self, request: TripRequest, attraction,
-    ) -> str:
-        """Return ``"matched"``, ``"mismatched"``, or ``"unknown"``.
-
-        Reads structured verification metadata from the Attraction,
-        falling back to address text parsing when no structured fields
-        are available.
-        """
-        verification = getattr(attraction, "verification", None)
-        cityname = getattr(verification, "cityname", "") or ""
-        citycode = getattr(verification, "citycode", "") or ""
-        adname = getattr(verification, "adname", "") or ""
-        adcode = getattr(verification, "adcode", "") or ""
-        return poi_destination_status(
-            destination_city=request.city,
-            cityname=cityname,
-            citycode=citycode,
-            adname=adname,
-            adcode=adcode,
-            address=getattr(attraction, "address", "") or "",
-            name=getattr(attraction, "name", "") or "",
         )
 
     def _distance_km(self, origin, destination) -> float:
@@ -2014,20 +2078,29 @@ class TripPlanQualityService:
         return "、".join(labels.get(value, value) for value in sorted(meal_types))
 
 
+def _has_error_issues(quality: TripPlanQualityResult | None) -> bool:
+    return any(
+        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
+        for issue in (getattr(quality, "issues", None) or [])
+    )
+
+
 def refresh_quality_gate(
     quality: TripPlanQualityResult,
     *,
     generation_mode: str = "primary",
-    force_unpublishable: bool = False,
+    force_review: bool = False,
 ) -> TripPlanQualityResult:
-    """Recompute the gate fields after any mutation of score/issues.
+    """Recompute ``publishable`` + ``review_required`` after a mutation.
 
-    Single source of truth for the reviewable-delivery gate, mirroring
-    ``evaluate()``'s tail: blocking dispositions reject; everything else
-    stays publishable with ``review_required`` marking notices.
-    ``force_unpublishable`` (kept for API compatibility — e.g. partial
-    enrichment in the planning graph) forces the review flag so degraded
-    plans are never presented as review-free.
+    ``evaluate()`` decides the pair once at construction; the pipeline then
+    mutates ``score`` and ``issues`` (partial enrichment, repair rounds), which
+    used to leave the pair describing a plan that no longer exists. Routing the
+    same rule through one recomputable function keeps them coherent.
+
+    ``force_review`` demotes a plan to "deliverable but review it" without
+    inventing an error issue — partial enrichment is a confidence problem, not
+    a correctness one, so it must not make the plan undeliverable.
     """
     has_blocking = any(
         issue_disposition(issue) == "blocking" for issue in quality.issues
@@ -2035,66 +2108,44 @@ def refresh_quality_gate(
     has_advisory = any(
         issue_disposition(issue) == "advisory" for issue in quality.issues
     )
-    quality.publishable = not has_blocking
-    quality.review_required = bool(
-        has_blocking
-        or has_advisory
+    if has_blocking:
+        quality.publishable = False
+        quality.review_required = True
+        quality.status = "failed"
+        quality.quality_status = "blocked"
+    elif (
+        has_advisory
+        or force_review
         or quality.score < 100
         or generation_mode in {"repaired", "map_fallback"}
-        or force_unpublishable
-    )
-    if has_blocking:
-        quality.quality_status = "blocked"
-    elif quality.review_required:
+    ):
+        quality.publishable = True
+        quality.review_required = True
+        quality.status = "warning"
         quality.quality_status = "needs_review"
     else:
+        quality.publishable = True
+        quality.review_required = False
+        quality.status = "passed"
         quality.quality_status = "publishable"
     return quality
 
 
 def resolve_plan_quality_status(plan: TripPlan) -> str:
-    """Read the unified gate decision for a plan.
+    """Derive ``blocked | needs_review | publishable`` for routing and display.
 
-    Prefers the coherent ``quality_status`` written by ``evaluate()`` /
-    ``refresh_quality_gate``.  Tolerates legacy or stub quality objects
-    that set ``publishable``/``review_required`` while leaving the field
-    default ``quality_status="blocked"``, and objects with no status.
+    Not a stored field: ``publishable`` + ``review_required`` are the authority
+    (see MERGE_REVIEW.md scheme 1). This is the one place that flattens them,
+    so callers cannot invent a fourth derivation.
     """
     quality = getattr(plan, "quality", None)
     if quality is None:
         return "blocked"
-
-    generation_mode = str(getattr(plan, "generation_mode", "") or "")
-    has_error = any(
-        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
-        for issue in (getattr(quality, "issues", None) or [])
-    )
-    status = str(getattr(quality, "quality_status", "") or "").strip().lower()
-    if status in {"publishable", "needs_review", "blocked"}:
-        if (
-            status == "blocked"
-            and bool(getattr(quality, "publishable", False))
-            and generation_mode != "map_fallback"
-            and not has_error
-        ):
-            # Incomplete stub/legacy quality objects (publishable=True with
-            # the field default status): trust the explicit flags.
-            return (
-                "needs_review"
-                if bool(getattr(quality, "review_required", False))
-                else "publishable"
-            )
-        return status
-
-    if bool(getattr(quality, "publishable", False)):
-        return (
-            "needs_review"
-            if bool(getattr(quality, "review_required", False))
-            else "publishable"
-        )
-    if has_error or generation_mode == "map_fallback":
+    if not bool(getattr(quality, "publishable", False)):
         return "blocked"
-    return "needs_review"
+    if bool(getattr(quality, "review_required", False)):
+        return "needs_review"
+    return "publishable"
 
 
 _trip_plan_quality_service: TripPlanQualityService | None = None

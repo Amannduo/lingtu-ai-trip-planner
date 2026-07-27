@@ -1,5 +1,6 @@
 """数据模型定义"""
 
+import math
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from datetime import date
@@ -151,8 +152,8 @@ class RouteRequest(BaseModel):
     """路线规划请求"""
     origin_address: str = Field(..., min_length=1, max_length=300, description="起点地址")
     destination_address: str = Field(..., min_length=1, max_length=300, description="终点地址")
-    origin_city: Optional[str] = Field(default=None, description="起点城市")
-    destination_city: Optional[str] = Field(default=None, description="终点城市")
+    origin_city: Optional[str] = Field(default=None, max_length=64, description="起点城市")
+    destination_city: Optional[str] = Field(default=None, max_length=64, description="终点城市")
     route_type: Literal["walking", "driving", "transit"] = Field(default="walking", description="路线类型: walking/driving/transit")
 
 
@@ -360,6 +361,14 @@ class Location(BaseModel):
     longitude: float = Field(..., ge=-180, le=180, description="经度")
     latitude: float = Field(..., ge=-90, le=90, description="纬度")
 
+    @field_validator("longitude", "latitude")
+    @classmethod
+    def _finite_coordinates(cls, value: float) -> float:
+        # Reject NaN / ±Infinity even when they pass numeric bounds checks.
+        if not math.isfinite(value):
+            raise ValueError("坐标必须是有限数值")
+        return value
+
 
 class MapContextPOI(BaseModel):
     """用于打印地图的高德周边场所。"""
@@ -398,6 +407,10 @@ class Attraction(BaseModel):
     image_url: Optional[str] = Field(default=None, description="图片URL")
     coordinate_source: str = Field(default="", description="坐标来源")
     ticket_price: int = Field(default=0, ge=0, le=1_000_000, description="单人门票参考价(元)")
+    ticket_price_status: Literal["unknown", "verified", "free"] = Field(
+        default="unknown",
+        description="门票状态：未知、已核验价格或已确认免费",
+    )
     verification: Optional[VerificationMeta] = Field(
         default=None,
         description="POI提供商返回的行政区数据，用于目的地校验，不参与前端展示",
@@ -503,6 +516,12 @@ class Budget(BaseModel):
     total_meals: int = Field(default=0, description="餐饮总费用")
     total_transportation: int = Field(default=0, description="交通总费用")
     total: int = Field(default=0, description="总费用")
+    known_total: int = Field(default=0, description="已知费用合计，不含待核实票价")
+    pending_ticket_items: List[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="门票价格待核实的景点",
+    )
     hotel_nights: int = Field(default=0, description="酒店晚数")
     hotel_rooms: int = Field(default=1, description="酒店间数")
     hotel_unit_price: int = Field(default=0, description="酒店单晚参考价")
@@ -513,6 +532,14 @@ class Budget(BaseModel):
     hotel_reference: Optional[str] = Field(default=None, description="酒店参考结果")
     transport_reference: Optional[str] = Field(default=None, description="交通参考结果")
     budget_notes: List[str] = Field(default_factory=list, max_length=50, description="预算备注")
+
+    @model_validator(mode="after")
+    def backfill_known_total(self):
+        # Backward compatibility for persisted plans created before
+        # ``known_total`` existed.
+        if self.known_total == 0 and self.total > 0:
+            self.known_total = self.total
+        return self
 
 
 class WebReference(BaseModel):
@@ -566,17 +593,13 @@ class TripPlanQualityResult(BaseModel):
     )
     review_required: bool = Field(
         default=False,
-        description=(
-            "Reviewable-delivery flag: the plan may persist and deliver, "
-            "but carries notices the user should review"
-        ),
+        description="Whether human or advisory review is requested",
     )
     quality_status: str = Field(
         default="blocked",
         description=(
-            "blocked | needs_review | publishable — unified gate decision "
-            "(blocked ⟺ not publishable; needs_review ⟺ publishable with "
-            "review_required)"
+            "Compatibility alias derived from publishable + review_required; "
+            "not an independent field. Use resolve_plan_quality_status() to read."
         ),
     )
     validation_mode: str = Field(

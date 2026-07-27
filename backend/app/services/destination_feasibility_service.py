@@ -32,6 +32,43 @@ _STATION_SUFFIXES: tuple[str, ...] = (
     "南站", "北站", "东站", "西站", "站",
 )
 
+# AMap citycode is a telephone-area code, while adcode is a GB/T 2260-style
+# administrative code.  Keep the two registries separate and compare county
+# adcodes with their prefecture parent.  This is administrative reference data,
+# not a POI/name exception list.
+_KNOWN_CITYCODES: dict[str, str] = {
+    "0351": "太原", "0352": "大同", "0353": "阳泉", "0354": "晋中",
+    "0355": "长治", "0356": "晋城", "0357": "临汾", "0358": "吕梁",
+    "0359": "运城", "0349": "朔州", "0350": "忻州",
+    "010": "北京", "021": "上海", "022": "天津", "023": "重庆",
+    "020": "广州", "0755": "深圳", "028": "成都", "029": "西安",
+    "0371": "郑州", "0379": "洛阳", "0531": "济南",
+    "024": "沈阳", "0411": "大连", "027": "武汉",
+    "0731": "长沙", "0571": "杭州", "025": "南京",
+    "0591": "福州", "0592": "厦门", "0898": "海口",
+    "0771": "南宁", "0851": "贵阳", "0871": "昆明",
+    "0931": "兰州", "0951": "银川", "0971": "西宁",
+    "0991": "乌鲁木齐", "0891": "拉萨",
+}
+
+_CITY_ADCODE_PREFIXES: dict[str, tuple[str, ...]] = {
+    # Municipalities include county-level codes outside the central-city 4-digit
+    # prefix, so their province-level two digits are the correct parent boundary.
+    "北京": ("11",), "天津": ("12",), "上海": ("31",), "重庆": ("50",),
+    "太原": ("1401",), "大同": ("1402",), "阳泉": ("1403",),
+    "长治": ("1404",), "晋城": ("1405",), "朔州": ("1406",),
+    "晋中": ("1407",), "运城": ("1408",), "忻州": ("1409",),
+    "临汾": ("1410",), "吕梁": ("1411",),
+    "沈阳": ("2101",), "大连": ("2102",), "南京": ("3201",),
+    "杭州": ("3301",), "福州": ("3501",), "厦门": ("3502",),
+    "济南": ("3701",), "郑州": ("4101",), "洛阳": ("4103",),
+    "武汉": ("4201",), "长沙": ("4301",), "广州": ("4401",),
+    "深圳": ("4403",), "南宁": ("4501",), "海口": ("4601",),
+    "成都": ("5101",), "贵阳": ("5201",), "昆明": ("5301",),
+    "拉萨": ("5401",), "西安": ("6101",), "兰州": ("6201",),
+    "西宁": ("6301",), "银川": ("6401",), "乌鲁木齐": ("6501",),
+}
+
 
 # This graph is deliberately conservative: for a one- or two-day trip we only
 # auto-recommend destinations with a dependable short-haul connection from the
@@ -172,9 +209,6 @@ class DestinationFeasibilityService:
 
         normalized = canonical.strip()
         if not normalized:
-            # "吉林市" strips to the empty string (province prefix + bare 市).
-            # Returning "" would silently disable every identity check that
-            # guards on truthiness, so keep the plain city normalization.
             normalized = self.normalize_city(original).strip()
         self._NORM_CACHE[cache_key] = normalized
         return normalized
@@ -337,7 +371,11 @@ def _address_points_to_conflicting_city(
     feasibility = get_destination_feasibility_service()
     dest_norm = feasibility.normalize_location_for_matching(destination_city)
     admin_refs = _extract_admin_references(address)
-    for ref_text, _ref_kind in admin_refs:
+    for ref_text, ref_kind in admin_refs:
+        # An unfamiliar county/district is not evidence of a different
+        # prefecture.  Its parent must come from structured provider fields.
+        if ref_kind != "市":
+            continue
         ref_norm = feasibility.normalize_location_for_matching(ref_text)
         if not ref_norm or not dest_norm:
             continue
@@ -403,20 +441,6 @@ def poi_destination_status(
             return "mismatched"
 
     # 2. citycode: known AMap citycode → city name mapping.
-    _KNOWN_CITYCODES: dict[str, str] = {
-        "0351": "太原", "0352": "大同", "0353": "阳泉", "0354": "晋中",
-        "0355": "长治", "0356": "晋城", "0357": "临汾", "0358": "吕梁",
-        "0359": "运城", "0349": "朔州", "0350": "忻州",
-        "010": "北京", "021": "上海", "022": "天津", "023": "重庆",
-        "020": "广州", "0755": "深圳", "028": "成都", "029": "西安",
-        "0371": "郑州", "0379": "洛阳", "0531": "济南",
-        "024": "沈阳", "0411": "大连", "027": "武汉",
-        "0731": "长沙", "0571": "杭州", "025": "南京",
-        "0591": "福州", "0592": "厦门", "0898": "海口",
-        "0771": "南宁", "0851": "贵阳", "0871": "昆明",
-        "0931": "兰州", "0951": "银川", "0971": "西宁",
-        "0991": "乌鲁木齐", "0891": "拉萨",
-    }
     if citycode:
         if citycode in _KNOWN_CITYCODES:
             mapped = _KNOWN_CITYCODES[citycode]
@@ -430,9 +454,16 @@ def poi_destination_status(
         # citycode present but not in our mapping — try adcode if
         # available, else fall through to address check.
 
-    # 3. adcode: the first 4 digits identify the city-level admin unit.
-    if adcode and len(adcode) >= 4:
-        adcode_prefix = adcode[:4]
+    # 3. adcode: county/district codes inherit their prefecture prefix.
+    clean_adcode = re.sub(r"\D", "", str(adcode or ""))
+    destination_prefixes = _CITY_ADCODE_PREFIXES.get(dest_norm, ())
+    if clean_adcode and destination_prefixes:
+        if any(clean_adcode.startswith(prefix) for prefix in destination_prefixes):
+            return "matched"
+        # A complete structured adcode under a known destination boundary is
+        # decisive cross-prefecture evidence.
+        if len(clean_adcode) >= 4:
+            return "mismatched"
 
     # 4. adname: only usable when we can confirm the parent city.
     if adname and not cityname and not citycode:
@@ -444,7 +475,7 @@ def poi_destination_status(
 
     if address:
         admin_refs = _extract_admin_references(address)
-        for ref_text, _ref_kind in admin_refs:
+        for ref_text, ref_kind in admin_refs:
             ref_norm = feasibility.normalize_location_for_matching(ref_text)
             if not ref_norm or not dest_norm:
                 continue
@@ -455,8 +486,10 @@ def poi_destination_status(
                     if cn_norm and cn_norm != ref_norm and cn_norm not in ref_norm and ref_norm not in cn_norm:
                         return "mismatched"  # conflict: structured wins
                 return "matched"
-            # A different identifiable city.
-            return "mismatched"
+            # Only an explicit different prefecture-level city is decisive.
+            # District/county names without a structured parent remain unknown.
+            if ref_kind == "市":
+                return "mismatched"
 
     return "unknown"
 
@@ -474,7 +507,9 @@ def _extract_admin_references(text: str) -> list[tuple[str, str]]:
 
     results: list[tuple[str, str]] = []
     # Match "XX市", "XX区", "XX县", "XX省XX市"
-    pattern = re.compile(r"([一-鿿]{2,10})(市|区|县)")
+    # Non-greedy matching keeps an explicit city suffix visible in
+    # "省+市+区" addresses instead of swallowing it into the district match.
+    pattern = re.compile(r"([一-鿿]{2,10}?)(市|区|县)")
     for match in pattern.finditer(text):
         city_text = match.group(1)
         suffix = match.group(2)

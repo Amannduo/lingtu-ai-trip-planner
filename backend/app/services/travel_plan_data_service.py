@@ -22,7 +22,7 @@ CONTRACT_SNAPSHOT_SCHEMA_VERSION = 1
 
 
 def _serialize_request_snapshot(request: TripRequest) -> str:
-    """Versioned generation-time request snapshot (contract stored aside)."""
+    """Serialize the generation-time request separately from its contract."""
     payload = {
         "schema_version": REQUEST_SNAPSHOT_SCHEMA_VERSION,
         "request": request.model_dump(mode="json", exclude={"semantic_contract"}),
@@ -45,11 +45,7 @@ def _request_from_snapshot(
     request_json: Any,
     contract_json: Any,
 ) -> TripRequest | None:
-    """Restore the generation-time request; None on any defect (fail soft).
-
-    Unknown future schema_versions are treated as unreadable rather than
-    partially parsed, so a downgraded deployment never misreads newer rows.
-    """
+    """Restore a versioned request snapshot, failing soft on invalid data."""
     if not isinstance(request_json, str) or not request_json.strip():
         return None
     try:
@@ -72,18 +68,14 @@ def _request_from_snapshot(
                 contract = SemanticTripContract.model_validate(
                     contract_wrapper["contract"]
                 )
-                request = request.model_copy(
-                    update={"semantic_contract": contract}
-                )
+                request = request.model_copy(update={"semantic_contract": contract})
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            # A broken contract snapshot degrades to contract-less full
-            # request; the quality gate's single-rebuild fallback covers it.
             pass
     return request
 
 
 def _as_optional_budget(value: Any) -> int | None:
-    """Coerce a stored NUMERIC user budget back to the request's int form."""
+    """Coerce a stored numeric user budget back to the request's int form."""
     if value is None:
         return None
     try:
@@ -187,14 +179,7 @@ class TravelPlanDataService:
     def get_trip_request_with_context(
         self, plan_no: str, user_id: str
     ) -> tuple[TripRequest | None, str]:
-        """Return ``(request, validation_mode)`` for the edit-path gate.
-
-        ``full``: the generation-time request snapshot (and semantic
-        contract) was restored — the quality gate runs at the same
-        strength as generation time.  ``legacy_weak``: only denormalized
-        columns are available (pre-snapshot rows or corrupt snapshots);
-        callers must never auto-upgrade such results to publishable.
-        """
+        """Return the request plus full or legacy-weak validation mode."""
         init_db()
         row = fetch_one(
             """SELECT request_json, contract_json FROM travel_plans

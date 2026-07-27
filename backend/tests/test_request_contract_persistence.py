@@ -188,15 +188,13 @@ def test_legacy_weak_rule_demotes_publishable_and_hints_regenerate() -> None:
         status="passed",
         score=92,
         publishable=True,
-        quality_status="publishable",
+        review_required=False,
     )
 
     _mark_legacy_weak_validation(quality)
 
     assert quality.validation_mode == "legacy_weak"
-    assert quality.quality_status == "needs_review"
-    # Reviewable model: saving stays allowed, but never review-free.
-    assert quality.publishable is True
+    assert quality.publishable is False
     assert quality.review_required is True
     legacy = next(
         i for i in quality.issues if i.code == "LEGACY_WEAK_VALIDATION"
@@ -211,14 +209,15 @@ def test_legacy_weak_rule_demotes_publishable_and_hints_regenerate() -> None:
     )
 
 
-def test_legacy_weak_rule_keeps_needs_review_and_blocked_untouched() -> None:
-    for status, publishable in (("needs_review", False), ("blocked", False)):
+def test_legacy_weak_rule_demotes_deliverable_pairs_and_keeps_blocked() -> None:
+    for publishable, review_required in ((True, True), (False, True)):
         quality = TripPlanQualityResult(
             status="warning",
             score=60,
             publishable=publishable,
-            quality_status=status,
+            review_required=review_required,
         )
         _mark_legacy_weak_validation(quality)
-        assert quality.quality_status == status
+        assert quality.publishable is False
+        assert quality.review_required is True
         assert quality.validation_mode == "legacy_weak"

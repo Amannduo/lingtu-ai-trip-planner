@@ -252,11 +252,9 @@ def _mark_legacy_weak_validation(quality) -> None:
                 suggestion="重新生成行程可获得完整质量校验。",
             )
         )
-    # Weak-context results must never present as review-free: force the
-    # review flag (saving stays allowed under the reviewable model).
+    quality.publishable = False
     quality.review_required = True
-    if quality.quality_status == "publishable":
-        quality.quality_status = "needs_review"
+    quality.quality_status = "blocked"
 
 
 def can_save_user_draft(quality) -> bool:
@@ -442,8 +440,13 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
 
 
 def _plan_is_publishable(plan: TripPlan) -> bool:
-    """Legacy helper: true only when the unified gate says publishable."""
-    return _resolve_quality_status(plan) == "publishable"
+    """Return the authoritative delivery decision.
+
+    ``review_required`` changes presentation and follow-up behavior, not
+    whether an otherwise non-blocking plan can be delivered.
+    """
+    quality = getattr(plan, "quality", None)
+    return bool(getattr(quality, "publishable", False))
 
 
 def _resolve_quality_status(plan: TripPlan) -> str:

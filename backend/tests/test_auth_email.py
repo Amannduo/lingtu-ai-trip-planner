@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.api.main import app
 from app.config import get_settings
-from app.models.schemas import TripPlan
+from app.models.schemas import TripPlan, TripPlanQualityResult
 from app.services.database_service import execute
 from app.services.trip_email_service import deliver_trip_plan_email, render_trip_plan_text
 from app.tools.send_email_tool import send_email
@@ -285,7 +285,7 @@ def test_unexpected_email_failure_does_not_fail_saved_trip(monkeypatch) -> None:
                 start_date="2026-10-01",
                 end_date="2026-10-01",
                 days=[],
-                overall_suggestions="提前预约需要的景点。",
+                overall_suggestions="按预约时间抵达景点。",
                 quality=TripPlanQualityResult(
                     status="passed",
                     score=90,

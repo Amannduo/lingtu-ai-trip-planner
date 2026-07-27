@@ -204,7 +204,7 @@ def _publishable_plan() -> TripPlan:
             status="passed",
             score=90,
             publishable=True,
-            quality_status="publishable",
+            review_required=False,
         ),
     )
 

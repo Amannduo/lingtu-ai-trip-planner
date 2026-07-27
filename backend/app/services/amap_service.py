@@ -214,6 +214,9 @@ class AmapService:
             rating=_safe_float(biz_ext.get("rating")),
             photos=photos[:3],
             district=_to_text(item.get("adname")),
+            cityname=_to_text(item.get("cityname")),
+            citycode=_to_text(item.get("citycode")),
+            adcode=_to_text(item.get("adcode")),
         )
 
     def search_poi(self, keywords: str, city: str, citylimit: bool = True) -> List[POIInfo]:
