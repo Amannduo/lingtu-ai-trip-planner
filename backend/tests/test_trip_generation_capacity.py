@@ -21,6 +21,19 @@ from app.services.trip_generation_job_service import (
 from app.models.schemas import TripPlanQualityIssue, TripPlanQualityResult
 
 
+def _await_idle_capacity(timeout: float = 2.0) -> None:
+    """Wait until no worker holds a slot.
+
+    ``reset_generation_capacity_for_tests`` rebinds the semaphore and refuses
+    to run while slots are held, so every caller — setup included — must wait
+    first. A worker from an earlier test file can still be unwinding when this
+    module starts.
+    """
+    deadline = time.time() + timeout
+    while generation_capacity_snapshot()["held"] > 0 and time.time() < deadline:
+        time.sleep(0.02)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_generation_capacity():
     """Isolate process-wide slots without hiding production release bugs.
@@ -28,12 +41,11 @@ def _isolate_generation_capacity():
     Each test starts from a full semaphore. After the test, held slots must
     return to zero once workers finish; otherwise the test fails explicitly.
     """
+    _await_idle_capacity()
     reset_generation_capacity_for_tests()
     yield
     # Give short-lived worker threads a moment to hit finally.
-    deadline = time.time() + 2.0
-    while generation_capacity_snapshot()["held"] > 0 and time.time() < deadline:
-        time.sleep(0.02)
+    _await_idle_capacity()
     assert generation_capacity_snapshot()["held"] == 0, generation_capacity_snapshot()
     reset_generation_capacity_for_tests()
 

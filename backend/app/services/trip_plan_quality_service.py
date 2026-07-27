@@ -13,7 +13,10 @@ from ..models.schemas import (
     TripPlanQualityResult,
     TripRequest,
 )
-from .destination_feasibility_service import get_destination_feasibility_service
+from .destination_feasibility_service import (
+    get_destination_feasibility_service,
+    poi_destination_status,
+)
 from .trip_pacing_contract import prefers_gentle_pacing
 
 
@@ -69,6 +72,8 @@ class TripPlanQualityService:
         "DAY_DATE_MISMATCH": 25,
         "EMPTY_DAY": 25,
         "INVALID_COORDINATE": 20,
+        "POI_DESTINATION_MISMATCH": 35,
+        "POI_DESTINATION_UNVERIFIED": 6,
         "NON_TOURISM_POI": 15,
         "UNVERIFIED_POI": 8,
         "UNVERIFIED_MEAL": 8,
@@ -370,6 +375,34 @@ class TripPlanQualityService:
                     and bool((attraction.poi_id or "").strip())
                 ):
                     verified_facts += 1
+                    dest_status = self._attraction_matches_destination(
+                        request, attraction,
+                    )
+                    if dest_status == "mismatched":
+                        add(
+                            "POI_DESTINATION_MISMATCH",
+                            "error",
+                            path,
+                            (
+                                f"景点「{attraction.name}」位于"
+                                f"「{attraction.address or '未知'}」"
+                                f"，与目的地「{request.city}」不一致。"
+                            ),
+                            "仅使用目的地城市的高德POI替换。",
+                        )
+                    elif dest_status == "unknown":
+                        add(
+                            "POI_DESTINATION_UNVERIFIED",
+                            "warning",
+                            path,
+                            (
+                                f"景点「{attraction.name}」的地址"
+                                f"「{attraction.address or '无'}」未包含"
+                                f"「{request.city}」的行政区信息，"
+                                "无法确认是否属于目的地。"
+                            ),
+                            "出发前通过地图确认实际位置。",
+                        )
                 else:
                     add(
                         "UNVERIFIED_POI",
@@ -1339,6 +1372,15 @@ class TripPlanQualityService:
             review_required = False
             status = "passed"
 
+        # Unified tri-state read by graph/planner/routes (P0 vocabulary):
+        # blocked ⟺ not publishable; needs_review ⟺ publishable + review.
+        if has_blocking:
+            quality_status = "blocked"
+        elif review_required:
+            quality_status = "needs_review"
+        else:
+            quality_status = "publishable"
+
         return TripPlanQualityResult(
             status=status,
             score=score,
@@ -1348,6 +1390,7 @@ class TripPlanQualityService:
             readiness_score=readiness_score,
             publishable=publishable,
             review_required=review_required,
+            quality_status=quality_status,
             checked_items=list(self.CHECKED_ITEMS),
             issues=issues,
             verified_facts=verified_facts,
@@ -1365,11 +1408,16 @@ class TripPlanQualityService:
         feasibility = get_destination_feasibility_service()
 
         def aliases(value: str) -> set[str]:
+            # Include the shared location normalization (province prefixes,
+            # station suffixes) so 山西太原 matches 太原站 in leg details.
             return {
                 normalized
                 for normalized in (
                     self._normalized_label(value),
                     self._normalized_label(feasibility.normalize_city(value)),
+                    self._normalized_label(
+                        feasibility.normalize_location_for_matching(value)
+                    ),
                 )
                 if normalized
             }
@@ -1491,7 +1539,9 @@ class TripPlanQualityService:
             }
         ]
         if pending_critical:
-            acknowledged = "[用户已确认待核对约束]" in (request.free_text_input or "")
+            # Single acknowledgment source: structured boolean first, with
+            # legacy free-text marker compatibility handled inside it.
+            acknowledged = risks_acked
             add(
                 "SEMANTIC_PENDING_FIELDS",
                 "info",
@@ -1635,6 +1685,61 @@ class TripPlanQualityService:
                 "确认同行关系与人数后可提高行程匹配度。",
             )
 
+        self._evaluate_exclusions(contract, plan, feasibility, add, risks_acked)
+
+    def _evaluate_exclusions(
+        self, contract, plan, feasibility, add, risks_acked: bool
+    ) -> None:
+        """What the user ruled out must not come back in the generated plan.
+
+        After an explicit secondary confirmation the user owns the decision, so
+        the destination check degrades to a warning instead of blocking.
+        """
+        excluded_cities = (
+            [str(item) for item in contract.excluded_destinations.value]
+            if contract.excluded_destinations.is_known()
+            and isinstance(contract.excluded_destinations.value, list)
+            else []
+        )
+        destination = feasibility.normalize_location_for_matching(plan.city)
+        if excluded_cities and destination:
+            for city in excluded_cities:
+                if feasibility.normalize_location_for_matching(city) == destination:
+                    add(
+                        "SEMANTIC_EXCLUDED_DESTINATION",
+                        "warning" if risks_acked else "error",
+                        "city",
+                        f"用户明确排除了“{city}”，但行程目的地仍是该城市。",
+                        "改用其他目的地重新生成，或请用户确认取消该排除。",
+                    )
+
+        excluded_themes = (
+            [str(item) for item in contract.excluded_themes.value]
+            if contract.excluded_themes.is_known()
+            and isinstance(contract.excluded_themes.value, list)
+            else []
+        )
+        if not excluded_themes:
+            return
+        for theme in excluded_themes:
+            hits = [
+                attraction.name
+                for day in plan.days
+                for attraction in (day.attractions or [])
+                if theme in f"{attraction.name} {attraction.category or ''}"
+            ]
+            if hits:
+                add(
+                    "SEMANTIC_EXCLUDED_THEME",
+                    "warning",
+                    "days[].attractions",
+                    (
+                        f"用户明确排除了“{theme}”，但行程仍包含 "
+                        f"{'、'.join(hits[:3])}。"
+                    ),
+                    "移除或替换这些安排后再确认行程。",
+                )
+
     def _prefers_relaxed_pace(self, request: TripRequest) -> bool:
         contract = request.semantic_contract
         if (
@@ -1734,6 +1839,30 @@ class TripPlanQualityService:
         return bool(
             re.search(r"(?:分店|门店|旗舰店|体验店)$", name or "")
             or re.search(r"[（(][^）)]*店[）)]$", name or "")
+        )
+
+    def _attraction_matches_destination(
+        self, request: TripRequest, attraction,
+    ) -> str:
+        """Return ``"matched"``, ``"mismatched"``, or ``"unknown"``.
+
+        Reads structured verification metadata from the Attraction,
+        falling back to address text parsing when no structured fields
+        are available.
+        """
+        verification = getattr(attraction, "verification", None)
+        cityname = getattr(verification, "cityname", "") or ""
+        citycode = getattr(verification, "citycode", "") or ""
+        adname = getattr(verification, "adname", "") or ""
+        adcode = getattr(verification, "adcode", "") or ""
+        return poi_destination_status(
+            destination_city=request.city,
+            cityname=cityname,
+            citycode=citycode,
+            adname=adname,
+            adcode=adcode,
+            address=getattr(attraction, "address", "") or "",
+            name=getattr(attraction, "name", "") or "",
         )
 
     def _distance_km(self, origin, destination) -> float:
@@ -1883,6 +2012,89 @@ class TripPlanQualityService:
     def _meal_names(self, meal_types: set[str]) -> str:
         labels = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}
         return "、".join(labels.get(value, value) for value in sorted(meal_types))
+
+
+def refresh_quality_gate(
+    quality: TripPlanQualityResult,
+    *,
+    generation_mode: str = "primary",
+    force_unpublishable: bool = False,
+) -> TripPlanQualityResult:
+    """Recompute the gate fields after any mutation of score/issues.
+
+    Single source of truth for the reviewable-delivery gate, mirroring
+    ``evaluate()``'s tail: blocking dispositions reject; everything else
+    stays publishable with ``review_required`` marking notices.
+    ``force_unpublishable`` (kept for API compatibility — e.g. partial
+    enrichment in the planning graph) forces the review flag so degraded
+    plans are never presented as review-free.
+    """
+    has_blocking = any(
+        issue_disposition(issue) == "blocking" for issue in quality.issues
+    )
+    has_advisory = any(
+        issue_disposition(issue) == "advisory" for issue in quality.issues
+    )
+    quality.publishable = not has_blocking
+    quality.review_required = bool(
+        has_blocking
+        or has_advisory
+        or quality.score < 100
+        or generation_mode in {"repaired", "map_fallback"}
+        or force_unpublishable
+    )
+    if has_blocking:
+        quality.quality_status = "blocked"
+    elif quality.review_required:
+        quality.quality_status = "needs_review"
+    else:
+        quality.quality_status = "publishable"
+    return quality
+
+
+def resolve_plan_quality_status(plan: TripPlan) -> str:
+    """Read the unified gate decision for a plan.
+
+    Prefers the coherent ``quality_status`` written by ``evaluate()`` /
+    ``refresh_quality_gate``.  Tolerates legacy or stub quality objects
+    that set ``publishable``/``review_required`` while leaving the field
+    default ``quality_status="blocked"``, and objects with no status.
+    """
+    quality = getattr(plan, "quality", None)
+    if quality is None:
+        return "blocked"
+
+    generation_mode = str(getattr(plan, "generation_mode", "") or "")
+    has_error = any(
+        str(getattr(issue, "severity", "") or "").strip().lower() == "error"
+        for issue in (getattr(quality, "issues", None) or [])
+    )
+    status = str(getattr(quality, "quality_status", "") or "").strip().lower()
+    if status in {"publishable", "needs_review", "blocked"}:
+        if (
+            status == "blocked"
+            and bool(getattr(quality, "publishable", False))
+            and generation_mode != "map_fallback"
+            and not has_error
+        ):
+            # Incomplete stub/legacy quality objects (publishable=True with
+            # the field default status): trust the explicit flags.
+            return (
+                "needs_review"
+                if bool(getattr(quality, "review_required", False))
+                else "publishable"
+            )
+        return status
+
+    if bool(getattr(quality, "publishable", False)):
+        return (
+            "needs_review"
+            if bool(getattr(quality, "review_required", False))
+            else "publishable"
+        )
+    if has_error or generation_mode == "map_fallback":
+        return "blocked"
+    return "needs_review"
 
 
 _trip_plan_quality_service: TripPlanQualityService | None = None

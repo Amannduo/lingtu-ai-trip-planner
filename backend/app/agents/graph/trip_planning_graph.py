@@ -14,14 +14,19 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, TypedDict
 
 from ...models.schemas import (
+    Attraction,
     DayPlan,
     Meal,
     TripPlan,
     TripPlanQualityIssue,
     TripPlanQualityResult,
     TripRequest,
+    VerificationMeta,
 )
-from ...services.trip_plan_quality_service import get_trip_plan_quality_service
+from ...services.trip_plan_quality_service import (
+    get_trip_plan_quality_service,
+    refresh_quality_gate,
+)
 from ...services.trip_generation_errors import TripGenerationCancelledError
 
 
@@ -49,6 +54,12 @@ class TripPlanningState(TypedDict, total=False):
     enrichment_errors: list[str]
     failure_stage: str
     failure_type: str
+    # ── quality repair tracking ──
+    repair_count: int
+    repaired_issue_codes: set[str]
+    best_quality_score: int
+    best_trip_plan: Optional[TripPlan]
+    dirty_enrichments: set[str]
 
 
 class TripPlanningAgentGraph:
@@ -71,6 +82,8 @@ class TripPlanningAgentGraph:
             graph.add_node("fallback", self._fallback_node)
             graph.add_node("enrich", self._enrich_node)
             graph.add_node("quality", self._quality_node)
+            graph.add_node("repair_quality", self._repair_quality_node)
+            graph.add_node("refresh_enrichment", self._refresh_enrichment_node)
             graph.set_entry_point("discovery")
             graph.add_conditional_edges(
                 "discovery",
@@ -99,7 +112,18 @@ class TripPlanningAgentGraph:
             )
             graph.add_edge("fallback", "enrich")
             graph.add_edge("enrich", "quality")
-            graph.add_edge("quality", END)
+            # quality → after_quality → [repair_quality | END]
+            graph.add_conditional_edges(
+                "quality",
+                self._after_quality,
+                {
+                    "repair_quality": "repair_quality",
+                    "end": END,
+                },
+            )
+            # repair_quality → refresh_enrichment → quality
+            graph.add_edge("repair_quality", "refresh_enrichment")
+            graph.add_edge("refresh_enrichment", "quality")
             return True, graph.compile()
         except TripGenerationCancelledError:
             raise
@@ -125,16 +149,19 @@ class TripPlanningAgentGraph:
             "repairable": False,
             "grounded": False,
             "runtime": runtime,
+            # quality repair tracking
+            "repair_count": 0,
+            "repaired_issue_codes": set(),
+            "best_quality_score": 0,
+            "best_trip_plan": None,
+            "dirty_enrichments": set(),
         }
         self._check_cancelled(initial)
         if self._compiled_graph is None:
             return self._run_sequential(initial)
         try:
             result = self._compiled_graph.invoke(initial)
-            plan = result.get("trip_plan")
-            if isinstance(plan, TripPlan):
-                return plan
-            raise RuntimeError("trip graph returned no plan")
+            return self._select_final_plan(result)
         except TripGenerationCancelledError:
             raise
         except Exception as exc:
@@ -159,7 +186,50 @@ class TripPlanningAgentGraph:
             state.update(self._fallback_node(state))
         state.update(self._enrich_node(state))
         state.update(self._quality_node(state))
-        return state["trip_plan"]
+        # Sequential quality repair loop (same routing as the graph edges).
+        for _ in range(self._MAX_QUALITY_REPAIRS):
+            if self._after_quality(state) == "end":
+                break
+            state.update(self._repair_quality_node(state))
+            state.update(self._refresh_enrichment_node(state))
+            state.update(self._quality_node(state))
+        return self._select_final_plan(state)
+
+    @staticmethod
+    def _plan_rank(plan: Optional[TripPlan]) -> tuple[int, int, int]:
+        """Order plans by deliverability first, score second.
+
+        Score alone is not a total order over "goodness": a repair round can
+        raise the score while introducing a blocking issue, so ranking on the
+        number would let a rejected plan displace a deliverable one.
+        """
+        quality = getattr(plan, "quality", None) if plan is not None else None
+        if quality is None:
+            return (-1, -1, -1)
+        not_blocked = int(
+            str(getattr(quality, "quality_status", "blocked")) != "blocked"
+        )
+        no_errors = int(
+            not any(issue.severity == "error" for issue in quality.issues)
+        )
+        return (not_blocked, no_errors, int(quality.score))
+
+    @classmethod
+    def _select_final_plan(cls, state: TripPlanningState) -> TripPlan:
+        """Pick the final answer, restoring the best repair-round snapshot.
+
+        The repair loop can legitimately end on a plan that ranks lower than
+        an earlier round; in that case the tracked best snapshot (including
+        its own quality report) is returned instead.
+        """
+        plan = state.get("trip_plan")
+        best = state.get("best_trip_plan")
+        if isinstance(plan, TripPlan) and isinstance(best, TripPlan):
+            if cls._plan_rank(best) > cls._plan_rank(plan):
+                return best
+        if isinstance(plan, TripPlan):
+            return plan
+        raise RuntimeError("trip graph returned no plan")
 
     def _recover_from_checkpoint(self, initial: TripPlanningState) -> TripPlan:
         """Finish safely after a late LangGraph/framework failure.
@@ -182,7 +252,7 @@ class TripPlanningAgentGraph:
             and isinstance(plan, TripPlan)
             and isinstance(plan.quality, TripPlanQualityResult)
         ):
-            return plan
+            return self._select_final_plan(state)
 
         if not state.get("parsed") and state.get("model_ready"):
             state.update(self._parse_node(state))
@@ -199,7 +269,7 @@ class TripPlanningAgentGraph:
             state.update(self._enrich_node(state))
         if "quality" not in completed_stages:
             state.update(self._quality_node(state))
-        return state["trip_plan"]
+        return self._select_final_plan(state)
 
     def _discovery_node(self, state: TripPlanningState) -> dict:
         request = state["request"]
@@ -702,7 +772,8 @@ class TripPlanningAgentGraph:
             except Exception as exc:
                 plan = before_stage
                 logger.info(
-                    f"[trip_graph] budget enrichment failed: {type(exc).__name__}"
+                    "[trip_graph] budget enrichment failed: %s: %s",
+                    type(exc).__name__, exc,
                 )
                 enrichment_errors.append(f"budget:{type(exc).__name__}")
             self._checkpoint_enrichment_stage(
@@ -834,24 +905,28 @@ class TripPlanningAgentGraph:
                     plan.quality.readiness_score = max(
                         0, plan.quality.readiness_score - 6
                     )
-            # Align with reviewable quality service: do not re-impose score>=75.
-            # Soft enrichment failures request review; only blocking issues unpublish.
-            from ...services.trip_plan_quality_service import issue_disposition
-
-            if enrichment_errors:
-                plan.quality.review_required = True
-            has_blocking = any(
-                issue_disposition(issue) == "blocking"
-                or str(getattr(issue, "severity", "")).strip().lower() == "error"
-                for issue in plan.quality.issues
+            # Recompute the unified gate triple after the score/issue
+            # mutations above; partial enrichment demotes the plan without
+            # fabricating an error issue.
+            refresh_quality_gate(
+                plan.quality,
+                generation_mode=plan.generation_mode,
+                force_unpublishable=bool(enrichment_errors),
             )
-            if has_blocking:
-                plan.quality.publishable = False
-                plan.quality.review_required = True
-                plan.quality.status = "failed"
-            elif not plan.quality.publishable:
-                # Keep service decision; ensure review flag for non-clean plans.
-                plan.quality.review_required = True
+            blocking_codes = sorted(
+                issue.code for issue in plan.quality.issues
+                if issue.severity == "error"
+            )
+            logger.info(
+                "[trip_graph] quality evaluation complete: "
+                "score=%d, threshold=75, publishable=%s, "
+                "blocking_codes=%s, total_issues=%d, status=%s",
+                plan.quality.score,
+                plan.quality.publishable,
+                blocking_codes if blocking_codes else "none",
+                len(plan.quality.issues),
+                plan.quality.status,
+            )
         except TripGenerationCancelledError:
             raise
         except Exception as exc:
@@ -882,7 +957,472 @@ class TripPlanningAgentGraph:
                 "generation_mode": plan.generation_mode,
             },
         )
-        return self._record_result(state, "quality", {"trip_plan": plan})
+        updates: dict[str, Any] = {"trip_plan": plan}
+        # Track the best plan across repair rounds via the node return value
+        # (edge predicates cannot persist state), so the loop can never end on
+        # a worse plan than an earlier round. Ranked by deliverability first:
+        # a blocked round must never displace a deliverable snapshot, however
+        # much its raw score improved.
+        best_plan = state.get("best_trip_plan")
+        if not isinstance(best_plan, TripPlan) or self._plan_rank(
+            plan
+        ) > self._plan_rank(best_plan):
+            updates["best_quality_score"] = plan.quality.score if plan.quality else 0
+            updates["best_trip_plan"] = plan.model_copy(deep=True)
+        return self._record_result(state, "quality", updates)
+
+    # ── quality repair loop ────────────────────────────────────────────
+
+    # Issues that can be auto-repaired in the deterministic repair node.
+    _REPAIRABLE_ISSUES: frozenset[str] = frozenset({
+        "DAY_SCHEDULE_OVERLOAD",
+        "DAY_UNDERFILLED",
+        "TOO_MANY_MUSEUMS",
+        "TOO_MANY_PARKS",
+        "ATTRACTION_TYPE_CONCENTRATION",
+    })
+
+    # Hard bound for quality-repair rounds, shared by the LangGraph edge
+    # predicate and the sequential fallback loop.
+    _MAX_QUALITY_REPAIRS: int = 2
+
+    def _after_quality(self, state: TripPlanningState) -> str:
+        """Route: repair if score < 75 with no blocking issues, else end.
+
+        This is a conditional-edge predicate: it must stay read-only.
+        LangGraph never merges ``state[...] = ...`` writes made here back
+        into the graph channels, so any tracking belongs in node returns.
+        """
+        plan = state.get("trip_plan")
+        quality = getattr(plan, "quality", None) if isinstance(plan, TripPlan) else None
+        if quality is None:
+            return "end"
+
+        quality_status = getattr(quality, "quality_status", "blocked")
+        repair_count = int(state.get("repair_count", 0))
+        max_repairs = self._MAX_QUALITY_REPAIRS
+
+        if quality_status != "needs_review":
+            logger.info(
+                "[trip_graph] quality gate: status=%s, score=%d, "
+                "repair_count=%d — skipping repair",
+                quality_status, quality.score, repair_count,
+            )
+            return "end"
+
+        if repair_count >= max_repairs:
+            logger.info(
+                "[trip_graph] quality repair: max rounds (%d) reached, "
+                "score=%d",
+                max_repairs, quality.score,
+            )
+            return "end"
+
+        repairable = [
+            i for i in quality.issues
+            if i.code in self._REPAIRABLE_ISSUES
+        ]
+        if not repairable:
+            logger.info(
+                "[trip_graph] quality repair: score=%d < 75 but no "
+                "repairable issues found",
+                quality.score,
+            )
+            return "end"
+
+        logger.info(
+            "[trip_graph] quality repair round %d: score=%d, "
+            "repairable_issues=%s",
+            repair_count + 1, quality.score,
+            sorted({i.code for i in repairable}),
+        )
+        return "repair_quality"
+
+    def _repair_quality_node(self, state: TripPlanningState) -> dict:
+        """Deterministic quality repair — no LLM calls.
+
+        All loop-tracking state (``repair_count``, ``repaired_issue_codes``,
+        ``dirty_enrichments``) is communicated exclusively through the
+        returned update dict so it merges into the LangGraph channels.
+        """
+        self._check_cancelled(state)
+        plan = state["trip_plan"]
+        quality = plan.quality
+        repair_count = int(state.get("repair_count", 0))
+        repaired = set(state.get("repaired_issue_codes") or ())
+        dirty: set[str] = set()
+        actions: list[str] = []
+
+        self._progress(
+            state, "repairing", 94,
+            f"正在优化行程质量（第{repair_count + 1}轮）…",
+            "自动调整景点安排、时间分配和类型平衡。",
+            {},
+        )
+
+        # Repair DAY_SCHEDULE_OVERLOAD: drop lowest-priority attraction
+        # from the most overloaded day.
+        overload_issues = [
+            i for i in quality.issues
+            if i.code == "DAY_SCHEDULE_OVERLOAD"
+            and i.code not in repaired
+        ]
+        if overload_issues:
+            plan = self._repair_overload(plan, actions)
+            dirty.add("routes")
+
+        # Repair DAY_UNDERFILLED: add an attraction from the verified
+        # discovery pool on an underfilled non-edge day.
+        underfill_issues = [
+            i for i in quality.issues
+            if i.code == "DAY_UNDERFILLED"
+            and i.code not in repaired
+        ]
+        if underfill_issues:
+            plan = self._repair_underfill(state, plan, actions)
+            dirty.add("routes")
+
+        # Repair museum/park caps.
+        for code in ("TOO_MANY_MUSEUMS", "TOO_MANY_PARKS"):
+            cap_issues = [
+                i for i in quality.issues
+                if i.code == code and i.code not in repaired
+            ]
+            if cap_issues:
+                plan = self._repair_cap(plan, code, actions)
+                dirty.add("routes")
+
+        # Repair concentration when it conflicts with preferences.
+        conc_issues = [
+            i for i in quality.issues
+            if i.code == "ATTRACTION_TYPE_CONCENTRATION"
+            and i.code not in repaired
+        ]
+        if conc_issues:
+            plan = self._repair_concentration(state, plan, actions)
+            dirty.add("routes")
+
+        if not actions:
+            logger.info(
+                "[trip_graph] repair: no action taken — "
+                "all repairable issues already attempted"
+            )
+            return {"trip_plan": plan, "repair_count": repair_count + 1}
+
+        for code in {i.code for i in quality.issues
+                     if i.code in self._REPAIRABLE_ISSUES}:
+            repaired.add(code)
+        dirty.add("budget")
+        # Hotel distance may change when attractions change.
+        dirty.add("hotel_distance")
+        # Web guide consistency may be affected by attraction changes.
+        dirty.add("web_guide")
+
+        logger.info(
+            "[trip_graph] repair actions: %s, dirty=%s",
+            "; ".join(actions), sorted(dirty),
+        )
+        return {
+            "trip_plan": plan,
+            "repair_count": repair_count + 1,
+            "repaired_issue_codes": repaired,
+            "dirty_enrichments": dirty,
+        }
+
+    @staticmethod
+    def _build_attraction_from_poi(poi: Any, visit_duration: int = 120) -> Attraction:
+        """Build an Attraction from a discovered POI with admin metadata."""
+        return Attraction(
+            name=str(getattr(poi, "name", "") or ""),
+            address=str(getattr(poi, "address", "") or ""),
+            location=getattr(poi, "location", None),
+            visit_duration=visit_duration,
+            description=str(getattr(poi, "type", "") or ""),
+            category=str(getattr(poi, "type", "") or ""),
+            poi_id=str(getattr(poi, "id", "") or ""),
+            coordinate_source="amap_poi",
+            verification=VerificationMeta(
+                cityname=str(getattr(poi, "cityname", "") or ""),
+                citycode=str(getattr(poi, "citycode", "") or ""),
+                adname=str(getattr(poi, "district", "") or ""),
+                adcode=str(getattr(poi, "adcode", "") or ""),
+            ),
+        )
+
+    def _repair_overload(
+        self, plan: TripPlan, actions: list[str],
+    ) -> TripPlan:
+        """Remove the lowest-priority attraction from the most overloaded day."""
+        target_day = None
+        max_duration = 0
+        for day in plan.days:
+            total = sum(
+                max(0, a.visit_duration or 0)
+                for a in (day.attractions or [])
+            )
+            if total > max_duration and len(day.attractions or []) > 1:
+                max_duration = total
+                target_day = day
+        if target_day is None or not target_day.attractions:
+            return plan
+
+        # Drop the attraction with the lowest visit_duration (least impact).
+        dropped = min(
+            target_day.attractions,
+            key=lambda a: max(0, a.visit_duration or 0),
+        )
+        target_day.attractions = [
+            a for a in target_day.attractions if a is not dropped
+        ]
+        actions.append(
+            f"第{target_day.day_index + 1}天移除低优先级景点「{dropped.name}」"
+            "以缓解日程过载"
+        )
+        return plan
+
+    def _repair_underfill(
+        self, state: TripPlanningState, plan: TripPlan, actions: list[str],
+    ) -> TripPlan:
+        """Try to add an attraction from the verified pool to an underfilled day."""
+        request = state["request"]
+        attraction_pool: list = state.get("attraction_pois") or []
+        if not attraction_pool:
+            return plan
+
+        # Find the most underfilled non-edge day (or edge day if only edge days).
+        target = None
+        max_gap = 0
+        for day in plan.days:
+            current = sum(
+                max(0, a.visit_duration or 0)
+                for a in (day.attractions or [])
+            )
+            # Edge days with cross-city travel have lower underfill threshold
+            # set by the quality service — target the biggest absolute gap.
+            gap = max(0, 180 - current)
+            if gap > max_gap:
+                max_gap = gap
+                target = day
+        if target is None or max_gap <= 0:
+            return plan
+
+        existing_names = {
+            a.name for a in (target.attractions or [])
+        }
+        for poi in attraction_pool:
+            poi_name = getattr(poi, "name", "") or ""
+            if not poi_name or poi_name in existing_names:
+                continue
+            if not self._poi_matches_destination(request, poi):
+                continue
+            target.attractions.append(
+                self._build_attraction_from_poi(poi, visit_duration=120)
+            )
+            actions.append(
+                f"第{target.day_index + 1}天补充景点「{poi_name}」"
+                "以丰富当日行程"
+            )
+            break
+        return plan
+
+    def _repair_cap(
+        self, plan: TripPlan, code: str, actions: list[str],
+    ) -> TripPlan:
+        """Reduce museum/park count by dropping one excess item."""
+        marker_map = {
+            "TOO_MANY_MUSEUMS": ("博物馆", "美术馆", "艺术馆", "纪念馆", "科技馆", "展览馆"),
+            "TOO_MANY_PARKS": ("公园", "绿道", "湿地", "植物园"),
+        }
+        markers = marker_map.get(code, ())
+        cap_map = {"TOO_MANY_MUSEUMS": 3, "TOO_MANY_PARKS": 4}
+
+        all_attrs = [(day, a) for day in plan.days for a in (day.attractions or [])]
+        matches = [
+            (day, a) for day, a in all_attrs
+            if any(m in f"{a.name} {a.category or ''}" for m in markers)
+        ]
+        limit = cap_map.get(code, 99)
+        if len(matches) <= limit:
+            return plan
+
+        # Drop the last excess item that is not the only thing on its day —
+        # emptying a day raises EMPTY_DAY, a blocking issue worse than the
+        # cap violation this repair is meant to relieve.
+        droppable = [
+            (day, attraction)
+            for day, attraction in matches
+            if len(day.attractions or []) > 1
+        ]
+        if not droppable:
+            return plan
+        day, dropped = droppable[-1]
+        day.attractions = [a for a in (day.attractions or []) if a is not dropped]
+        label = "博物馆" if code == "TOO_MANY_MUSEUMS" else "公园"
+        actions.append(
+            f"第{day.day_index + 1}天移除超量{label}「{dropped.name}」"
+        )
+        return plan
+
+    def _repair_concentration(
+        self, state: TripPlanningState, plan: TripPlan, actions: list[str],
+    ) -> TripPlan:
+        """Swap one attraction to a different category."""
+        request = state["request"]
+        all_attrs = [(day, a) for day in plan.days for a in (day.attractions or [])]
+        if len(all_attrs) < 2:
+            return plan
+
+        # Find the dominant category and swap the last item in that category.
+        category_counts: dict[str, int] = {}
+        for _, a in all_attrs:
+            cat = self._category_for_repair(a)
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+        dominant = max(category_counts, key=category_counts.get)
+        pool = state.get("attraction_pois") or []
+        existing_names = {a.name for _, a in all_attrs}
+
+        for day, a in reversed(all_attrs):
+            if self._category_for_repair(a) != dominant:
+                continue
+            for poi in pool:
+                poi_name = getattr(poi, "name", "") or ""
+                poi_type = getattr(poi, "type", "") or ""
+                if poi_name in existing_names:
+                    continue
+                if self._category_for_repair(Attraction(
+                    name=poi_name, address="", location=None,
+                    visit_duration=0, description="",
+                    category=poi_type,
+                )) == dominant:
+                    continue
+                if not self._poi_matches_destination(request, poi):
+                    continue
+                # Found a different-category replacement.
+                replacement = self._build_attraction_from_poi(
+                    poi, visit_duration=a.visit_duration,
+                )
+                day.attractions = [
+                    replacement if x is a else x
+                    for x in (day.attractions or [])
+                ]
+                actions.append(
+                    f"第{day.day_index + 1}天将「{a.name}」替换为"
+                    f"「{poi_name}」以增加类型多样性"
+                )
+                return plan
+        return plan
+
+    def _poi_matches_destination(
+        self, request: TripRequest, poi: Any,
+    ) -> bool:
+        """Return True if *poi* plausibly belongs to the destination city.
+
+        Uses the shared ``poi_destination_status`` with both the POI
+        address and district fields.  Only ``"matched"`` is accepted.
+        ``"mismatched"`` and ``"unknown"`` are rejected.
+        """
+        from ...services.destination_feasibility_service import poi_destination_status
+
+        dest = request.city
+        poi_address = str(getattr(poi, "address", "") or "")
+        poi_name = str(getattr(poi, "name", "") or "")
+        poi_cityname = str(getattr(poi, "cityname", "") or "")
+        poi_citycode = str(getattr(poi, "citycode", "") or "")
+        poi_adname = str(getattr(poi, "district", "") or "")
+        poi_adcode = str(getattr(poi, "adcode", "") or "")
+
+        result = poi_destination_status(
+            destination_city=dest,
+            cityname=poi_cityname,
+            citycode=poi_citycode,
+            adname=poi_adname,
+            adcode=poi_adcode,
+            address=poi_address,
+            name=poi_name,
+        )
+        if result == "matched":
+            return True
+        if result == "mismatched":
+            return False
+
+        logger.info(
+            "[trip_graph] repair candidate rejected: "
+            "poi=%r cityname=%r adname=%r address=%s — status=%s for dest=%r",
+            poi_name, poi_cityname, poi_adname,
+            (poi_address or "")[:40], result, dest,
+        )
+        return False
+
+    @staticmethod
+    def _category_for_repair(attr: Any) -> str:
+        """Simplified category for repair matching."""
+        text = f"{getattr(attr, 'name', '') or ''} "
+        text += f"{getattr(attr, 'category', '') or ''}"
+        if any(m in text for m in ("博物馆", "美术馆", "艺术馆", "纪念馆", "科技馆")):
+            return "museum"
+        if any(m in text for m in ("公园", "园林", "湿地", "植物园", "绿道", "山", "湖", "瀑布")):
+            return "nature"
+        if any(m in text for m in ("寺", "庙", "祠", "塔", "遗址", "古城", "古镇", "城墙", "文化")):
+            return "culture"
+        if any(m in text for m in ("街区", "街", "步行街", "购物", "广场", "商圈")):
+            return "street"
+        return "other"
+
+    def _refresh_enrichment_node(self, state: TripPlanningState) -> dict:
+        """Re-compute enrichment data that was invalidated by repairs."""
+        self._check_cancelled(state)
+        request = state["request"]
+        plan = state["trip_plan"]
+        dirty: set[str] = state.get("dirty_enrichments") or set()
+        if not dirty:
+            return {"trip_plan": plan}
+
+        self._progress(
+            state, "repairing", 96,
+            "正在重新计算路线和预算…",
+            "根据修改后的行程更新路线、预算和酒店校验。",
+            {},
+        )
+
+        # Routes change when attraction set changes.
+        if dirty.intersection({"routes", "hotel_distance"}):
+            try:
+                candidate = self.planner._apply_route_planning(request, plan)
+                if isinstance(candidate, TripPlan):
+                    plan = candidate
+            except Exception as exc:
+                logger.info(
+                    "[trip_graph] repair route refresh failed: %s",
+                    type(exc).__name__,
+                )
+
+        # Budget changes when attractions or hotel change.
+        enrichment_errors = list(state.get("enrichment_errors") or [])
+        if dirty.intersection({"routes", "budget", "hotel_distance"}):
+            # Keep the previous budget: BUDGET_MISSING is a blocking code, so
+            # clearing it and then failing would turn a transient estimator
+            # outage into a hard rejection of an otherwise deliverable plan.
+            before_stage = plan.model_copy(deep=True)
+            plan.budget = None
+            try:
+                candidate = self.planner._apply_budget_estimate(request, plan)
+                if isinstance(candidate, TripPlan):
+                    plan = candidate
+            except Exception as exc:
+                plan = before_stage
+                logger.info(
+                    "[trip_graph] repair budget refresh failed: %s",
+                    type(exc).__name__,
+                )
+                # Surface the degradation so the quality gate demotes the plan
+                # instead of silently publishing a stale budget.
+                enrichment_errors.append(f"budget:{type(exc).__name__}")
+
+        return {
+            "trip_plan": plan,
+            "dirty_enrichments": set(),
+            "enrichment_errors": enrichment_errors,
+        }
 
     def _after_discovery(self, state: TripPlanningState) -> str:
         return "compose" if state.get("context_ready") else "fallback"

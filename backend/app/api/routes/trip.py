@@ -24,24 +24,37 @@ from ...models.schemas import (
     Attraction,
     TripRequest,
     TripPlan,
+    TripPlanQualityIssue,
     TripPlanResponse,
     ErrorResponse
 )
-from ...agents.trip_planner_agent import get_trip_planner_agent
+from ...agents.trip_planner_agent import (
+    get_trip_planner_agent,
+    planner_is_initialized,
+)
 from ...services.trip_generation_errors import (
     TripGenerationCancelledError,
     TripPlanQualityRejectedError,
 )
 from ...services.auth_service import AuthenticatedUser
 from ...services.destination_feasibility_service import get_destination_feasibility_service
-from ...services.semantic_contract_service import collect_semantic_hard_block_issues
+from ...services.contract_token_service import verify_contract_token
+from ...services.semantic_contract_service import (
+    build_generation_contract,
+    collect_hard_block_issues_for_contract,
+    user_acknowledged_contract_risks,
+)
 from ...services.trip_email_service import deliver_trip_plan_email
 from ...services.travel_plan_data_service import get_travel_plan_data_service
-from ...services.trip_plan_quality_service import get_trip_plan_quality_service
+from ...services.trip_plan_quality_service import (
+    get_trip_plan_quality_service,
+    resolve_plan_quality_status,
+)
 from ...services.web_push_service import notify_trip_plan_ready
 from ...services.trip_generation_job_service import (
     TripGenerationCancellationToken,
     TripGenerationCapacityError,
+    generation_capacity_snapshot,
     get_trip_generation_job_service,
     run_with_generation_capacity,
 )
@@ -53,11 +66,18 @@ class UntrustedTripEditError(ValueError):
     """Client attempted to forge server-owned plan facts or add unverified POIs."""
 
 
-def _validate_generation_request(request: TripRequest) -> None:
+def _validate_generation_request(
+    request: TripRequest,
+    current_user: AuthenticatedUser | None = None,
+) -> TripRequest:
     """Reject unusable generation inputs before agent work starts.
 
     Covers civil past dates, unresolved semantic hard-blocks, and auto-
     recommended destinations that violate short-trip feasibility.
+
+    Returns the request with the server-built semantic contract attached —
+    the single construction point for the whole request lifecycle; every
+    downstream reader (planner, quality gate) reuses this contract.
     """
     try:
         start = date.fromisoformat(str(request.start_date))
@@ -72,17 +92,38 @@ def _validate_generation_request(request: TripRequest) -> None:
             detail="出行开始日期不能早于今天。",
         )
 
+    # A verified recommendation token contributes the session contract as
+    # merge base; any verification defect silently means "no token".
+    session_contract = None
+    raw_token = str(getattr(request, "recommendation_token", "") or "")
+    if raw_token:
+        session_contract = verify_contract_token(
+            raw_token,
+            subject=(
+                f"user:{current_user.user_id}"
+                if current_user is not None
+                else "anon"
+            ),
+        )
+
+    request, message_contract = build_generation_contract(
+        request, session_contract=session_contract
+    )
+
     settings = get_settings()
     if bool(getattr(settings, "semantic_contract_hard_block_enabled", True)):
-        issues = collect_semantic_hard_block_issues(request)
-        if issues:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "存在未确认的关键约束冲突，请先确认后再生成。",
-                    "issues": issues,
-                },
+        if not user_acknowledged_contract_risks(request):
+            issues = collect_hard_block_issues_for_contract(
+                request, message_contract
             )
+            if issues:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "存在未确认的关键约束冲突，请先确认后再生成。",
+                        "issues": issues,
+                    },
+                )
 
     if str(getattr(request, "destination_source", "") or "") == "recommendation":
         assessment = get_destination_feasibility_service().assess(
@@ -96,6 +137,7 @@ def _validate_generation_request(request: TripRequest) -> None:
                 status_code=422,
                 detail=assessment.reason or "推荐目的地不在当前天数的可信短途圈内。",
             )
+    return request
 
 
 def _attraction_key(attraction: Attraction) -> str:
@@ -187,13 +229,56 @@ def _reject_identity_mutation(edited: TripPlan, existing: TripPlan) -> None:
             )
 
 
-def _quality_blocks_edit_save(quality) -> bool:
+def _mark_legacy_weak_validation(quality) -> None:
+    """Product rule for rows without a generation-time request snapshot.
+
+    Editing and saving stay allowed, but the weaker context must be
+    visible and can never silently upgrade the plan to publishable; the
+    user is told a regenerate restores the full quality gate.
+    """
     if quality is None:
-        return True
+        return
+    quality.validation_mode = "legacy_weak"
+    if not any(
+        getattr(issue, "code", "") == "LEGACY_WEAK_VALIDATION"
+        for issue in quality.issues
+    ):
+        quality.issues.append(
+            TripPlanQualityIssue(
+                code="LEGACY_WEAK_VALIDATION",
+                severity="info",
+                path="quality",
+                message="该行程缺少生成时的完整请求快照，本次为弱校验。",
+                suggestion="重新生成行程可获得完整质量校验。",
+            )
+        )
+    # Weak-context results must never present as review-free: force the
+    # review flag (saving stays allowed under the reviewable model).
+    quality.review_required = True
+    if quality.quality_status == "publishable":
+        quality.quality_status = "needs_review"
+
+
+def can_save_user_draft(quality) -> bool:
+    """Whether a user-edited plan may be stored as their own draft.
+
+    This is a **draft-save** policy, deliberately laxer than publishability,
+    and it is not a fourth ``quality_status`` derivation: publishability is
+    decided solely by ``resolve_plan_quality_status``. A plan the gate calls
+    ``needs_review`` is still the user's own work and stays savable; only a
+    failed evaluation or an error-severity issue is refused.
+
+    Saving a draft never implies the plan may be published, and never relaxes
+    the identity, ownership or unforgeable-field checks that run before it
+    (``_reject_identity_mutation``, ``_restore_verified_plan_facts``, the
+    owner-scoped lookup and the If-Match revision guard).
+    """
+    if quality is None:
+        return False
     status = str(getattr(quality, "status", "") or "").strip().lower()
     if status == "failed":
-        return True
-    return any(
+        return False
+    return not any(
         str(getattr(issue, "severity", "") or "").strip().lower() == "error"
         for issue in (getattr(quality, "issues", None) or [])
     )
@@ -357,34 +442,79 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
 
 
 def _plan_is_publishable(plan: TripPlan) -> bool:
-    """True when quality allows delivery (including reviewable warnings)."""
-    quality = plan.quality
-    if quality is None:
-        return False
-    from ...services.trip_plan_quality_service import issue_disposition
-    return bool(
-        quality.publishable
-        and quality.status in {"passed", "warning", "review"}
-        and not any(
-            issue_disposition(issue) == "blocking"
-            for issue in (quality.issues or [])
-        )
-    )
+    """Legacy helper: true only when the unified gate says publishable."""
+    return _resolve_quality_status(plan) == "publishable"
 
 
-def _derived_quality_status(plan: TripPlan) -> str:
-    """Internal compatibility label only — not a second source of truth.
+def _resolve_quality_status(plan: TripPlan) -> str:
+    """Delegate to the quality service's unified gate resolver."""
+    return resolve_plan_quality_status(plan)
 
-    blocking → blocked
-    publishable + review_required → needs_review
-    publishable + not review_required → publishable
+
+def _email_delivery_for_plan(
+    request: TripRequest,
+    trip_plan: TripPlan,
+    plan_no: str | None,
+    current_user: AuthenticatedUser | None,
+    client_ip: str,
+) -> dict | None:
+    """Build the email delivery outcome for a generated plan.
+
+    Shared by the sync and job paths.  Never raises: notification failures
+    are reported inside the returned payload so they cannot affect the trip
+    result itself.
     """
-    quality = getattr(plan, "quality", None)
-    if quality is None or not _plan_is_publishable(plan):
-        return "blocked"
-    if bool(getattr(quality, "review_required", False)):
-        return "needs_review"
-    return "publishable"
+    if not request.email_on_completion:
+        return None
+    recipient = str(request.delivery_email or "").strip()
+    if current_user is None:
+        return {
+            "requested": True,
+            "sent": False,
+            "dry_run": False,
+            "to": recipient or None,
+            "message": "登录后才能发送旅行计划邮件。",
+        }
+    recipient = recipient or (current_user.email or "")
+    if not recipient:
+        return {
+            "requested": True,
+            "sent": False,
+            "dry_run": False,
+            "to": None,
+            "message": "请填写收件邮箱或先在账号中绑定邮箱。",
+        }
+    try:
+        return deliver_trip_plan_email(
+            recipient,
+            trip_plan,
+            plan_no,
+            user_id=current_user.user_id,
+            client_ip=client_ip,
+        )
+    except Exception as email_error:
+        print(
+            "[trip] email delivery failed (not critical): "
+            f"{type(email_error).__name__}"
+        )
+        return {
+            "requested": True,
+            "sent": False,
+            "dry_run": False,
+            "to": recipient,
+            "message": "邮件服务暂时不可用，行程已正常保存。",
+        }
+
+
+def _notify_push_safely(user_id: str, city: str, plan_no: str) -> None:
+    """Best-effort web push; failures must never affect the trip result."""
+    try:
+        notify_trip_plan_ready(user_id, city, plan_no)
+    except Exception as push_error:
+        print(
+            "[trip] push notify failed (not critical): "
+            f"{type(push_error).__name__}"
+        )
 
 
 def _job_owner(current_user: AuthenticatedUser | None, http_request: HttpRequest) -> str:
@@ -438,8 +568,9 @@ async def plan_trip(
     """
     try:
         # Reject past dates / hard semantic conflicts before rate-limit spend
-        # or expensive agent initialization.
-        _validate_generation_request(request)
+        # or expensive agent initialization; the returned request carries the
+        # server-built semantic contract for all downstream readers.
+        request = _validate_generation_request(request, current_user)
         # After auth + TripRequest validation: count only real generation creates.
         _enforce_trip_generation_rate_limit(http_request, current_user)
 
@@ -462,23 +593,22 @@ async def plan_trip(
 
         print("✅ 旅行计划生成成功,准备返回响应\n")
 
-        # Reviewable model: reject only non-publishable/blocking plans.
-        if not _plan_is_publishable(trip_plan):
+        quality_status = _resolve_quality_status(trip_plan)
+        needs_review = quality_status == "needs_review"
+        if quality_status == "blocked":
+            # Agent gate should already reject blocked plans; keep a hard stop.
             raise TripPlanQualityRejectedError(
                 quality=getattr(trip_plan, "quality", None),
                 plan=trip_plan,
             )
-        quality = getattr(trip_plan, "quality", None)
-        review_required = (
-            bool(getattr(quality, "review_required", False)) if quality else False
-        )
 
         plan_no = None
         try:
             if current_user is None:
                 print("[trip] anonymous request - generated plan will not be saved")
             else:
-                # warning + clean both may persist; blocking already rejected
+                # Reviewable-delivery model: needs_review plans persist too,
+                # carrying their quality notices; only blocked is rejected.
                 plan_no = get_travel_plan_data_service().save_trip_plan(
                     request,
                     trip_plan,
@@ -491,8 +621,11 @@ async def plan_trip(
             print(f"[trip] save travel plan skipped (not critical): {save_error}")
 
         if plan_no and current_user is not None:
+            # Wrapped, like the job path: a raw notifier raising inside a
+            # BackgroundTask surfaces as an unhandled ASGI exception after the
+            # body is already written.
             background_tasks.add_task(
-                notify_trip_plan_ready,
+                _notify_push_safely,
                 current_user.user_id,
                 trip_plan.city,
                 plan_no,
@@ -500,68 +633,40 @@ async def plan_trip(
 
         email_delivery = None
         if request.email_on_completion:
-            recipient = str(request.delivery_email or "").strip()
-            if current_user is None:
-                email_delivery = {
-                    "requested": True,
-                    "sent": False,
-                    "dry_run": False,
-                    "to": recipient or None,
-                    "message": "登录后才能发送旅行计划邮件。",
-                }
-            else:
-                recipient = recipient or (current_user.email or "")
-                if not recipient:
-                    email_delivery = {
-                        "requested": True,
-                        "sent": False,
-                        "dry_run": False,
-                        "to": None,
-                        "message": "请填写收件邮箱或先在账号中绑定邮箱。",
-                    }
-                else:
-                    try:
-                        email_delivery = await run_in_threadpool(
-                            deliver_trip_plan_email,
-                            recipient,
-                            trip_plan,
-                            plan_no,
-                            user_id=current_user.user_id,
-                            client_ip=(
-                                http_request.client.host
-                                if http_request.client
-                                else "unknown"
-                            ),
-                        )
-                    except Exception as email_error:
-                        print(
-                            "[trip] email delivery failed (not critical): "
-                            f"{type(email_error).__name__}"
-                        )
-                        email_delivery = {
-                            "requested": True,
-                            "sent": False,
-                            "dry_run": False,
-                            "to": recipient,
-                            "message": "邮件服务暂时不可用，行程已正常保存。",
-                        }
+            email_delivery = await run_in_threadpool(
+                _email_delivery_for_plan,
+                request,
+                trip_plan,
+                plan_no,
+                current_user,
+                http_request.client.host if http_request.client else "unknown",
+            )
 
         return TripPlanResponse(
             success=True,
             message=(
                 "行程已生成，以下事项需要你确认"
-                if review_required
+                if needs_review
                 else "旅行计划生成成功"
             ),
             data=trip_plan,
             plan_no=plan_no,
             email_delivery=email_delivery,
+            needs_review=needs_review,
+            quality_status=quality_status,
         )
 
     except TripPlanQualityRejectedError as exc:
         raise HTTPException(
             status_code=422,
             detail=_quality_rejection_detail(exc),
+        )
+    except TripGenerationCapacityError:
+        # Same contract as /plan-jobs: capacity pressure is a retryable 429,
+        # never a 500 with internal detail.
+        raise HTTPException(
+            status_code=429,
+            detail="当前规划任务较多，请等待已有任务完成后再试。",
         )
     except HTTPException:
         raise
@@ -711,12 +816,25 @@ async def update_trip_history(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     request_ctx = None
-    get_request = getattr(service, "get_trip_request", None)
-    if callable(get_request):
-        request_ctx = get_request(plan_no, current_user.user_id)
+    validation_mode = "legacy_weak"
+    get_request_ctx = getattr(service, "get_trip_request_with_context", None)
+    if callable(get_request_ctx):
+        request_ctx, validation_mode = get_request_ctx(
+            plan_no, current_user.user_id
+        )
+    else:
+        # Duck-typed services without the snapshot interface keep the
+        # pre-snapshot behavior; legacy_weak is only asserted when the
+        # real service explicitly reports a degraded context.
+        get_request = getattr(service, "get_trip_request", None)
+        if callable(get_request):
+            request_ctx = get_request(plan_no, current_user.user_id)
+            validation_mode = "full"
     if request_ctx is not None:
         plan.quality = get_trip_plan_quality_service().evaluate(request_ctx, plan)
-        if _quality_blocks_edit_save(plan.quality):
+        if validation_mode == "legacy_weak":
+            _mark_legacy_weak_validation(plan.quality)
+        if not can_save_user_draft(plan.quality):
             raise HTTPException(
                 status_code=422,
                 detail={
@@ -773,10 +891,11 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
-    _validate_generation_request(request)
+    request = _validate_generation_request(request, current_user)
     # After auth + TripRequest validation: shared create quota with /plan.
     _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)
+    client_ip = http_request.client.host if http_request.client else "unknown"
 
     def worker(progress):
         _raise_if_generation_cancelled(progress)
@@ -788,43 +907,45 @@ def create_trip_plan_job(
         )
         _raise_if_generation_cancelled(progress)
 
-        if not _plan_is_publishable(trip_plan):
+        quality_status = _resolve_quality_status(trip_plan)
+        if quality_status == "blocked":
             raise TripPlanQualityRejectedError(
                 quality=getattr(trip_plan, "quality", None),
                 plan=trip_plan,
             )
 
         quality = getattr(trip_plan, "quality", None)
-        review_required = (
-            bool(getattr(quality, "review_required", False)) if quality else False
-        )
+        needs_review = quality_status == "needs_review"
 
         plan_no = None
         if current_user is not None:
-            # Publishable includes reviewable warnings — still persist.
+            # Reviewable-delivery model: needs_review plans persist too,
+            # carrying their quality notices; only blocked was rejected.
             _begin_generation_finalization(progress)
             progress(
                 stage="finalizing",
                 progress=99,
                 message=(
-                    "正在安全保存并准备结果"
-                    if not review_required
-                    else "质量提示已生成，正在保存行程"
+                    "行程已生成，需要确认以下事项"
+                    if needs_review
+                    else "正在安全保存并准备结果"
                 ),
                 detail=(
-                    "质量检查已完成，正在保存行程。"
-                    if not review_required
-                    else (
-                        f"方案评分 {getattr(quality, 'score', 0)}/100，"
-                        "可交付但仍需复核。"
-                    )
+                    f"方案评分 {getattr(quality, 'score', 0)}/100，"
+                    "已保存，部分事项建议出发前复核。"
+                    if needs_review
+                    else "质量检查已完成，正在保存行程。"
                 ),
                 meta={
-                    "review_required": review_required,
-                    "quality_score": getattr(quality, "score", 0) if quality else 0,
+                    "quality_score": getattr(quality, "score", 0),
+                    "needs_review": needs_review,
                 },
             )
             _raise_if_generation_cancelled(progress)
+            # Deliberately unguarded, unlike the sync path: the job contract is
+            # "a completed job yields a retrievable plan_no", so a save failure
+            # must surface as a failed job rather than a result the user can
+            # never fetch again. Pinned by test_save_failure_does_not_complete.
             plan_no = get_travel_plan_data_service().save_trip_plan(
                 request,
                 trip_plan,
@@ -842,17 +963,31 @@ def create_trip_plan_job(
             )
 
         _raise_if_generation_cancelled(progress)
+
+        # Notifications mirror the sync path and run inside the worker
+        # thread; both helpers are failure-isolated so a broken SMTP or
+        # push provider can never fail the job or lose the plan result.
+        email_delivery = None
+        if request.email_on_completion:
+            email_delivery = _email_delivery_for_plan(
+                request, trip_plan, plan_no, current_user, client_ip
+            )
+        if plan_no and current_user is not None:
+            _notify_push_safely(current_user.user_id, trip_plan.city, plan_no)
+
         return jsonable_encoder(
             TripPlanResponse(
                 success=True,
                 message=(
                     "行程已生成，以下事项需要你确认"
-                    if review_required
+                    if needs_review
                     else "旅行计划生成成功"
                 ),
                 data=trip_plan,
                 plan_no=plan_no,
-                email_delivery=None,
+                email_delivery=email_delivery,
+                needs_review=needs_review,
+                quality_status=quality_status,
             )
         )
 
@@ -961,37 +1096,41 @@ def cancel_trip_plan_job(
     summary="健康检查",
     description="检查旅行规划服务是否正常"
 )
-async def health_check():
-    """健康检查"""
+async def health_check(http_request: HttpRequest):
+    """Liveness only: minimal, cheap, and rate limited.
+
+    The endpoint is public, so it deliberately reveals nothing about the search
+    provider, the pipeline shape or live capacity, and it never constructs the
+    planner — a cold-start flood would otherwise pin every threadpool worker on
+    ``_multi_agent_planner_lock`` and starve real generation requests.
+    Detailed diagnostics belong on an authenticated internal endpoint.
+    """
+    settings = get_settings()
+    retry_after = get_request_rate_limit_service(http_request).check(
+        "service-health",
+        f"ip:{_normalize_client_ip(http_request.client.host if http_request.client else None)}",
+        limit=max(1, int(getattr(settings, "health_rate_limit", 30) or 30)),
+        window_seconds=max(
+            1, int(getattr(settings, "health_rate_window_seconds", 60) or 60)
+        ),
+    )
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后重试。",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     try:
-        # 检查Agent是否可用
-        agent = get_trip_planner_agent()
-        
+        # Read the singleton without building it: this reports readiness, not
+        # the health of a planner we would have to pay to construct.
         return {
             "status": "healthy",
             "service": "trip-planner",
-            "agents": {
-                "attraction": {
-                    "name": agent.attraction_agent.name,
-                    "tools_count": len(agent.attraction_agent.list_tools())
-                },
-                "weather": {
-                    "name": agent.weather_agent.name,
-                    "tools_count": len(agent.weather_agent.list_tools())
-                },
-                "hotel": {
-                    "name": agent.hotel_agent.name,
-                    "tools_count": len(agent.hotel_agent.list_tools())
-                },
-                "planner": {
-                    "name": agent.planner_agent.name,
-                    "tools_count": len(agent.planner_agent.list_tools())
-                },
-                "web_guide": agent.web_guide_agent.status()
-            }
+            "version": str(getattr(settings, "app_version", "") or ""),
+            "planner_initialized": planner_is_initialized(),
         }
     except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"服务不可用: {str(e)}"
-        )
+        # Never leak provider/internal details through a public endpoint.
+        print(f"[trip] health check failed: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="服务不可用")

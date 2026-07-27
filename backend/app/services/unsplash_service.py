@@ -55,7 +55,7 @@ class UnsplashService:
             return photos
 
         except Exception as e:
-            print(f"Unsplash search failed: {type(e).__name__}: {e}")
+            print(f"Unsplash search failed: {type(e).__name__}")
             return []
     
     def get_photo_url(self, query: str) -> Optional[str]:

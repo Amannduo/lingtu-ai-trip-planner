@@ -23,7 +23,13 @@ from ..models.schemas import (
     TripRequest,
 )
 from .business_calendar import resolve_business_date
-from .city_mention_service import extract_mentioned_destination
+from .city_mention_service import (
+    NEGATION_FILLER,
+    NEGATOR_ALTERNATION,
+    extract_mentioned_destination,
+    is_negated_at,
+    known_destination_cities,
+)
 
 
 NUMBER_WORDS = {
@@ -62,6 +68,191 @@ EARLY_ARRIVAL_HINT_DEFAULT = (
     "建议周五下午或傍晚出发，提前抵达后休息或在酒店周边简单活动，周六再开始完整游玩。"
 )
 WEEKEND_MARKERS = ("下周末", "这个周末", "这周末", "本周末", "周末")
+
+# Labels of the machine-authored block the recommender writes into
+# ``free_text_input``. That block is system output, not a user utterance —
+# re-parsing it made the advisory line "建议周五下午出发" look like an explicit
+# Friday departure and silently expanded a 2-day weekend into 3 days.
+MACHINE_FREE_TEXT_LABELS = (
+    "目的地",
+    "约束",
+    "时段",
+    "抵达建议",
+    "同行",
+    "理由",
+    "出发",
+    "城际",
+    "优先",
+    "范围",
+    "排除",
+)
+_MACHINE_LABEL_ALTERNATION = "|".join(MACHINE_FREE_TEXT_LABELS)
+_MACHINE_LABEL_RE = re.compile(r"【(" + _MACHINE_LABEL_ALTERNATION + r")】")
+# A machine segment runs to the next 【 or end of line, so an inline block is
+# stripped as reliably as a line-per-label one.
+_MACHINE_SEGMENT_RE = re.compile(
+    r"【(?:" + _MACHINE_LABEL_ALTERNATION + r")】[^【\n]*"
+)
+_USER_QUOTE_RE = re.compile(r"【原文】[ \t]*([^【\n]*)")
+# The recommender always writes every label plus 【原文】. Below that, the text
+# is user-authored and must be left alone.
+_MACHINE_BLOCK_MIN_LABELS = 3
+
+# Longest marker first, in ONE alternation: otherwise the bare 周末 inside an
+# already-negated 下周末 is re-tested with the negator outside its window.
+_WEEKEND_MARKER_RE = re.compile(
+    "|".join(sorted(WEEKEND_MARKERS, key=len, reverse=True))
+)
+
+_SEPARABLE_VERB_RE = re.compile(r"(避|散|透|逛|歇|玩|睡|吃)个(?=[暑步气街脚够觉饭])")
+
+# A date only outranks a weekend window when it reads as the travel date;
+# "这个周末出去玩，8月1号之前得定好" is a deadline, not a departure.
+_DATE_CORE = r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})[日号]"
+_ANY_DATE_RE = re.compile(_DATE_CORE)
+_DATE_CHANGE_PREFIX = r"(?:改成|改到|改为|推到|挪到|定在|定为)"
+# Weak verbs (去/到/开始/走) only count as departure when the sentence is
+# explicitly rescheduling: "我8月10号去上海出差，这个周末想在附近转转" is not a
+# departure date, and must not cancel the requested weekend.
+_DEPARTURE_DATE_RES = (
+    # Rescheduling: any following verb (or none) still means the travel date.
+    re.compile(
+        _DATE_CHANGE_PREFIX + r"\s*" + _DATE_CORE
+        + r"\s*(?:那天|这天)?\s*(?:出发|走|启程|动身|出行|去|到|开始)?"
+    ),
+    # Otherwise only an unambiguous departure verb counts.
+    re.compile(_DATE_CORE + r"\s*(?:那天|这天)?\s*(?:出发|启程|动身|出行)"),
+)
+
+
+def _find_departure_date(text: str) -> Optional[re.Match[str]]:
+    """First date that reads as the travel date, with groups (year, month, day)."""
+    for pattern in _DEPARTURE_DATE_RES:
+        match = pattern.search(text)
+        if match:
+            return match
+    return None
+
+
+def extract_user_utterance(text: str | None) -> str:
+    """Return only the user-authored part of a free-text field.
+
+    A recognizable machine block (【原文】 present, or at least
+    ``_MACHINE_BLOCK_MIN_LABELS`` distinct machine labels) has its segments
+    removed and its 【原文】 content restored. Anything else — including a user
+    who typed one bracketed line themselves — is returned untouched.
+    """
+    raw = str(text or "")
+    if "【" not in raw:
+        return raw.strip()
+    labels = set(_MACHINE_LABEL_RE.findall(raw))
+    quotes = [match.group(1).strip() for match in _USER_QUOTE_RE.finditer(raw)]
+    if not quotes and len(labels) < _MACHINE_BLOCK_MIN_LABELS:
+        return raw.strip()
+
+    remainder = _MACHINE_SEGMENT_RE.sub(" ", _USER_QUOTE_RE.sub(" ", raw))
+    parts = [*(quote for quote in quotes if quote)]
+    parts.extend(line.strip() for line in remainder.splitlines() if line.strip())
+    return "\n".join(parts).strip()
+
+
+_MACHINE_ENTRY_RE = re.compile(
+    r"【(" + _MACHINE_LABEL_ALTERNATION + r")】([^【\n]*)"
+)
+# Labels that record a decided constraint (safe for downstream rules) versus
+# labels that are model prose or an unconfirmed suggestion (never a constraint).
+DECIDED_MACHINE_LABELS = frozenset({"时段", "约束", "同行", "范围", "排除", "目的地"})
+
+
+def parse_machine_block(text: str | None) -> Dict[str, str]:
+    """Return the recommender's 【label】→content map from a free-text field."""
+    return {
+        match.group(1): match.group(2).strip()
+        for match in _MACHINE_ENTRY_RE.finditer(str(text or ""))
+    }
+
+
+def decided_constraint_text(text: str | None) -> str:
+    """User words plus system-decided constraints, without advisory prose.
+
+    Downstream rules must not read 【理由】 or 【抵达建议】: those are generated
+    copy, and treating them as user intent is how "建议周五下午出发" once turned
+    a two-day weekend into three days.
+    """
+    block = parse_machine_block(text)
+    parts = [user_intent_text(text)]
+    parts.extend(
+        content
+        for label, content in block.items()
+        if label in DECIDED_MACHINE_LABELS and content
+    )
+    return " ".join(part for part in parts if part).strip()
+
+
+EXCLUDABLE_THEMES = (
+    "海边", "海岛", "爬山", "登山", "沙漠", "草原", "古镇", "博物馆",
+    "购物", "夜市", "游乐园", "温泉", "自驾", "长途大巴",
+)
+# 不去北京西站接人 mentions a station, not a rejected destination.
+_STATION_AFTER_RE = re.compile(r"^[东南西北]?站|^机场")
+_EXCLUSION_ENUMERATION = r"(?:\s*[和与、,，]\s*(?:%s))*"
+_excluded_city_pattern_cache: Optional[re.Pattern[str]] = None
+_excluded_theme_pattern_cache: Optional[re.Pattern[str]] = None
+
+
+def _build_exclusion_pattern(terms: Iterable[str]) -> re.Pattern[str]:
+    """One compiled alternation for all terms, with 和/与/、 enumeration."""
+    alternation = "|".join(
+        re.escape(term) for term in sorted(set(terms), key=len, reverse=True)
+    )
+    return re.compile(
+        r"(?:" + NEGATOR_ALTERNATION + r")" + NEGATION_FILLER + r"[去到看玩选往]{0,2}\s*"
+        r"((?:" + alternation + r")" + (_EXCLUSION_ENUMERATION % alternation) + r")"
+    )
+
+
+def _excluded_city_pattern() -> re.Pattern[str]:
+    global _excluded_city_pattern_cache
+    if _excluded_city_pattern_cache is None:
+        _excluded_city_pattern_cache = _build_exclusion_pattern(
+            known_destination_cities()
+        )
+    return _excluded_city_pattern_cache
+
+
+def _excluded_theme_pattern() -> re.Pattern[str]:
+    global _excluded_theme_pattern_cache
+    if _excluded_theme_pattern_cache is None:
+        _excluded_theme_pattern_cache = _build_exclusion_pattern(EXCLUDABLE_THEMES)
+    return _excluded_theme_pattern_cache
+
+
+def _find_excluded(text: str, pattern: re.Pattern[str]) -> List[str]:
+    found: List[str] = []
+    for match in pattern.finditer(text):
+        offset = match.start(1)
+        # Keep the separators so each term's own end offset stays correct: the
+        # station guard is per term ("不想去天津和北京站" still rejects 天津).
+        for index, term in enumerate(re.split(r"([和与、,，])", match.group(1))):
+            end = offset + len(term)
+            offset = end
+            if index % 2:  # separator
+                continue
+            item = term.strip()
+            if not item or item in found:
+                continue
+            if _STATION_AFTER_RE.match(text[end:end + 3]):
+                continue
+            found.append(item)
+    return found
+
+
+def has_affirmative_weekend(text: str) -> bool:
+    """Whether the text asks for a weekend trip (negated mentions don't count)."""
+    return any(
+        not is_negated_at(text, match.start())
+        for match in _WEEKEND_MARKER_RE.finditer(text)
+    )
 
 
 def parse_chinese_number(text: str) -> Optional[int]:
@@ -185,6 +376,9 @@ class SemanticContractService:
         """
         contract = SemanticTripContract(raw_text=text or "")
         normalized = (text or "").replace("，", ",").replace("。", " ").strip()
+        # Separable verb-object forms: 避个暑 / 散个步 / 透个气 read the same as
+        # 避暑 / 散步 / 透气, and dropping the infix keeps one keyword table.
+        normalized = _SEPARABLE_VERB_RE.sub(r"\1", normalized)
         if not normalized:
             contract.refresh_pending_fields()
             return contract
@@ -211,21 +405,78 @@ class SemanticContractService:
                     evidence=origin_match.group(0),
                 )
 
-        traveler_match = re.search(
-            r"([1-9]\d?|一|两|二|三|四|五|六|七|八|九|十)(?:个)?人",
-            normalized,
+        traveler_pattern = re.compile(
+            r"([1-9]\d?|一|两|二|三|四|五|六|七|八|九|十)"
+            r"(?:个|位|名)?"
+            r"(年轻人|年青人|青年人?|成年人?|成人|老年人?|老人|学生|男生|女生|人)"
         )
-        vague_count = bool(re.search(r"(大概|大约|左右|差不多|估计).{0,6}人", normalized))
+        traveler_matches = [
+            match
+            for match in traveler_pattern.finditer(normalized)
+            if not self._is_lodging_capacity(normalized, match)
+        ]
+        traveler_match = traveler_matches[0] if traveler_matches else None
+        vague_count = bool(
+            re.search(r"(大概|大约|左右|差不多|估计).{0,6}人", normalized)
+        ) or any(
+            re.match(r"\s*(?:左右|上下|大约|大概|差不多)", normalized[match.end():])
+            for match in traveler_matches
+        )
         if traveler_match:
-            raw = traveler_match.group(1)
-            count = int(raw) if raw.isdigit() else NUMBER_WORDS.get(raw)
-            if count is not None:
+            parsed_counts = [
+                int(match.group(1))
+                if match.group(1).isdigit()
+                else NUMBER_WORDS.get(match.group(1))
+                for match in traveler_matches
+            ]
+            connectors = [
+                normalized[left.end():right.start()]
+                for left, right in zip(traveler_matches, traveler_matches[1:])
+            ]
+            additive_groups = len(traveler_matches) > 1 and all(
+                re.fullmatch(r"\s*(?:和|与|及|以及|加上?|另有|、|，|,)\s*", connector)
+                for connector in connectors
+            )
+            ambiguous_groups = len(traveler_matches) > 1 and not additive_groups
+            valid_counts = [count for count in parsed_counts if count is not None]
+            count = sum(valid_counts) if additive_groups else valid_counts[0]
+            evidence = (
+                normalized[traveler_matches[0].start():traveler_matches[-1].end()]
+                if additive_groups
+                else " / ".join(match.group(0) for match in traveler_matches)
+            )
+            out_of_range = not 1 <= count <= 20
+            pending_count = vague_count or ambiguous_groups or out_of_range
+            if not out_of_range:
                 contract.travelers = bind(
                     count,
                     "user_explicit",
-                    "medium" if vague_count else "high",
-                    pending=vague_count,
-                    evidence=traveler_match.group(0),
+                    "medium" if pending_count else "high",
+                    pending=pending_count,
+                    evidence=evidence,
+                )
+            else:
+                # RecommendationContext accepts 1..20 only. Keep the evidence for
+                # clarification, but never project an out-of-domain value and 500.
+                note = f"travelers: {evidence} 合计{count}人，超出系统支持的1至20人"
+                contract.travelers = bind(
+                    None,
+                    "unknown",
+                    "low",
+                    pending=True,
+                    evidence=f"{evidence}（系统支持1至20人）",
+                    conflicts=[note],
+                )
+                contract.conflicts.append(note)
+            if any(match.group(2) != "人" for match in traveler_matches):
+                # Preserve explicit party descriptions instead of reducing them
+                # to only a scalar traveler count.
+                contract.travel_party = bind(
+                    evidence,
+                    "user_explicit",
+                    "medium" if pending_count else "high",
+                    pending=pending_count,
+                    evidence=evidence,
                 )
         else:
             travelers, travel_party, party_evidence = self._infer_travel_party(normalized)
@@ -359,7 +610,11 @@ class SemanticContractService:
             "休闲": ("放松", "散心", "透气", "不想太累", "慢一点", "避开人群", "避暑"),
         }
         for preference, keywords in preference_keywords.items():
-            if any(keyword in normalized for keyword in keywords):
+            # "不要海边" must not add 自然风光; only affirmative mentions count.
+            if any(
+                self._mentioned_affirmatively(normalized, keyword)
+                for keyword in keywords
+            ):
                 preferences.append(preference)
         if preferences:
             contract.preferences = bind(
@@ -409,10 +664,89 @@ class SemanticContractService:
             )
 
         self._apply_destination_city(normalized, contract)
+        self._apply_scope_and_exclusions(normalized, contract)
         self._apply_relative_dates(normalized, contract, today=today)
         self._apply_weekend_and_friday_semantics(normalized, contract, today=today)
         contract.refresh_pending_fields()
         return contract
+
+    @staticmethod
+    def _mentioned_affirmatively(text: str, keyword: str) -> bool:
+        """Whether *keyword* appears at least once without a direct negation."""
+        for match in re.finditer(re.escape(keyword), text):
+            if not is_negated_at(text, match.start()):
+                return True
+        return False
+
+    def _apply_scope_and_exclusions(
+        self, text: str, contract: SemanticTripContract
+    ) -> None:
+        """Capture range requirements and explicit exclusions.
+
+        Without these the recommender silently loses "附近的城市"、"不想去昆明"
+        and "不要海边" — the user then sees options they already ruled out.
+        """
+        nearby_markers = ("附近", "周边", "周围", "短途", "近一点", "近点", "不远")
+        far_markers = ("远一点", "远点", "远途", "长途", "跨省玩", "去远的")
+        nearby_hit = next(
+            (m for m in nearby_markers if self._mentioned_affirmatively(text, m)),
+            None,
+        )
+        far_hit = next(
+            (m for m in far_markers if self._mentioned_affirmatively(text, m)),
+            None,
+        )
+        if nearby_hit and far_hit:
+            note = f"destination_scope: 同时出现「{nearby_hit}」与「{far_hit}」，范围待确认"
+            contract.destination_scope = bind(
+                "nearby",
+                "rule_inferred",
+                "low",
+                pending=True,
+                evidence=f"{nearby_hit}/{far_hit}",
+                conflicts=[note],
+            )
+            contract.conflicts.append(note)
+        elif nearby_hit:
+            contract.destination_scope = bind(
+                "nearby", "user_explicit", "high", evidence=nearby_hit
+            )
+        elif far_hit:
+            contract.destination_scope = bind(
+                "far", "user_explicit", "high", evidence=far_hit
+            )
+
+        chosen = (
+            str(contract.destination_city.value)
+            if contract.destination_city.is_known()
+            else ""
+        )
+        excluded_cities: List[str] = []
+        for city in _find_excluded(text, _excluded_city_pattern()):
+            if chosen and city == chosen:
+                # "不想去大同，还是去大同吧": the affirmative choice wins, but the
+                # reversal is recorded rather than silently forgotten.
+                note = f"excluded_destinations: 先排除后又选择了「{city}」，以最新选择为准"
+                if note not in contract.conflicts:
+                    contract.conflicts.append(note)
+                continue
+            excluded_cities.append(city)
+        if excluded_cities:
+            contract.excluded_destinations = bind(
+                excluded_cities,
+                "user_explicit",
+                "high",
+                evidence="、".join(excluded_cities),
+            )
+
+        excluded_themes = _find_excluded(text, _excluded_theme_pattern())
+        if excluded_themes:
+            contract.excluded_themes = bind(
+                excluded_themes,
+                "user_explicit",
+                "high",
+                evidence="、".join(excluded_themes),
+            )
 
     def _apply_destination_city(self, text: str, contract: SemanticTripContract) -> None:
         """Write explicit destination mentions into the contract (not recommender-only)."""
@@ -490,11 +824,21 @@ class SemanticContractService:
             "weekend_style",
             "early_arrival_hint",
             "departure_mode",
+            "destination_scope",
         ]
         for name in field_names:
             current: FieldBinding = getattr(merged, name)
             new: FieldBinding = getattr(incoming, name)
             setattr(merged, name, self._merge_field(name, current, new, merged))
+
+        # Exclusions accumulate across turns: "不要海边" said once stays true
+        # until the user takes it back, so a later message must not drop it.
+        for name in ("excluded_destinations", "excluded_themes"):
+            setattr(
+                merged,
+                name,
+                self._merge_exclusions(getattr(merged, name), getattr(incoming, name)),
+            )
 
         # Date window consistency: non-pending dates define travel_days.
         # Protected mismatched day counts are recorded, then aligned to the window
@@ -547,6 +891,11 @@ class SemanticContractService:
                             )
             except ValueError:
                 pass
+
+        # Conflicts detected while reading the message (out-of-range party size,
+        # contradictory range, an exclusion the user then reversed) are part of
+        # the merged record — dropping them made them invisible to every caller.
+        merged.conflicts.extend(incoming.conflicts)
 
         # Dedupe conflicts
         seen = set()
@@ -677,6 +1026,9 @@ class SemanticContractService:
         payload["raw_text"] = contract.raw_text
         payload["semantic_contract"] = contract.model_dump(mode="json")
         payload["conflicts"] = list(contract.conflicts)
+        # The subset the user actually has to resolve. Shipping it means the UI
+        # does not maintain a second, drifting copy of the same rule.
+        payload["blocking_conflicts"] = blocking_conflicts(contract)
         payload["pending_fields"] = list(contract.pending_fields)
         return payload
 
@@ -778,10 +1130,22 @@ class SemanticContractService:
             return current
 
         if not new.is_known() and new.pending_confirmation:
-            # Incoming only says "still unknown/pending" — keep current
+            # A pending signal with a concrete conflict (for example an explicit
+            # out-of-range traveler total) must not disappear behind a form value.
+            if new.conflicts:
+                notes = list(new.conflicts)
+                merged.conflicts.extend(notes)
+                return current.model_copy(
+                    deep=True,
+                    update={
+                        "pending_confirmation": True,
+                        "conflicts": list(current.conflicts) + notes,
+                    },
+                )
+            # A generic unknown without conflicting evidence keeps the form value.
             return current
 
-        if self._values_equal(current.value, new.value):
+        if self._values_equal(name, current.value, new.value):
             # Same value: upgrade evidence/source priority toward stronger source
             if new.source == "user_explicit" and current.source != "user_explicit":
                 return new.model_copy(deep=True)
@@ -841,13 +1205,48 @@ class SemanticContractService:
         merged.conflicts.append(note)
         return result
 
-    def _values_equal(self, left: Any, right: Any) -> bool:
+    def _merge_exclusions(
+        self, current: FieldBinding, new: FieldBinding
+    ) -> FieldBinding:
+        merged_values: List[str] = []
+        for binding in (current, new):
+            if not binding.is_known() or not isinstance(binding.value, list):
+                continue
+            for item in binding.value:
+                text = str(item).strip()
+                if text and text not in merged_values:
+                    merged_values.append(text)
+        if not merged_values:
+            return current
+        evidence = new.evidence or current.evidence or "、".join(merged_values)
+        return bind(merged_values, "user_explicit", "high", evidence=evidence)
+
+    def _values_equal(self, name: str, left: Any, right: Any) -> bool:
         if isinstance(left, list) and isinstance(right, list):
             return list(left) == list(right)
+        if name in {"origin_city", "destination_city"}:
+            # "山西太原" and "太原" are the same place, not a conflict to report.
+            return _normalize_compare(name, left) == _normalize_compare(name, right)
         return left == right
 
     def _clean_location_label(self, value: str) -> str:
         return "".join(str(value or "").split()).strip("，,。 ")
+
+    def _is_lodging_capacity(self, text: str, match: re.Match) -> bool:
+        """Return whether a person-count phrase describes a room/table/ticket."""
+        before = text[max(0, match.start() - 8):match.start()]
+        after = text[match.end():match.end() + 8]
+        direct_capacity = re.match(
+            r"(?:间|房|房型|桌|票)|"
+            r"(?:(?:豪华|标准|家庭|商务|大床|双床|主题|套|海景){1,2})"
+            r"(?:间|房|房型)",
+            after,
+        )
+        contextual_capacity = (
+            re.search(r"(?:住|入住|订|预订|预定|开).{0,4}$", before)
+            and re.search(r".{0,6}(?:间|房|房型)", after)
+        )
+        return bool(direct_capacity or contextual_capacity)
 
     def _infer_travel_party(
         self, text: str
@@ -890,13 +1289,20 @@ class SemanticContractService:
         *,
         today: date,
     ) -> None:
+        # A stated *departure* date outranks weekend inference — otherwise
+        # "不要周末了，改成9月15号出发" keeps the old weekend window. A bare date
+        # mention ("8月1号之前得定好") must not hijack the window.
+        departure = _find_departure_date(text)
+        explicit = departure or _ANY_DATE_RE.search(text)
+
         # Weekend calendar dates: rule_inferred + pending (do not auto-confirm).
-        if any(marker in text for marker in WEEKEND_MARKERS):
+        if not departure and has_affirmative_weekend(text):
             days_until_saturday = (5 - today.weekday()) % 7
             start = today + timedelta(days=days_until_saturday)
-            if "下周末" in text:
+            next_weekend = self._mentioned_affirmatively(text, "下周末")
+            if next_weekend:
                 start += timedelta(days=7)
-            evidence = "下周末" if "下周末" in text else "周末"
+            evidence = "下周末" if next_weekend else "周末"
             contract.start_date = bind(
                 start.isoformat(),
                 "rule_inferred",
@@ -915,7 +1321,6 @@ class SemanticContractService:
                 contract.travel_days = bind(2, "rule_inferred", "high", evidence=evidence)
             return
 
-        explicit = re.search(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})[日号]", text)
         if not explicit:
             return
         year = int(explicit.group(1) or today.year)
@@ -953,7 +1358,14 @@ class SemanticContractService:
         today: date,
     ) -> None:
         """Attach weekend / Friday early-arrival semantics without silent 3-day expand."""
-        has_weekend = any(marker in text for marker in WEEKEND_MARKERS)
+        # A stated departure date defines the window; a lingering 周末 mention
+        # must not then label a Tuesday trip as "周六—周日" and offer a Friday card.
+        stated_dates = (
+            contract.start_date.is_known()
+            and contract.start_date.source == "user_explicit"
+            and not contract.start_date.pending_confirmation
+        )
+        has_weekend = has_affirmative_weekend(text) and not stated_dates
         friday_match = re.search(
             r"(?:周五|星期五)(?:下午|晚上|晚|傍晚|出发|走|去)?",
             text,
@@ -1088,8 +1500,60 @@ def strip_contract_ack_marker(text: str | None) -> str:
     return raw.replace(USER_CONTRACT_ACK_MARKER, " ").strip()
 
 
+def user_intent_text(text: str | None) -> str:
+    """Free text reduced to user-authored intent, ready for extraction.
+
+    Strips the acknowledgment stamp and the recommender's machine block so the
+    system never re-reads its own advisory copy as a new user constraint.
+    """
+    return extract_user_utterance(strip_contract_ack_marker(text))
+
+
+def build_generation_contract(
+    request: TripRequest,
+    *,
+    session_contract: SemanticTripContract | None = None,
+) -> tuple[TripRequest, SemanticTripContract | None]:
+    """Server-entry contract build: at most one NL extraction per request.
+
+    Returns ``(attached_request, message_contract)``.  The attached request
+    carries the merged server-owned contract for every downstream reader;
+    ``message_contract`` is the free-text-only extraction the divergence
+    gate needs, or ``None`` when the request has no user-authored text —
+    in which case zero extractions run and the contract is form-only.
+
+    ``session_contract`` (a verified recommendation-token contract) merges
+    as the *base*: current form values and the latest user text win over
+    session history exactly per the field merge matrix — a token never
+    bypasses confirmation or the 422 gate.
+    """
+    service = get_semantic_contract_service()
+    intent_text = user_intent_text(request.free_text_input)
+    message_contract = (
+        service.extract_from_text(intent_text) if intent_text.strip() else None
+    )
+    attached = _attach_contract(
+        request, message_contract, session_contract=session_contract
+    )
+    return attached, message_contract
+
+
 def attach_contract_to_trip_request(request: TripRequest) -> TripRequest:
     """Rebuild a server-owned contract from form fields + free text.
+
+    Compatibility wrapper over :func:`build_generation_contract` for callers
+    that only need the attached request (direct/internal invocations).
+    """
+    return build_generation_contract(request)[0]
+
+
+def _attach_contract(
+    request: TripRequest,
+    message_contract: SemanticTripContract | None,
+    *,
+    session_contract: SemanticTripContract | None = None,
+) -> TripRequest:
+    """Merge form + pre-extracted free-text contract onto the request.
 
     Client-supplied contracts are ignored for authority: form values become
     form_confirmed, free-text extraction is merged with provenance rules.
@@ -1116,10 +1580,17 @@ def attach_contract_to_trip_request(request: TripRequest) -> TripRequest:
         "high",
         evidence="trip_request.city",
     )
-    message_contract = service.extract_from_text(
-        strip_contract_ack_marker(request.free_text_input)
-    )
-    merged = service.merge(form_contract, message_contract)
+    if session_contract is not None:
+        # Session history is the base; the current form wins per the merge
+        # matrix (divergences surface as pending/conflicts, not silently).
+        form_contract = service.merge(session_contract, form_contract)
+    if message_contract is not None:
+        merged = service.merge(form_contract, message_contract)
+    else:
+        # Form-only path: re-refresh because destination_city was rebound
+        # after contract_from_form's own refresh (merge would have done it).
+        form_contract.refresh_pending_fields()
+        merged = form_contract
     updates: Dict[str, Any] = {"semantic_contract": merged}
     # Surface weekend semantics onto TripRequest for planner consumption.
     if request.date_pattern is None and merged.date_pattern.is_known():
@@ -1168,7 +1639,72 @@ def _is_audit_only_conflict(note: str) -> bool:
         return True
     if "与日期窗口" in text:
         return True
+    # The user reversed their own exclusion — already resolved, just recorded.
+    if "以最新选择为准" in text:
+        return True
+    # Notes about non-critical fields never block generation, mirroring
+    # ``_pending_is_hard_block``.
+    field = re.match(r"^([a-z_]+)\s*:", text)
+    if field and field.group(1) not in CRITICAL_HARD_BLOCK_FIELDS:
+        return True
     return False
+
+
+FIELD_LABELS: Dict[str, str] = {
+    "origin_city": "出发地",
+    "destination_city": "目的地",
+    "start_date": "开始日期",
+    "end_date": "结束日期",
+    "travel_days": "天数",
+    "travelers": "人数",
+    "travel_party": "同行关系",
+    "budget": "预算",
+    "pace": "节奏",
+    "preferences": "偏好",
+    "transportation": "交通方式",
+    "accommodation": "住宿",
+    "date_pattern": "日期模式",
+    "weekend_style": "周末形态",
+    "departure_mode": "出发时段",
+    "early_arrival_hint": "提前抵达建议",
+    "destination_scope": "目的地范围",
+    "excluded_destinations": "排除的目的地",
+    "excluded_themes": "排除的类型",
+}
+
+
+def field_label(name: str) -> str:
+    """Chinese label for a contract field; never leak the raw key to users."""
+    return FIELD_LABELS.get(name, name)
+
+
+def humanize_conflict(note: str) -> str:
+    """Replace the machine field prefix in a conflict note with its label.
+
+    The stored notes keep the raw ``field:`` prefix because the audit-only
+    rules match on it; only what reaches a person is relabelled.
+    """
+    text = str(note or "")
+    match = re.match(r"^([a-z_]+)\s*:\s*", text)
+    if not match:
+        return text
+    return f"{field_label(match.group(1))}：{text[match.end():]}"
+
+
+def blocking_conflicts(contract: SemanticTripContract | None) -> list[str]:
+    """Conflicts the user still has to resolve, in user-facing wording.
+
+    Single definition shared by the hard-block gate, the recommender reply and
+    the frontend banner, so one contract cannot read as "conflicting" in one
+    place and "clean" in another.
+    """
+    if contract is None:
+        return []
+    return [
+        humanize_conflict(note)
+        for note in contract.conflicts
+        if note and not _is_audit_only_conflict(note)
+    ]
 
 
 def _field_resolved_by_request(field: str, request: TripRequest) -> bool:
@@ -1186,7 +1722,9 @@ def _field_resolved_by_request(field: str, request: TripRequest) -> bool:
     if field == "travel_party":
         return request.travelers is not None and request.travelers >= 1
     if field == "pace":
-        text = strip_contract_ack_marker(request.free_text_input)
+        # 【理由】 is generated copy — it must not resolve a pending pace on the
+        # user's behalf. Only decided constraints and the user's own words count.
+        text = decided_constraint_text(request.free_text_input)
         prefs = set(request.preferences or [])
         return "休闲" in prefs or bool(
             re.search(r"轻松|慢|父母|爸妈|避暑|不想太累", text)
@@ -1220,12 +1758,15 @@ def _normalize_compare(field: str, value: Any) -> Any:
     if value is None:
         return None
     if field in {"origin_city", "destination_city"}:
-        text = "".join(str(value).split())
-        # Lightweight compare: strip common admin suffixes
-        for suffix in ("特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区", "自治区", "省", "市", "地区"):
-            if text.endswith(suffix) and len(text) > len(suffix) + 1:
-                text = text[: -len(suffix)]
-        return text
+        # Share the planner's canonical form so "山西太原" and "太原" compare
+        # equal — otherwise a province-prefixed utterance hard-blocks the form.
+        from .destination_feasibility_service import (
+            get_destination_feasibility_service,
+        )
+
+        return get_destination_feasibility_service().normalize_location_for_matching(
+            value
+        )
     if field in {"budget", "travelers", "travel_days"}:
         try:
             return int(value)
@@ -1302,23 +1843,36 @@ def collect_semantic_hard_block_issues(
 ) -> list[dict[str, Any]]:
     """Return structured 422 issues for unresolved critical contract risks.
 
-    Empty list means generation may proceed. Acknowledgment (boolean flag or
-    free_text marker) skips the hard block after frontend secondary confirm.
+    Compatibility wrapper: builds the contract once, then delegates to
+    :func:`collect_hard_block_issues_for_contract`.  Callers that already
+    ran :func:`build_generation_contract` should call the core directly.
     """
     if user_acknowledged_contract_risks(request):
         return []
+    attached, message_contract = build_generation_contract(request)
+    return collect_hard_block_issues_for_contract(attached, message_contract)
 
-    service = get_semantic_contract_service()
-    message_contract = service.extract_from_text(
-        strip_contract_ack_marker(request.free_text_input)
-    )
-    attached = attach_contract_to_trip_request(request)
-    contract = attached.semantic_contract
+
+def collect_hard_block_issues_for_contract(
+    request: TripRequest,
+    message_contract: SemanticTripContract | None,
+) -> list[dict[str, Any]]:
+    """Hard-block gate core: reads the attached contract, never extracts.
+
+    ``request`` must carry the server-built ``semantic_contract``;
+    ``message_contract`` is the free-text-only extraction from
+    :func:`build_generation_contract` (``None`` when there was no
+    user-authored text, which skips the divergence check by construction).
+    """
+    contract = request.semantic_contract
     if contract is None:
         return []
 
     issues: list[dict[str, Any]] = []
-    issues.extend(collect_free_text_form_divergences(request, message_contract))
+    if message_contract is not None:
+        issues.extend(
+            collect_free_text_form_divergences(request, message_contract)
+        )
 
     pending: list[str] = []
     for name in CRITICAL_HARD_BLOCK_FIELDS:
@@ -1330,7 +1884,7 @@ def collect_semantic_hard_block_issues(
             pending.append(name)
 
     if pending:
-        labels = "、".join(pending[:8])
+        labels = "、".join(field_label(name) for name in pending[:8])
         issues.append(
             {
                 "code": "SEMANTIC_CONTRACT_PENDING",
@@ -1346,27 +1900,23 @@ def collect_semantic_hard_block_issues(
             }
         )
 
-    blocking_conflicts = [
-        note
-        for note in contract.conflicts
-        if note and not _is_audit_only_conflict(note)
-    ]
-    if blocking_conflicts:
+    unresolved = blocking_conflicts(contract)
+    if unresolved:
         issues.append(
             {
                 "code": "SEMANTIC_CONTRACT_CONFLICT_BLOCK",
                 "severity": "error",
                 "path": "semantic_contract.conflicts",
                 "message": (
-                    f"语义契约存在 {len(blocking_conflicts)} 条未消解冲突："
-                    f"{blocking_conflicts[0]}"
+                    f"语义契约存在 {len(unresolved)} 条未消解冲突："
+                    f"{unresolved[0]}"
                 ),
                 "suggestion": (
                     "请核对出发地/人数/预算等表单取值，或二次确认后继续生成"
                     f"（semantic_risks_acknowledged / {USER_CONTRACT_ACK_MARKER}）。"
                 ),
                 "auto_repaired": False,
-                "conflicts": blocking_conflicts[:5],
+                "conflicts": unresolved[:5],
             }
         )
 

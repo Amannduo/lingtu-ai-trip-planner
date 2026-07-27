@@ -42,6 +42,15 @@ class Settings(BaseSettings):
 
     # 服务端认证配置
     auth_secret_key: str = ""
+    # Optional dedicated signing key for recommendation-contract tokens.
+    # When empty, a purpose-specific key is derived from auth_secret_key
+    # via HKDF-SHA256 with domain separation (never the raw key itself).
+    recommendation_token_signing_key: str = ""
+    # S4c switch: keep writing the legacy 【…】 machine block into
+    # form_patch free text (dual channel with the signed token). Flip to
+    # false only after the token path has been observed stable in
+    # production; the backend keeps reading the old format either way.
+    recommendation_machine_block_write_enabled: bool = True
     auth_access_token_minutes: int = 480
     auth_cookie_name: str = "lingtu_access_token"
     auth_cookie_secure: bool = False

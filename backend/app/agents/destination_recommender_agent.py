@@ -30,6 +30,8 @@ from ..services.city_mention_service import (
 )
 from ..services.semantic_contract_service import (
     EARLY_ARRIVAL_HINT_DEFAULT,
+    blocking_conflicts,
+    field_label,
     get_semantic_contract_service,
 )
 
@@ -121,6 +123,24 @@ FALLBACK_CITY_PROFILES: Dict[str, Dict[str, Any]] = {
         "themes": ["避暑", "父母友好", "轻松"],
         "highlights": ["通天河国家森林公园", "灵官峡"]
     },
+    "忻州": {
+        "reason": "五台山一带海拔高、夏季凉爽，从太原短途可达，适合把两天安排成一处主景区加县城休息的低强度节奏；山区天气和景区班车需出发前复核。",
+        "preferences": ["自然风光", "休闲", "历史文化"],
+        "themes": ["避暑", "父母友好", "轻松"],
+        "highlights": ["五台山", "雁门关", "禹王洞"]
+    },
+    "大同": {
+        "reason": "夏季气温明显低于华北平原，石窟与古城集中在市区周边，换乘少、步行强度可控；景区门票与开放时间需提前确认。",
+        "preferences": ["历史文化", "自然风光", "休闲"],
+        "themes": ["避暑", "父母友好", "轻松"],
+        "highlights": ["云冈石窟", "大同古城", "悬空寺"]
+    },
+    "晋中": {
+        "reason": "平遥古城与晋商大院步行动线短、住宿选择多，从太原通勤式往返即可，适合把预算集中在住宿与餐饮上。",
+        "preferences": ["历史文化", "美食", "休闲"],
+        "themes": ["父母友好", "轻松"],
+        "highlights": ["平遥古城", "乔家大院", "王家大院"]
+    },
     "厦门": {
         "reason": "海边休闲感强,行程压力小,适合想放松和拍照散步的旅行。",
         "preferences": ["自然风光", "休闲"],
@@ -196,14 +216,32 @@ class DestinationRecommenderAgent:
                 recommendations=[],
             )
 
+        explicit_city = self._normalize_city(inferred.get("destination_city"))
+        took_short_path = False
         if inferred.get("destination_city"):
+            # Destination already decided: skip the model round-trip entirely.
             seeds = self._fallback_candidates(effective_request)
+            took_short_path = True
+        elif self._short_path_available(contract, context):
+            # Origin + a real short-haul circle + a weekend window is enough to
+            # rank deterministically; the model adds latency, not information.
+            seeds = self._fallback_candidates(effective_request)
+            took_short_path = True
         else:
             seeds = self._generate_candidate_seeds(effective_request)
-        explicit_city = self._normalize_city(inferred.get("destination_city"))
-        seeds = self._filter_and_rank_candidates(
-            seeds, context, explicit_city, latest_message
+        ranked = self._filter_and_rank_candidates(
+            seeds, context, explicit_city, latest_message, contract
         )
+        if not ranked and took_short_path:
+            # Exclusions can empty a small circle; widen instead of giving up.
+            ranked = self._filter_and_rank_candidates(
+                self._generate_candidate_seeds(effective_request),
+                context,
+                explicit_city,
+                latest_message,
+                contract,
+            )
+        seeds = ranked
         if not seeds and not get_destination_feasibility_service().nearby_destinations(
             context.origin_city
         ):
@@ -237,6 +275,9 @@ class DestinationRecommenderAgent:
             ]
         recommendations = []
         seen = set()
+        # One turn, one lookup per city: the Friday card re-describes a city
+        # that was already enriched, and re-searching it buys nothing.
+        turn_cache: Dict[str, Any] = {}
         for seed in seeds:
             city = str(seed.get("city") or "").strip()
             if not city or city in seen or len(recommendations) >= count:
@@ -253,7 +294,9 @@ class DestinationRecommenderAgent:
                 if self._is_default_weekend(contract)
                 else None,
             }
-            item = self._build_recommendation(enriched_seed, context, contract)
+            item = self._build_recommendation(
+                enriched_seed, context, contract, cache=turn_cache
+            )
             if item is not None:
                 item = self._apply_recommendation_checklist(item, contract, context)
             if item is not None:
@@ -263,7 +306,7 @@ class DestinationRecommenderAgent:
         # Appended as an extra decision card so city ranking stays intact.
         if self._is_default_weekend(contract) and recommendations:
             friday_card = self._build_friday_early_option(
-                recommendations[0], context, contract
+                recommendations[0], context, contract, cache=turn_cache
             )
             if friday_card is not None:
                 recommendations.append(friday_card)
@@ -271,17 +314,37 @@ class DestinationRecommenderAgent:
         understood = self._understood_summary(contract, context)
         pending_note = ""
         if contract.pending_fields:
-            pending_note = (
-                f" 仍待确认：{'、'.join(contract.pending_fields[:4])}。"
-            )
-        if contract.conflicts:
+            labels = [field_label(name) for name in contract.pending_fields[:4]]
+            pending_note = f" 仍待确认：{'、'.join(labels)}。"
+        # Only unresolved conflicts are worth the user's attention; a successful
+        # "latest utterance overrode the old form value" note is audit history.
+        if blocking_conflicts(contract):
             pending_note += " 已检测到需求冲突，表单保留原确认值。"
-        if len(recommendations) == 3:
+        # The Friday card is an alternative schedule for the same city, not an
+        # extra destination direction — do not inflate the count with it.
+        direction_count = sum(
+            1 for item in recommendations if item.schedule_option != "friday_early"
+        )
+        if direction_count == 0:
+            reply = (
+                f"我理解的是：{understood}。当前约束下暂时没有合适的方向，"
+                f"可以放宽排除条件、增加天数，或换一个出发地再试。{pending_note}"
+            )
+            return DestinationChatResponse(
+                success=True,
+                message="暂无匹配方案",
+                reply=reply,
+                needs_more_info=False,
+                interpreted_context=semantics.interpreted_payload(contract),
+                semantic_contract=contract,
+                recommendations=[],
+            )
+        if direction_count == 3:
             direction_text = "下面三个方向分别偏向省心、松弛和体验丰富"
-        elif len(recommendations) == 1:
+        elif direction_count == 1:
             direction_text = "下面是当前约束下最匹配的一个方向"
         else:
-            direction_text = f"下面有{len(recommendations)}个可比较方向"
+            direction_text = f"下面有{direction_count}个可比较方向"
         reply = (
             f"我理解的是：{understood}。{direction_text}，"
             f"可以直接比较后选择；识别有误的内容随时可以修改。{pending_note}"
@@ -437,7 +500,10 @@ class DestinationRecommenderAgent:
         if context.travelers:
             party = (
                 contract.travel_party.value
-                if contract.travel_party.is_known()
+                if (
+                    contract.travel_party.is_known()
+                    and not contract.travel_party.pending_confirmation
+                )
                 else None
             )
             if party and contract.travelers.value == context.travelers:
@@ -573,29 +639,78 @@ class DestinationRecommenderAgent:
 
         return [{"city": city, **self._profile_for_city(city)} for city in cities]
 
+    def _short_path_available(
+        self,
+        contract: SemanticTripContract,
+        context: RecommendationContext,
+    ) -> bool:
+        """Whether deterministic ranking already answers the request.
+
+        Simple requests take the short path: a known origin with a real
+        short-haul circle plus a ≤2-day window leaves nothing for a model to
+        decide that the feasibility graph does not already decide better.
+        """
+        if not get_destination_feasibility_service().nearby_destinations(
+            context.origin_city
+        ):
+            return False
+        scope = (
+            str(contract.destination_scope.value)
+            if contract.destination_scope.is_known()
+            and not contract.destination_scope.pending_confirmation
+            else ""
+        )
+        if scope == "far":
+            # An explicit "远一点" is exactly the case the short-haul circle
+            # cannot answer — keep the exploratory path.
+            return False
+        short_window = context.travel_days is not None and context.travel_days <= 2
+        return bool(scope == "nearby" or short_window)
+
+    @staticmethod
+    def _excluded_cities(contract: SemanticTripContract) -> List[str]:
+        binding = contract.excluded_destinations
+        if not binding.is_known() or not isinstance(binding.value, list):
+            return []
+        return [str(item).strip() for item in binding.value if str(item).strip()]
+
     def _filter_and_rank_candidates(
         self,
         seeds: List[Dict[str, Any]],
         context: RecommendationContext,
         explicit_city: str = "",
         intent_text: str = "",
+        contract: Optional[SemanticTripContract] = None,
     ) -> List[Dict[str, Any]]:
         """Apply deterministic feasibility after the LLM and fill safe gaps.
 
         A model may propose candidates, but it cannot make a two-day trip from
         Baoji to Kunming or Urumqi feasible. Explicit user choices are retained
         with a warning; automatically proposed infeasible cities are removed.
+        Cities the user ruled out are dropped regardless of model confidence.
         """
         service = get_destination_feasibility_service()
         target_count = self._recommendation_count(context)
         accepted: List[tuple[int, int, int, Dict[str, Any]]] = []
         seen: set[str] = set()
+        excluded = {
+            service.normalize_location_for_matching(item)
+            for item in (self._excluded_cities(contract) if contract else [])
+        }
+        excluded.discard("")
 
         def consider(seed: Dict[str, Any], order: int) -> None:
             city = service.normalize_city(str(seed.get("city") or ""))
             if not city or city in seen:
                 return
             is_explicit = bool(explicit_city and city == explicit_city)
+            # A city the user then explicitly asks for is no longer excluded.
+            if (
+                not is_explicit
+                and excluded
+                and service.normalize_location_for_matching(city) in excluded
+            ):
+                return
             assessment = service.assess(
                 context.origin_city,
                 city,
@@ -628,14 +743,59 @@ class DestinationRecommenderAgent:
 
         # For weekend trips, deterministic nearby options replace infeasible
         # model output. For longer trips they only fill genuine candidate gaps.
+        nearby_cities = service.nearby_destinations(context.origin_city)
         short_window = context.travel_days is not None and context.travel_days <= 2
-        should_fill_nearby = short_window or len(accepted) < target_count
+        scope = (
+            str(contract.destination_scope.value)
+            if contract
+            and contract.destination_scope.is_known()
+            and not contract.destination_scope.pending_confirmation
+            else ""
+        )
+        wants_nearby = scope == "nearby"
+        wants_far = scope == "far"
+        # Filling the short-haul circle would out-rank every long-haul candidate
+        # (graph hits score 95), so an explicit "远一点" must skip the fill.
+        should_fill_nearby = not wants_far and (
+            short_window or wants_nearby or len(accepted) < target_count
+        )
         if should_fill_nearby:
-            for index, city in enumerate(service.nearby_destinations(context.origin_city)):
+            for index, city in enumerate(nearby_cities):
                 consider({"city": city, **self._profile_for_city(city)}, len(seeds) + index)
 
         accepted.sort(key=lambda item: item[:3], reverse=True)
-        return [item[3] for item in accepted[:target_count]]
+        ranked = [item[3] for item in accepted]
+
+        # Range is a constraint, not a preference: once a real short-haul circle
+        # exists, "附近" is never answered with a cross-country city, and
+        # "远一点" is never answered with the circle itself.
+        if nearby_cities and (wants_nearby or wants_far):
+            nearby_norm = {
+                service.normalize_location_for_matching(city) for city in nearby_cities
+            }
+
+            def is_explicit_choice(seed: Dict[str, Any]) -> bool:
+                return bool(
+                    explicit_city
+                    and service.normalize_city(str(seed.get("city") or ""))
+                    == explicit_city
+                )
+
+            def in_circle(seed: Dict[str, Any]) -> bool:
+                return (
+                    service.normalize_location_for_matching(str(seed.get("city") or ""))
+                    in nearby_norm
+                )
+
+            filtered = [
+                seed
+                for seed in ranked
+                if is_explicit_choice(seed)
+                or (in_circle(seed) if wants_nearby else not in_circle(seed))
+            ]
+            if filtered:
+                ranked = filtered
+        return ranked[:target_count]
 
     def _candidate_relevance(
         self,
@@ -680,23 +840,39 @@ class DestinationRecommenderAgent:
     def _normalize_city(self, city: Optional[str]) -> str:
         return get_destination_feasibility_service().normalize_city(city)
 
+    def _cached(self, cache: Optional[Dict[str, Any]], key: str, produce):
+        """Memoize one external lookup for the duration of a chat turn."""
+        if cache is None:
+            return produce()
+        if key not in cache:
+            cache[key] = produce()
+        return cache[key]
+
     def _build_recommendation(
         self,
         seed: Dict[str, Any],
         context: RecommendationContext,
         contract: SemanticTripContract,
+        *,
+        cache: Optional[Dict[str, Any]] = None,
     ) -> Optional[DestinationRecommendation]:
         city = str(seed.get("city") or "").strip()
         if not city:
             return None
 
         suggested_preferences = self._merge_preferences(seed.get("preferences"), context.preferences)
-        pois = self._search_city_highlights(city, suggested_preferences)
+        pois = self._cached(
+            cache,
+            f"poi:{city}:{'|'.join(suggested_preferences)}",
+            lambda: self._search_city_highlights(city, suggested_preferences),
+        )
         highlights = [poi.name for poi in pois[:3]]
         if not highlights:
             highlights = list(seed.get("highlights") or FALLBACK_CITY_PROFILES.get(city, {}).get("highlights", []))[:3]
 
-        weather_summary = self._weather_summary(city)
+        weather_summary = self._cached(
+            cache, f"weather:{city}", lambda: self._weather_summary(city)
+        )
         start_date, end_date, suggested_days = self._resolve_trip_window(
             context,
             contract,
@@ -966,6 +1142,20 @@ class DestinationRecommenderAgent:
         early_hint: Optional[str],
         is_friday_early: bool,
     ) -> str:
+        from ..config import get_settings
+
+        if not bool(
+            getattr(
+                get_settings(),
+                "recommendation_machine_block_write_enabled",
+                True,
+            )
+        ):
+            # S4c: the signed token is the structured carrier; free text
+            # keeps only the user's own words so entry extraction reads
+            # pure user intent. Machine-block *reading* stays supported.
+            return str(contract.raw_text or "")[:500]
+
         constraints: List[str] = []
         if contract.pace.is_known():
             constraints.append(str(contract.pace.value))
@@ -1004,6 +1194,24 @@ class DestinationRecommenderAgent:
             f"【同行】{party}",
             f"【理由】{reason}",
         ]
+        if contract.destination_scope.is_known():
+            scope_label = (
+                "仅短途/周边可达"
+                if str(contract.destination_scope.value) == "nearby"
+                else "接受较远目的地"
+            )
+            lines.append(f"【范围】{scope_label}")
+        exclusions = [
+            *self._excluded_cities(contract),
+            *(
+                [str(item) for item in contract.excluded_themes.value]
+                if contract.excluded_themes.is_known()
+                and isinstance(contract.excluded_themes.value, list)
+                else []
+            ),
+        ]
+        if exclusions:
+            lines.append(f"【排除】{'、'.join(exclusions[:6])}")
         if origin_note:
             lines.append(f"【出发】{origin_note}")
         if transport_note:
@@ -1135,6 +1343,8 @@ class DestinationRecommenderAgent:
         base: DestinationRecommendation,
         context: RecommendationContext,
         contract: SemanticTripContract,
+        *,
+        cache: Optional[Dict[str, Any]] = None,
     ) -> Optional[DestinationRecommendation]:
         """Optional decision card: user must click to apply 3-day Fri–Sun patch."""
         seed = {
@@ -1155,7 +1365,7 @@ class DestinationRecommenderAgent:
             "schedule_option": "friday_early",
             "transport_note": "建议周五下午或傍晚城际出发，首日仅安排抵达与轻活动",
         }
-        item = self._build_recommendation(seed, context, contract)
+        item = self._build_recommendation(seed, context, contract, cache=cache)
         if item is None:
             return None
         item.decision_label = "周五提前出发"

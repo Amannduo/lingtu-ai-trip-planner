@@ -29,6 +29,23 @@ def _run_compatibility_migrations() -> None:
                         "ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'"
                     )
                 )
+            if "user_budget" not in columns:
+                # Nullable, no backfill: the user's constraint cannot be
+                # recovered from the stored estimate.
+                connection.execute(
+                    text(
+                        "ALTER TABLE travel_plans "
+                        "ADD COLUMN user_budget NUMERIC(14, 2)"
+                    )
+                )
+            if "request_json" not in columns:
+                connection.execute(
+                    text("ALTER TABLE travel_plans ADD COLUMN request_json TEXT")
+                )
+            if "contract_json" not in columns:
+                connection.execute(
+                    text("ALTER TABLE travel_plans ADD COLUMN contract_json TEXT")
+                )
 
         if "users" in tables:
             columns = _column_names("users")
@@ -37,8 +54,6 @@ def _run_compatibility_migrations() -> None:
                     text("ALTER TABLE users ADD COLUMN email VARCHAR(254)")
                 )
             if "token_version" not in columns:
-                # SQLite + PostgreSQL: additive column with server default 0 so
-                # existing rows keep sessions until the next security event.
                 connection.execute(
                     text(
                         "ALTER TABLE users ADD COLUMN token_version "

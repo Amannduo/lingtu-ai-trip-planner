@@ -350,7 +350,7 @@ def _finish_node(state: AgentState) -> dict:
             result_summary=state.get("result", ""),
         )
     except Exception as exc:
-        print(f"[agent_graph] audit logging failed: {exc}")
+        print(f"[agent_graph] audit logging failed: {type(exc).__name__}")
 
     permission = {
         "role": state.get("role", "guest"),
@@ -413,7 +413,7 @@ class TravelAgentGraph:
             graph.add_edge("finish", END)
             return True, graph.compile()
         except Exception as exc:
-            print(f"[agent_graph] LangGraph unavailable, using sequential fallback: {exc}")
+            print(f"[agent_graph] LangGraph unavailable, using sequential fallback: {type(exc).__name__}")
             return False, None
 
     def run(

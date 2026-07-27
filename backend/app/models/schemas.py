@@ -1,6 +1,5 @@
 """数据模型定义"""
 
-import math
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from datetime import date
@@ -55,6 +54,14 @@ class TripRequest(BaseModel):
         description=(
             "用户已在前端二次确认语义风险；为 True 时允许带着未消解冲突继续生成。"
             "亦可在 free_text 写入 [用户已确认待核对约束]。"
+        ),
+    )
+    recommendation_token: Optional[str] = Field(
+        default=None,
+        max_length=20_000,
+        description=(
+            "推荐会话的服务端签名契约令牌（原样回传）；验签通过后其契约"
+            "进入合并矩阵，不代表表单已确认，验签失败静默走无令牌路径"
         ),
     )
     # Weekend / early-arrival semantics (optional, backward compatible).
@@ -144,8 +151,8 @@ class RouteRequest(BaseModel):
     """路线规划请求"""
     origin_address: str = Field(..., min_length=1, max_length=300, description="起点地址")
     destination_address: str = Field(..., min_length=1, max_length=300, description="终点地址")
-    origin_city: Optional[str] = Field(default=None, max_length=64, description="起点城市")
-    destination_city: Optional[str] = Field(default=None, max_length=64, description="终点城市")
+    origin_city: Optional[str] = Field(default=None, description="起点城市")
+    destination_city: Optional[str] = Field(default=None, description="终点城市")
     route_type: Literal["walking", "driving", "transit"] = Field(default="walking", description="路线类型: walking/driving/transit")
 
 
@@ -276,6 +283,20 @@ class SemanticTripContract(BaseModel):
     preferences: FieldBinding = Field(default_factory=FieldBinding)
     transportation: FieldBinding = Field(default_factory=FieldBinding)
     accommodation: FieldBinding = Field(default_factory=FieldBinding)
+    # Range and exclusion semantics: "附近城市" / "不想去昆明" / "不要海边" must
+    # survive from utterance to recommendation, not be dropped as unmodelled text.
+    destination_scope: FieldBinding = Field(
+        default_factory=FieldBinding,
+        description="nearby | far —— 用户对目的地距离范围的要求",
+    )
+    excluded_destinations: FieldBinding = Field(
+        default_factory=FieldBinding,
+        description="用户明确排除的目的地城市列表",
+    )
+    excluded_themes: FieldBinding = Field(
+        default_factory=FieldBinding,
+        description="用户明确排除的主题/场景，如「海边」「爬山」",
+    )
     # Weekend / early-arrival semantics (optional FieldBindings for provenance).
     date_pattern: FieldBinding = Field(
         default_factory=FieldBinding,
@@ -306,6 +327,9 @@ class SemanticTripContract(BaseModel):
             "transportation",
             "accommodation",
             "early_arrival_hint",
+            "destination_scope",
+            "excluded_destinations",
+            "excluded_themes",
         ]
         for name in tracked:
             binding = getattr(self, name)
@@ -336,14 +360,6 @@ class Location(BaseModel):
     longitude: float = Field(..., ge=-180, le=180, description="经度")
     latitude: float = Field(..., ge=-90, le=90, description="纬度")
 
-    @field_validator("longitude", "latitude")
-    @classmethod
-    def _finite_coordinates(cls, value: float) -> float:
-        # Reject NaN / ±Infinity even when they pass numeric bounds checks.
-        if not math.isfinite(value):
-            raise ValueError("坐标必须是有限数值")
-        return value
-
 
 class MapContextPOI(BaseModel):
     """用于打印地图的高德周边场所。"""
@@ -353,6 +369,19 @@ class MapContextPOI(BaseModel):
     location: Location = Field(..., description="高德 GCJ-02 坐标")
     poi_id: str = Field(default="", description="高德 POI ID")
     source: str = Field(default="amap_poi", description="数据来源")
+
+
+class VerificationMeta(BaseModel):
+    """Provider-supplied administrative data for POI destination verification.
+
+    Not part of the public user-facing plan display.  Backward-compatible:
+    default values ensure that historical plans without this field parse
+    without errors.
+    """
+    cityname: str = Field(default="", description="高德 cityname")
+    citycode: str = Field(default="", description="高德 citycode")
+    adname: str = Field(default="", description="高德 adname")
+    adcode: str = Field(default="", description="高德 adcode")
 
 
 class Attraction(BaseModel):
@@ -369,6 +398,10 @@ class Attraction(BaseModel):
     image_url: Optional[str] = Field(default=None, description="图片URL")
     coordinate_source: str = Field(default="", description="坐标来源")
     ticket_price: int = Field(default=0, ge=0, le=1_000_000, description="单人门票参考价(元)")
+    verification: Optional[VerificationMeta] = Field(
+        default=None,
+        description="POI提供商返回的行政区数据，用于目的地校验，不参与前端展示",
+    )
 
     @field_validator("photos", mode="before")
     @classmethod
@@ -533,13 +566,30 @@ class TripPlanQualityResult(BaseModel):
     )
     review_required: bool = Field(
         default=False,
-        description="Whether human or advisory review is requested",
+        description=(
+            "Reviewable-delivery flag: the plan may persist and deliver, "
+            "but carries notices the user should review"
+        ),
+    )
+    quality_status: str = Field(
+        default="blocked",
+        description=(
+            "blocked | needs_review | publishable — unified gate decision "
+            "(blocked ⟺ not publishable; needs_review ⟺ publishable with "
+            "review_required)"
+        ),
+    )
+    validation_mode: str = Field(
+        default="full",
+        description=(
+            "full | legacy_weak — 校验所用请求上下文完整度；legacy_weak 表示缺少"
+            "生成时请求快照的弱校验，结果不允许自动升级为 publishable"
+        ),
     )
     checked_items: List[str] = Field(default_factory=list)
     issues: List[TripPlanQualityIssue] = Field(default_factory=list)
     verified_facts: int = Field(default=0)
     generated_at: str = Field(default="")
-
 
 
 class TripPlan(BaseModel):
@@ -580,7 +630,14 @@ class TripPlanResponse(BaseModel):
     data: Optional[TripPlan] = Field(default=None, description="旅行计划数据")
     plan_no: Optional[str] = Field(default=None, description="已保存的旅行计划编号")
     email_delivery: Optional[EmailDeliveryResult] = None
-
+    needs_review: bool = Field(
+        default=False,
+        description="质量门无阻断但分数不足，行程可展示但需人工复核",
+    )
+    quality_status: str = Field(
+        default="",
+        description="blocked | needs_review | publishable",
+    )
 
 
 class POIInfo(BaseModel):
@@ -593,7 +650,10 @@ class POIInfo(BaseModel):
     tel: Optional[str] = Field(default=None, description="电话")
     rating: Optional[float] = Field(default=None, description="高德评分")
     photos: List[str] = Field(default_factory=list, description="高德 POI 图片")
-    district: str = Field(default="", description="所在区县")
+    district: str = Field(default="", description="所在区县 (adname)")
+    cityname: str = Field(default="", description="高德 cityname")
+    citycode: str = Field(default="", description="高德 citycode")
+    adcode: str = Field(default="", description="高德 adcode")
 
 
 class POISearchResponse(BaseModel):
@@ -712,6 +772,13 @@ class DestinationChatResponse(BaseModel):
     semantic_contract: Optional[SemanticTripContract] = Field(
         default=None,
         description="完整语义契约：字段来源、冲突与待确认状态",
+    )
+    contract_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "服务端签名的会话契约令牌；生成行程时经 recommendation_token"
+            "原样回传，跨 worker 无状态传递（Base64 仅编码不加密，不含原文）"
+        ),
     )
     recommendations: List[DestinationRecommendation] = Field(default=[], description="目的地推荐列表")
 

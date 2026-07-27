@@ -280,7 +280,7 @@ def test_no_friday_card_when_recommendations_empty(monkeypatch) -> None:
     monkeypatch.setattr(
         agent,
         "_filter_and_rank_candidates",
-        lambda seeds, context, explicit_city="", intent_text="": [],
+        lambda seeds, context, explicit_city="", intent_text="", contract=None: [],
     )
     response = agent.chat(
         request_for("这个周末两个人出去玩", origin_city="上海", travel_days=2)

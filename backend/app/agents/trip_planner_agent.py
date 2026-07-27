@@ -11,14 +11,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Callable, List, Optional
 from hello_agents import SimpleAgent
 from ..services.llm_service import get_llm
+from ..services.semantic_contract_service import decided_constraint_text
 from ..services.transport_budget_service import get_transport_budget_service
 from ..services.amap_service import get_amap_service
-from ..services.trip_pacing_contract import (
-    cap_day_attractions,
-    gentle_pacing_note,
-    prefers_gentle_pacing,
-    user_named_overflow_note,
-)
 from ..models.schemas import (
     TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo,
     Location, Hotel, RouteSegment, POIInfo, AgentAuditResult
@@ -164,11 +159,15 @@ class MultiAgentTripPlanner:
         normal success by default.
         """
         try:
-            from ..services.semantic_contract_service import (
-                attach_contract_to_trip_request,
-            )
+            # The HTTP entry already attached the server-built contract;
+            # this fallback covers direct/internal callers only, keeping
+            # the at-most-one-extraction invariant per request.
+            if getattr(request, "semantic_contract", None) is None:
+                from ..services.semantic_contract_service import (
+                    attach_contract_to_trip_request,
+                )
 
-            request = attach_contract_to_trip_request(request)
+                request = attach_contract_to_trip_request(request)
         except Exception:
             # Contract attachment must never block trip generation.
             pass
@@ -190,19 +189,26 @@ class MultiAgentTripPlanner:
         *,
         allow_unpublishable: bool = False,
     ) -> TripPlan:
-        """Reject unpublishable plans at the public planner entry."""
+        """Read the unified quality_status from the quality service.
+
+        - ``blocked`` → raise TripPlanQualityRejectedError
+        - ``needs_review`` → return plan as-is (not an error)
+        - ``publishable`` → return plan as-is
+        """
         from ..services.trip_generation_errors import TripPlanQualityRejectedError
-        from ..services.trip_plan_quality_service import get_trip_plan_quality_service
+        from ..services.trip_plan_quality_service import (
+            get_trip_plan_quality_service,
+            resolve_plan_quality_status,
+        )
 
         if plan.quality is None:
-            # Normal graph paths always attach quality; if a path skipped the
-            # node, re-run the deterministic gate rather than fail open.
             plan.quality = get_trip_plan_quality_service().evaluate(request, plan)
 
         if allow_unpublishable:
             return plan
 
-        if not bool(getattr(plan.quality, "publishable", False)):
+        # Same unified resolver as the HTTP layer — one gate, one decision.
+        if resolve_plan_quality_status(plan) == "blocked":
             raise TripPlanQualityRejectedError(quality=plan.quality, plan=plan)
         return plan
 
@@ -820,6 +826,14 @@ class MultiAgentTripPlanner:
         # visit duration and generated descriptions.
         attraction.category = categories[-1] if categories else (attraction.category or "景点")
         attraction.coordinate_source = "amap_poi"
+        # Provider-supplied admin data for destination verification.
+        from ..models.schemas import VerificationMeta
+        attraction.verification = VerificationMeta(
+            cityname=poi.cityname,
+            citycode=poi.citycode,
+            adname=poi.district,   # district column IS the AMap adname
+            adcode=poi.adcode,
+        )
         # Model-written descriptions, duration and ticket prices are not facts
         # supplied by the POI provider. Recompute neutral content downstream.
         attraction.description = ""
@@ -841,7 +855,10 @@ class MultiAgentTripPlanner:
             )
         }
         if gentle_pacing:
-            pacing_note = gentle_pacing_note(request)
+            pacing_note = (
+                "已按父母/老人同行或轻松出游需求降低行程密度，"
+                "每天最多保留2个主景点，并为休息和临时调整预留时间。"
+            )
             if pacing_note not in trip_plan.overall_suggestions:
                 trip_plan.overall_suggestions = (
                     f"{trip_plan.overall_suggestions.rstrip()} {pacing_note}"
@@ -878,19 +895,9 @@ class MultiAgentTripPlanner:
             if intercity and is_last:
                 attraction_cap = min(attraction_cap, 2)
             if len(day.attractions) > attraction_cap:
-                # Prefer free_text-named attractions over naive prefix truncation.
-                day.attractions, named_overflow = cap_day_attractions(
-                    request,
-                    day.attractions,
-                    attraction_cap,
-                )
-                if named_overflow:
-                    overflow_note = user_named_overflow_note()
-                    if overflow_note not in (trip_plan.overall_suggestions or ""):
-                        trip_plan.overall_suggestions = (
-                            f"{(trip_plan.overall_suggestions or '').rstrip()} "
-                            f"{overflow_note}"
-                        ).strip()
+                day.attractions = day.attractions[:attraction_cap]
+            if gentle_pacing and len(day.attractions) > 2:
+                day.attractions = day.attractions[:2]
             durations = [
                 max(0, int(attraction.visit_duration or 0))
                 for attraction in day.attractions
@@ -937,7 +944,9 @@ class MultiAgentTripPlanner:
     def _is_evening_before_departure(self, request: TripRequest) -> bool:
         if request.departure_mode == "evening_before":
             return True
-        text = request.free_text_input or ""
+        # Never the advisory 【抵达建议】 line: on a default weekend card it says
+        # "建议周五下午或傍晚出发" while the user chose the Saturday start.
+        text = decided_constraint_text(request.free_text_input)
         if "evening_before" in text or "周五—周日" in text or "周五提前" in text:
             return True
         if re.search(r"周五.{0,6}(?:下午|傍晚|晚上)", text):
@@ -945,13 +954,25 @@ class MultiAgentTripPlanner:
         return False
 
     def _needs_gentle_pacing(self, request: TripRequest) -> bool:
-        """True only for explicit gentle / family / elder pacing signals.
-
-        Markers are shared with TripPlanQualityService via trip_pacing_contract
-        so finalize density caps and quality thresholds cannot drift.
-        Does not infer medical needs or force theme-park content.
-        """
-        return prefers_gentle_pacing(request)
+        # Structured channel first (S4a): the server-built contract's pace
+        # binding is the authoritative decided value.
+        contract = getattr(request, "semantic_contract", None)
+        pace = getattr(contract, "pace", None) if contract is not None else None
+        if pace is not None and pace.is_known():
+            return str(pace.value or "") == "轻松"
+        # Machine-block / preference keyword channel — kept as the compat
+        # fallback until the token handoff (S4b/S4c) fully replaces it.
+        text = (
+            f"{decided_constraint_text(request.free_text_input)} "
+            f"{' '.join(request.preferences)}"
+        )
+        return any(
+            keyword in text
+            for keyword in (
+                "父母", "爸妈", "老人", "长辈", "不想太累",
+                "轻松", "慢一点", "休闲", "避暑",
+            )
+        )
 
     def _normalized_visit_duration(self, attraction: Attraction, force_suggested: bool = False) -> int:
         current = max(0, int(attraction.visit_duration or 0))
@@ -1456,7 +1477,7 @@ class MultiAgentTripPlanner:
 7. 如果用户设置了总预算,酒店、餐饮、交通和门票估算应尽量控制在该预算内,并在budget.total中体现
 8. weather_info只能填写天气来源中与{request.start_date}至{request.end_date}日期完全匹配的数据；如果天气来源日期不匹配,weather_info返回空数组,并在overall_suggestions提示出发前复核天气
 9. 如果出发地与目的地不同，首日和末日必须为城际往返预留时间，不得按两个完整游玩日排满
-10. 如果额外要求或偏好含父母、老人、亲子、儿童、轻松、缓节奏、少走路、不赶行程、休闲或避暑，每天最多安排2个主景点，避免高强度徒步、连续爬坡和频繁换乘；不要默认安排主题乐园，也不要编造儿童票价/身高限制
+10. 如果额外要求含父母、老人、轻松、休闲或避暑，每天最多安排2个主景点，避免高强度徒步、连续爬坡和频繁换乘
 11. 景点类型必须多样化，商业街区或步行街不超过全部景点的三分之一，且不得选择住宅、汽车服务、产业园或带门店后缀的弱旅游POI
 12. 博物馆、美术馆和展馆合计最多3个，公园和绿道合计最多4个；优先选择知名景区、城市地标和与用户偏好强相关的地点，避免用小型附属设施凑数
 13. days 数组长度必须恰好为 {request.travel_days}，禁止多生成或少生成天数
@@ -1986,6 +2007,14 @@ def get_trip_planner_agent() -> MultiAgentTripPlanner:
 
     return _multi_agent_planner
 
+
+def planner_is_initialized() -> bool:
+    """Whether the planner singleton already exists, without constructing it.
+
+    Lets a public readiness probe report state without paying — or triggering —
+    the expensive first-call initialisation.
+    """
+    return _multi_agent_planner is not None
 
 
 def shutdown_trip_planner_agent() -> None:

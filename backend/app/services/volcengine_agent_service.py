@@ -71,7 +71,7 @@ class VolcengineAgentService:
                 headers=headers,
                 json=payload
             )
-            print(f"[volcengine] HTTP {response.status_code}, response body (first 500 chars): {response.text[:500]}")
+            print(f"[volcengine] HTTP {response.status_code}")
             response.raise_for_status()
             data = response.json()
 

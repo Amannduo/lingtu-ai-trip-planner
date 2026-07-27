@@ -167,6 +167,31 @@ def test_chat_returns_distinct_decision_options_and_form_patch() -> None:
     assert "start_date" in (response.interpreted_context.get("pending_fields") or [])
 
 
+def test_chat_preserves_described_traveler_count_in_summary_and_form_patch() -> None:
+    agent = build_agent()
+    response = agent.chat(
+        request_for(
+            "周末从山西太原出发，想去附近的城市避个暑，两个年轻人，预算3000"
+        )
+    )
+
+    assert response.semantic_contract is not None
+    assert response.semantic_contract.travelers.value == 2
+    assert response.semantic_contract.travel_party.value == "两个年轻人"
+    assert response.interpreted_context["travelers"] == 2
+    assert "travelers" not in response.semantic_contract.pending_fields
+    assert "2人（两个年轻人）" in response.reply
+    pending_reply = response.reply.partition("仍待确认：")[2]
+    assert "travelers" not in pending_reply
+    core = [
+        item
+        for item in response.recommendations
+        if item.schedule_option != "friday_early"
+    ]
+    assert core
+    assert all(item.form_patch.travelers == 2 for item in core)
+
+
 def test_explicit_destination_is_respected_by_fallback() -> None:
     agent = build_agent()
 

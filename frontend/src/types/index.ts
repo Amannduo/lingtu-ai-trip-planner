@@ -36,6 +36,8 @@ export interface Meal {
   location?: Location
   description?: string
   estimated_cost?: number
+  poi_id?: string
+  coordinate_source?: string
 }
 
 export interface RouteSegment {
@@ -136,6 +138,10 @@ export interface TripPlanQualityResult {
   score: number
   publishable: boolean
   review_required?: boolean
+  /** blocked | needs_review | publishable — unified gate decision */
+  quality_status?: 'blocked' | 'needs_review' | 'publishable' | string
+  /** full | legacy_weak — validation context completeness on edits */
+  validation_mode?: 'full' | 'legacy_weak' | string
   checked_items?: string[]
   issues?: TripPlanQualityIssue[]
   verified_facts?: number
@@ -146,6 +152,7 @@ export interface TripPlan {
   city: string
   start_date: string
   end_date: string
+  generation_mode: 'primary' | 'repaired' | 'map_fallback'
   days: DayPlan[]
   weather_info: WeatherInfo[]
   overall_suggestions: string
@@ -181,6 +188,8 @@ export interface TripFormData {
   weekend_style?: 'sat_sun' | 'fri_sun_optional' | null
   early_arrival_hint?: string | null
   departure_mode?: 'morning_first_day' | 'evening_before' | null
+  /** Server-signed session contract token, returned verbatim */
+  recommendation_token?: string | null
 }
 
 export interface EmailDeliveryResult {
@@ -198,6 +207,10 @@ export interface TripPlanResponse {
   data?: TripPlan
   plan_no?: string | null
   email_delivery?: EmailDeliveryResult | null
+  /** Unified gate decision — authoritative over inferring from quality */
+  quality_status?: 'blocked' | 'needs_review' | 'publishable' | ''
+  /** No blocking issues but score below threshold; not auto-persisted */
+  needs_review?: boolean
 }
 
 export interface ChatMessage {
@@ -265,7 +278,6 @@ export interface DestinationRecommendation {
   schedule_summary?: string | null
 }
 
-
 export type FieldSource =
   | 'user_explicit'
   | 'rule_inferred'
@@ -309,9 +321,11 @@ export interface DestinationChatResponse {
   message: string
   reply: string
   needs_more_info: boolean
-  /** Apply-safe flat fields plus optional semantic_contract */
-  interpreted_context?: Record<string, unknown>
+  /** Apply-safe flat fields plus optional semantic_contract / conflicts / pending_fields */
+  interpreted_context: Record<string, unknown>
   semantic_contract?: SemanticTripContract | null
+  /** Server-signed session contract token for the generation request */
+  contract_token?: string | null
   recommendations: DestinationRecommendation[]
 }
 
