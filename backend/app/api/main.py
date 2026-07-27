@@ -5,6 +5,8 @@ import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
@@ -98,6 +100,41 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["ETag", "Retry-After"],
 )
+
+
+_MAX_VALIDATION_ISSUES = 20
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Preserve FastAPI detail while adding the unified error vocabulary."""
+    errors = jsonable_encoder(exc.errors())
+    issues: list[dict] = []
+    for error in errors[:_MAX_VALIDATION_ISSUES]:
+        loc = error.get("loc") or ()
+        path = ".".join(str(part) for part in loc) if loc else "body"
+        issues.append(
+            {
+                "code": "REQUEST_VALIDATION",
+                "severity": "error",
+                "path": path,
+                "message": str(error.get("msg") or "参数无效"),
+            }
+        )
+    summary = "；".join(
+        f"{issue['path']}: {issue['message']}" for issue in issues[:3]
+    )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": errors,
+            "message": f"请求参数无效：{summary}" if summary else "请求参数无效。",
+            "issues": issues,
+        },
+    )
+
 
 def _rate_limit_rule(method: str, path: str) -> tuple[str, int, int] | None:
     """Middleware rate rules for coarse public endpoints.

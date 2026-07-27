@@ -285,6 +285,7 @@ def test_unexpected_email_failure_does_not_fail_saved_trip(monkeypatch) -> None:
                 start_date="2026-10-01",
                 end_date="2026-10-01",
                 days=[],
+                overall_suggestions="按预约时间抵达景点。",
                 quality=TripPlanQualityResult(
                     status="passed",
                     score=90,

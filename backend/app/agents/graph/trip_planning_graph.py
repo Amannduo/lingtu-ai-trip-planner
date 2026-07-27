@@ -206,9 +206,7 @@ class TripPlanningAgentGraph:
         quality = getattr(plan, "quality", None) if plan is not None else None
         if quality is None:
             return (-1, -1, -1)
-        not_blocked = int(
-            str(getattr(quality, "quality_status", "blocked")) != "blocked"
-        )
+        not_blocked = int(bool(getattr(quality, "publishable", False)))
         no_errors = int(
             not any(issue.severity == "error" for issue in quality.issues)
         )
@@ -924,13 +922,6 @@ class TripPlanningAgentGraph:
                 plan.quality.status,
                 
             )
-            if has_blocking:
-                plan.quality.publishable = False
-                plan.quality.review_required = True
-                plan.quality.status = "failed"
-            elif not plan.quality.publishable:
-                # Keep service decision; ensure review flag for non-clean plans.
-                plan.quality.review_required = True
         except TripGenerationCancelledError:
             raise
         except Exception as exc:
@@ -938,6 +929,8 @@ class TripPlanningAgentGraph:
             plan.quality = TripPlanQualityResult(
                 status="failed",
                 score=0,
+                publishable=False,
+                review_required=True,
                 checked_items=["质量门执行状态"],
                 issues=[
                     TripPlanQualityIssue(
@@ -1002,11 +995,19 @@ class TripPlanningAgentGraph:
         if quality is None:
             return "end"
 
-        quality_status = getattr(quality, "quality_status", "blocked")
+        publishable = bool(getattr(quality, "publishable", False))
+        review_required = bool(getattr(quality, "review_required", False))
+        quality_status = (
+            "needs_review"
+            if publishable and review_required
+            else "publishable"
+            if publishable
+            else "blocked"
+        )
         repair_count = int(state.get("repair_count", 0))
         max_repairs = self._MAX_QUALITY_REPAIRS
 
-        if quality_status != "needs_review":
+        if not (publishable and review_required):
             logger.info(
                 "[trip_graph] quality gate: status=%s, score=%d, "
                 "repair_count=%d — skipping repair",

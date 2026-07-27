@@ -1111,7 +1111,9 @@ def test_quality_gate_rejects_infeasible_auto_recommended_weekend_trip() -> None
         preferences=[],
     )
 
-    result = TripPlanQualityService().evaluate(request, make_plan("昆明"))
+    plan = make_plan("昆明")
+    plan.days[0].attractions[0].address = "昆明市五华区"
+    result = TripPlanQualityService().evaluate(request, plan)
 
     assert result.status == "failed"
     assert any(
@@ -1135,7 +1137,9 @@ def test_quality_gate_warns_but_preserves_explicit_far_destination() -> None:
         preferences=[],
     )
 
-    result = TripPlanQualityService().evaluate(request, make_plan("昆明"))
+    plan = make_plan("昆明")
+    plan.days[0].attractions[0].address = "昆明市五华区"
+    result = TripPlanQualityService().evaluate(request, plan)
 
     assert result.status == "warning"
     assert any(issue.code == "SHORT_TRIP_DESTINATION_RISK" for issue in result.issues)

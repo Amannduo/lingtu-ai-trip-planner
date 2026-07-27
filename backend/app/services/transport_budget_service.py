@@ -86,7 +86,18 @@ class TransportBudgetService:
         # (model output and planner defaults); scale by travelers for party total.
         attraction_total = self._sum_attraction_costs(trip_plan, request.travelers)
         meal_total = self._sum_meal_costs(trip_plan, request.travelers)
-        budget_notes: List[str] = []
+        has_attractions = any(day.attractions for day in trip_plan.days)
+        budget_notes: List[str] = [f"餐饮按{request.travelers}人计算。"]
+        if attraction_total > 0:
+            budget_notes.append(
+                f"已填写的景点门票参考价按{request.travelers}人计算，"
+                "实际票价和优惠政策仍需通过景区官方渠道复核。"
+            )
+        elif has_attractions:
+            budget_notes.append(
+                "景点门票当前暂按0元计入；0仅表示未取得可核验的结构化票价，"
+                "不代表已确认免费，出发前需核对官方票价、免费政策和预约要求。"
+            )
 
         if meal_total <= 0:
             meal_total = self._estimate_meal_cost(request)
@@ -288,20 +299,19 @@ class TransportBudgetService:
         mode = (request.intercity_transportation or "").strip().lower()
         logger.info("[budget] intercity estimate started")
         if "自驾" in mode:
-            vehicle_count = max(1, math.ceil(request.travelers / 4))
-            total = 400 * vehicle_count
-            per_person = math.ceil(total / request.travelers)
+            unit_price = 400
+            total = unit_price * max(1, request.travelers)
             logger.info(
                 "[budget] intercity drive fallback: "
-                f"vehicles={vehicle_count}, per_person={per_person}, total={total}"
+                f"unit={unit_price}, travelers={request.travelers}, total={total}"
             )
             return QuoteResult(
-                unit_price=per_person,
+                unit_price=unit_price,
                 total_price=total,
                 reference=f"{request.origin_city} 往返 {request.city} 自驾估算",
                 notes=[
-                    f"自驾费用按{vehicle_count}辆车、每车往返约400元估算，"
-                    "包含基础油费与路桥费缓冲，出发前请按车型和实时路线复核。"
+                    "未取得实时自驾价格，已按单人往返约400元估算；"
+                    "包含基础油费与路桥费缓冲，出发前请按车型和路线复核。"
                 ],
                 source="heuristic_drive"
             )

@@ -17,11 +17,73 @@ from .schema import init_db
 logger = logging.getLogger(__name__)
 
 
-def _as_optional_budget(value) -> int | None:
-    if value is None: return None
-    try: amount=int(float(value))
-    except (TypeError,ValueError): return None
-    return amount if amount>=0 else None
+REQUEST_SNAPSHOT_SCHEMA_VERSION = 1
+CONTRACT_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def _serialize_request_snapshot(request: TripRequest) -> str:
+    """Serialize the generation-time request separately from its contract."""
+    payload = {
+        "schema_version": REQUEST_SNAPSHOT_SCHEMA_VERSION,
+        "request": request.model_dump(mode="json", exclude={"semantic_contract"}),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _serialize_contract_snapshot(request: TripRequest) -> str | None:
+    contract = getattr(request, "semantic_contract", None)
+    if contract is None:
+        return None
+    payload = {
+        "schema_version": CONTRACT_SNAPSHOT_SCHEMA_VERSION,
+        "contract": contract.model_dump(mode="json"),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _request_from_snapshot(
+    request_json: Any,
+    contract_json: Any,
+) -> TripRequest | None:
+    """Restore a versioned request snapshot, failing soft on invalid data."""
+    if not isinstance(request_json, str) or not request_json.strip():
+        return None
+    try:
+        wrapper = json.loads(request_json)
+        if int(wrapper.get("schema_version", -1)) != REQUEST_SNAPSHOT_SCHEMA_VERSION:
+            return None
+        request = TripRequest.model_validate(wrapper["request"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+    if isinstance(contract_json, str) and contract_json.strip():
+        try:
+            from ..models.schemas import SemanticTripContract
+
+            contract_wrapper = json.loads(contract_json)
+            if (
+                int(contract_wrapper.get("schema_version", -1))
+                == CONTRACT_SNAPSHOT_SCHEMA_VERSION
+            ):
+                contract = SemanticTripContract.model_validate(
+                    contract_wrapper["contract"]
+                )
+                request = request.model_copy(update={"semantic_contract": contract})
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass
+    return request
+
+
+def _as_optional_budget(value: Any) -> int | None:
+    """Coerce a stored numeric user budget back to the request's int form."""
+    if value is None:
+        return None
+    try:
+        amount = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return amount if amount >= 0 else None
+
 
 class TravelPlanDataService:
     """Persist trip plans and maintain user profile summaries."""
@@ -77,6 +139,8 @@ class TravelPlanDataService:
                 "free_text": request.free_text_input or "",
                 "summary": summary,
                 "plan_json": _serialize_plan(trip_plan),
+                "request_json": _serialize_request_snapshot(request),
+                "contract_json": _serialize_contract_snapshot(request),
                 "status": "completed",
                 "source": source,
             },
@@ -112,12 +176,31 @@ class TravelPlanDataService:
     def revision_for_plan(trip_plan: TripPlan) -> str:
         return _plan_revision(_serialize_plan(trip_plan))
 
+    def get_trip_request_with_context(
+        self, plan_no: str, user_id: str
+    ) -> tuple[TripRequest | None, str]:
+        """Return the request plus full or legacy-weak validation mode."""
+        init_db()
+        row = fetch_one(
+            """SELECT request_json, contract_json FROM travel_plans
+               WHERE plan_no = :plan_no AND user_id = :user_id""",
+            {"plan_no": plan_no, "user_id": user_id},
+        )
+        if row:
+            request = _request_from_snapshot(
+                row.get("request_json"), row.get("contract_json")
+            )
+            if request is not None:
+                return request, "full"
+        return self.get_trip_request(plan_no, user_id), "legacy_weak"
+
     def get_trip_request(self, plan_no: str, user_id: str) -> TripRequest | None:
         """Rebuild the non-sensitive request context used by the quality gate."""
         init_db()
         row = fetch_one(
             """SELECT origin_city, destination, start_date, end_date, travel_days,
-                      travelers, transportation, accommodation, preferences, free_text
+                      travelers, user_budget, transportation, accommodation,
+                      preferences, free_text
                FROM travel_plans
                WHERE plan_no = :plan_no AND user_id = :user_id""",
             {"plan_no": plan_no, "user_id": user_id},
@@ -138,7 +221,7 @@ class TravelPlanDataService:
                 end_date=row["end_date"],
                 travel_days=int(row.get("travel_days") or 1),
                 travelers=int(row.get("travelers") or 1),
-                budget=None,
+                budget=_as_optional_budget(row.get("user_budget")),
                 transportation=row.get("transportation") or "公共交通",
                 accommodation=row.get("accommodation") or "舒适型酒店",
                 preferences=[str(value) for value in preferences],

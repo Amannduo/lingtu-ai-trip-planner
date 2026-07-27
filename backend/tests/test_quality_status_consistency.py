@@ -1,19 +1,18 @@
-"""Regression tests for unified quality_status derivation (P0-2).
+"""Regression tests for the unified quality gate decision (P0-2).
 
 Before the fix there were three independent derivations of the gate
 decision (quality service, graph quality node, HTTP route helper) that
 could disagree:
 
-- the graph's quality node flipped ``publishable`` after enrichment
-  failures but never recomputed ``quality_status`` — a plan could carry
-  ``publishable=False`` with ``quality_status="publishable"`` and still be
-  persisted/delivered;
+- the graph's quality node could leave ``publishable`` and
+  ``review_required`` describing different decisions after enrichment
+  failures;
 - the agent public gate and the HTTP helper used different fallback rules
   for stub/legacy quality objects, so the same plan could pass one gate
   and be rejected by the other.
 
-These tests pin the invariant: the triple (publishable, quality_status)
-is always coherent, and every gate reads the same resolver.
+These tests pin the invariant: ``publishable`` + ``review_required`` are
+authoritative, and every compatibility label is derived from that pair.
 """
 
 from __future__ import annotations
@@ -161,18 +160,16 @@ class _PublishableQualityStub:
             status="passed",
             score=95,
             publishable=True,
-            quality_status="publishable",
+            review_required=False,
             checked_items=["基础检查"],
             issues=[],
         )
 
 
-def test_enrichment_failure_demotes_quality_status_not_only_publishable(
+def test_enrichment_failure_marks_deliverable_plan_for_review(
     monkeypatch,
 ) -> None:
-    """A publishable evaluation + failed enrichment must end as
-    needs_review — never publishable=False with quality_status='publishable'
-    (which downstream gates would persist and deliver)."""
+    """Partial enrichment remains deliverable but requires review."""
     monkeypatch.setattr(
         graph_module,
         "get_trip_plan_quality_service",
@@ -183,14 +180,13 @@ def test_enrichment_failure_demotes_quality_status_not_only_publishable(
     result = graph.run(_request())
 
     assert result.quality is not None
-    assert result.quality.publishable is False
-    assert result.quality.quality_status == "needs_review"
+    assert result.quality.publishable is True
+    assert result.quality.review_required is True
     assert resolve_plan_quality_status(result) == "needs_review"
 
 
-def test_gate_triple_stays_coherent_after_graph_run(monkeypatch) -> None:
-    """Invariant: quality_status=='publishable' if and only if
-    publishable is True."""
+def test_gate_pair_stays_coherent_after_graph_run(monkeypatch) -> None:
+    """A partial-enrichment result is deliverable and explicitly reviewable."""
     monkeypatch.setattr(
         graph_module,
         "get_trip_plan_quality_service",
@@ -199,19 +195,19 @@ def test_gate_triple_stays_coherent_after_graph_run(monkeypatch) -> None:
     graph = TripPlanningAgentGraph(_PlannerStub())
     result = graph.run(_request())
 
-    assert (result.quality.quality_status == "publishable") == bool(
-        result.quality.publishable
-    )
+    assert result.quality.publishable is True
+    assert result.quality.review_required is True
+    assert resolve_plan_quality_status(result) == "needs_review"
 
 
-def test_agent_gate_and_route_gate_agree_on_stub_quality_objects() -> None:
-    """A stub/legacy quality object (publishable=True with the default
-    quality_status='blocked') must pass BOTH the agent public gate and the
-    HTTP resolver — previously the agent gate rejected it while the route
-    accepted it."""
+def test_agent_gate_and_route_gate_agree_on_authoritative_pair() -> None:
+    """Both public gates read the authoritative boolean pair."""
     plan = _plan()
-    plan.quality = TripPlanQualityResult(publishable=True, score=90)
-    assert plan.quality.quality_status == "blocked"  # field default
+    plan.quality = TripPlanQualityResult(
+        publishable=True,
+        review_required=False,
+        score=90,
+    )
 
     assert _resolve_quality_status(plan) == "publishable"
 
@@ -221,17 +217,23 @@ def test_agent_gate_and_route_gate_agree_on_stub_quality_objects() -> None:
 
 
 @pytest.mark.parametrize(
-    "score,severity,mode,force,expected_status,expected_publishable",
+    "score,severity,mode,force,expected_publishable,expected_review_required",
     [
-        (95, None, "primary", False, "publishable", True),
-        (60, None, "primary", False, "needs_review", False),
-        (95, "error", "primary", False, "blocked", False),
-        (95, None, "map_fallback", False, "blocked", False),
-        (95, None, "primary", True, "needs_review", False),
+        (100, None, "primary", False, True, False),
+        (95, None, "primary", False, True, True),
+        (60, None, "primary", False, True, True),
+        (95, "error", "primary", False, False, True),
+        (95, None, "map_fallback", False, True, True),
+        (95, None, "primary", True, True, True),
     ],
 )
 def test_refresh_quality_gate_matrix(
-    score, severity, mode, force, expected_status, expected_publishable
+    score,
+    severity,
+    mode,
+    force,
+    expected_publishable,
+    expected_review_required,
 ) -> None:
     issues = []
     if severity:
@@ -249,23 +251,23 @@ def test_refresh_quality_gate_matrix(
         quality, generation_mode=mode, force_review=force
     )
 
-    assert quality.quality_status == expected_status
     assert quality.publishable is expected_publishable
+    assert quality.review_required is expected_review_required
 
 
-def test_blocking_code_blocks_even_with_warning_severity() -> None:
-    """Codes in BLOCKING_CODES block regardless of severity or score."""
+def test_structural_blocking_code_blocks_even_with_warning_severity() -> None:
+    """Structural blocker codes block regardless of severity or score."""
     quality = TripPlanQualityResult(
         score=95,
         issues=[
             TripPlanQualityIssue(
-                code="BUDGET_MISSING",
+                code="EMPTY_DAY",
                 severity="warning",
-                path="budget",
-                message="预算缺失",
+                path="days[0]",
+                message="当日没有任何可执行安排",
             )
         ],
     )
     refresh_quality_gate(quality, generation_mode="primary")
-    assert quality.quality_status == "blocked"
     assert quality.publishable is False
+    assert quality.review_required is True

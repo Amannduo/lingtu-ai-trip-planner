@@ -252,9 +252,9 @@ def _mark_legacy_weak_validation(quality) -> None:
                 suggestion="重新生成行程可获得完整质量校验。",
             )
         )
-    if quality.quality_status == "publishable":
-        quality.quality_status = "needs_review"
-        quality.publishable = False
+    quality.publishable = False
+    quality.review_required = True
+    quality.quality_status = "blocked"
 
 
 def can_save_user_draft(quality) -> bool:
@@ -440,8 +440,13 @@ def _quality_rejection_detail(exc: "TripPlanQualityRejectedError") -> dict:
 
 
 def _plan_is_publishable(plan: TripPlan) -> bool:
-    """Legacy helper: true only when the unified gate says publishable."""
-    return _resolve_quality_status(plan) == "publishable"
+    """Return the authoritative delivery decision.
+
+    ``review_required`` changes presentation and follow-up behavior, not
+    whether an otherwise non-blocking plan can be delivered.
+    """
+    quality = getattr(plan, "quality", None)
+    return bool(getattr(quality, "publishable", False))
 
 
 def _resolve_quality_status(plan: TripPlan) -> str:
@@ -582,7 +587,7 @@ async def plan_trip(
     try:
         # Reject past dates / hard semantic conflicts before rate-limit spend
         # or expensive agent initialization.
-        _validate_generation_request(request)
+        request = _validate_generation_request(request, current_user)
         # After auth + TripRequest validation: count only real generation creates.
         _enforce_trip_generation_rate_limit(http_request, current_user)
 
@@ -621,10 +626,8 @@ async def plan_trip(
         try:
             if current_user is None:
                 print("[trip] anonymous request - generated plan will not be saved")
-            elif needs_review:
-                print("[trip] needs_review plan - not auto-persisted")
             else:
-                # warning + clean both may persist; blocking already rejected
+                # Clean and reviewable plans may persist; blocking was rejected.
                 plan_no = get_travel_plan_data_service().save_trip_plan(
                     request,
                     trip_plan,
@@ -896,7 +899,7 @@ def create_trip_plan_job(
     response: Response,
     current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
-    _validate_generation_request(request)
+    request = _validate_generation_request(request, current_user)
     # After auth + TripRequest validation: shared create quota with /plan.
     _enforce_trip_generation_rate_limit(http_request, current_user)
     owner_key = _job_owner(current_user, http_request)

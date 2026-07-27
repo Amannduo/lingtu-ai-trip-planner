@@ -176,8 +176,8 @@ class _QualityStub:
         return TripPlanQualityResult(
             status="warning",
             score=self.scores[idx],
-            publishable=False,
-            quality_status="needs_review",
+            publishable=True,
+            review_required=True,
             checked_items=["日程负载"],
             issues=[
                 TripPlanQualityIssue(

@@ -63,7 +63,7 @@ def _ok_plan() -> TripPlan:
             status="passed",
             score=90,
             publishable=True,
-            quality_status="publishable",
+            review_required=False,
         ),
     )
 
@@ -207,14 +207,16 @@ def test_notification_failures_never_fail_the_job(job_client, monkeypatch) -> No
     save.assert_called_once()
 
 
-def test_needs_review_plan_skips_email_and_push(job_client, monkeypatch) -> None:
+def test_needs_review_plan_skips_email_but_saves_and_pushes(
+    job_client, monkeypatch
+) -> None:
     client, _service, save, email, notify = job_client
     plan = _ok_plan()
     plan.quality = TripPlanQualityResult(
         status="warning",
         score=60,
-        publishable=False,
-        quality_status="needs_review",
+        publishable=True,
+        review_required=True,
     )
     _use_planner(
         monkeypatch,
@@ -235,10 +237,10 @@ def test_needs_review_plan_skips_email_and_push(job_client, monkeypatch) -> None
         e for e in _sse_events(streamed.text) if e.get("type") == "result"
     )
     assert result["data"]["needs_review"] is True
-    assert result["data"]["plan_no"] is None
-    save.assert_not_called()
+    assert result["data"]["plan_no"] == "P-NOTIFY-1"
+    save.assert_called_once()
     email.assert_not_called()
-    notify.assert_not_called()
+    notify.assert_called_once_with("user-notify", "杭州", "P-NOTIFY-1")
 
 
 def test_sse_quality_error_event_carries_structured_issues(
@@ -249,7 +251,7 @@ def test_sse_quality_error_event_carries_structured_issues(
         status="failed",
         score=40,
         publishable=False,
-        quality_status="blocked",
+        review_required=True,
         issues=[
             TripPlanQualityIssue(
                 code="EMPTY_DAY",

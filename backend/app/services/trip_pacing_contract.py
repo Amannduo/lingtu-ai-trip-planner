@@ -160,23 +160,33 @@ def normalize_user_text(text: str) -> str:
 
 def prefers_gentle_pacing(request: TripRequest) -> bool:
     """True only for explicit structured prefs or free-text intent phrases."""
-    if _prefers_gentle_from_preferences(request.preferences or []):
-        return True
     contract = getattr(request, "semantic_contract", None)
     if (
         contract is not None
         and getattr(contract, "pace", None) is not None
         and contract.pace.is_known()
-        and str(contract.pace.value) in {"轻松", "舒缓"}
     ):
+        return str(contract.pace.value) in {"轻松", "舒缓"}
+    if _prefers_gentle_from_preferences(request.preferences or []):
         return True
     # Only user-authored words and decided constraints: the recommender writes
     # a machine block into free_text, and reading its 【理由】 prose here would
     # let generated copy assert a pacing the user never chose.
-    from .semantic_contract_service import decided_constraint_text
+    from .semantic_contract_service import (
+        decided_constraint_text,
+        parse_machine_block,
+    )
 
-    return _prefers_gentle_from_free_text(
+    if _prefers_gentle_from_free_text(
         decided_constraint_text(request.free_text_input)
+    ):
+        return True
+    decided_constraint = normalize_user_text(
+        parse_machine_block(request.free_text_input).get("约束", "")
+    )
+    return any(
+        marker in decided_constraint
+        for marker in ("轻松", "舒缓", "慢节奏", "少走路", "不赶行程")
     )
 
 

@@ -140,17 +140,17 @@ def test_create_job_streams_progress_and_result(job_client, monkeypatch) -> None
     notify.assert_called_once_with("user-jobs", "杭州", "P-JOB-1")
 
 
-def test_needs_review_plan_streams_result_without_auto_save(
+def test_needs_review_plan_streams_result_and_saves(
     job_client, monkeypatch
 ) -> None:
-    """Mid-score non-blocking plans must reach the client without persistence."""
+    """Mid-score non-blocking plans remain deliverable and persistable."""
     client, _service, save, email, notify = job_client
     plan = _ok_plan()
     plan.quality = TripPlanQualityResult(
         status="warning",
         score=60,
-        publishable=False,
-        quality_status="needs_review",
+        publishable=True,
+        review_required=True,
     )
 
     class FakePlanner:
@@ -170,9 +170,9 @@ def test_needs_review_plan_streams_result_without_auto_save(
     assert "event: result" in streamed.text
     assert "event: error" not in streamed.text
     assert '"needs_review":true' in streamed.text.replace(" ", "")
-    save.assert_not_called()
+    save.assert_called_once()
     email.assert_not_called()
-    notify.assert_not_called()
+    notify.assert_called_once()
 
 
 def test_reviewable_warning_plan_streams_result_and_saves(
@@ -207,7 +207,7 @@ def test_reviewable_warning_plan_streams_result_and_saves(
     assert "需要你确认" in streamed.text or "保存行程" in streamed.text
     save.assert_called_once()
     email.assert_not_called()
-    notify.assert_not_called()
+    notify.assert_called_once_with("user-jobs", "杭州", "P-JOB-1")
 
 
 def test_quality_rejection_fails_job_without_save(job_client, monkeypatch) -> None:

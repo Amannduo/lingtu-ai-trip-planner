@@ -1275,7 +1275,8 @@ class TestPOIDestinationValidation:
         result = qs.evaluate(self._req(), plan)
         poi_issues = [i for i in result.issues if i.code == "POI_DESTINATION_MISMATCH"]
         assert len(poi_issues) >= 1
-        assert result.quality_status == "blocked"
+        assert result.publishable is False
+        assert result.review_required is True
 
     def test_full_eval_structured_datong_passes(self, qs):
         """cityname=大同市 → no POI_DESTINATION_MISMATCH."""
